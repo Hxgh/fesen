@@ -1,0 +1,42 @@
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Rust
+target/
+**/target/
+Cargo.lock.bak
+
+# Node / Tauri frontend
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+.vite/
+*.tsbuildinfo
+
+# Tauri
+**/src-tauri/gen/
+**/src-tauri/target/
+
+# Android
+**/gen/android/.gradle/
+**/gen/android/build/
+**/gen/android/local.properties
+*.apk
+*.aab
+*.jks
+*.keystore
+
+# IDE
+.idea/
+.vscode/*
+!.vscode/extensions.json
