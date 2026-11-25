@@ -13,11 +13,22 @@ use std::{
 
 #[derive(Default, Serialize, Deserialize, Clone)]
 #[serde(default)]
+pub struct AccountConfig {
+    pub shares: Vec<Publication>,
+    pub labels: Vec<Label>,
+}
+
+#[derive(Default, Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct Local {
     pub server: String,
     pub identities: BTreeMap<String, Identity>,
     pub session: Option<Login>,
+    pub accounts: BTreeMap<String, AccountConfig>,
+    // Legacy flat fields retained solely for automatic one-time migration from older device.json.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shares: Vec<Publication>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<Label>,
 }
 
@@ -123,10 +134,84 @@ impl Local {
                 f.read_to_end(&mut bytes)?;
                 Ok(bytes)
             }) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other),
+            Ok(bytes) => {
+                let mut local: Self = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+                local.migrate_legacy();
+                Ok(local)
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e),
         }
+    }
+
+    pub fn migrate_legacy(&mut self) {
+        if self.shares.is_empty() && self.labels.is_empty() {
+            return;
+        }
+        let target = self.session.as_ref().map(|s| s.member.clone()).or_else(|| {
+            (self.identities.len() == 1)
+                .then(|| self.identities.keys().next().cloned())
+                .flatten()
+        });
+        if let Some(member) = target {
+            self.migrate_to_member(&member);
+        }
+    }
+
+    pub fn migrate_to_member(&mut self, member: &str) {
+        if self.shares.is_empty() && self.labels.is_empty() {
+            return;
+        }
+        let entry = self.accounts.entry(member.to_owned()).or_default();
+        if entry.shares.is_empty() {
+            entry.shares = std::mem::take(&mut self.shares);
+        } else {
+            self.shares.clear();
+        }
+        if entry.labels.is_empty() {
+            entry.labels = std::mem::take(&mut self.labels);
+        } else {
+            self.labels.clear();
+        }
+    }
+
+    pub fn active_member(&self) -> Option<&str> {
+        self.session.as_ref().map(|s| s.member.as_str())
+    }
+
+    pub fn shares(&self) -> &[Publication] {
+        self.active_member()
+            .and_then(|m| self.accounts.get(m))
+            .map_or(&[], |a| a.shares.as_slice())
+    }
+
+    pub fn shares_mut(&mut self) -> Result<&mut Vec<Publication>, Code> {
+        let member = self
+            .active_member()
+            .ok_or(Code::Unauthorized)?
+            .to_owned();
+        Ok(&mut self.accounts.entry(member).or_default().shares)
+    }
+
+    pub fn labels(&self) -> &[Label] {
+        self.active_member()
+            .and_then(|m| self.accounts.get(m))
+            .map_or(&[], |a| a.labels.as_slice())
+    }
+
+    pub fn labels_mut(&mut self) -> Result<&mut Vec<Label>, Code> {
+        let member = self
+            .active_member()
+            .ok_or(Code::Unauthorized)?
+            .to_owned();
+        Ok(&mut self.accounts.entry(member).or_default().labels)
+    }
+
+    pub fn clear_group(&mut self) {
+        self.identities.clear();
+        self.accounts.clear();
+        self.shares.clear();
+        self.labels.clear();
     }
 
     pub fn save(&self, dir: &Path) -> Result<(), Code> {

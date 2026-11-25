@@ -109,6 +109,7 @@ pub struct Session {
 
 pub struct Device {
     member: String,
+    label: String,
     cert: Vec<u8>,
     local: Vec<SocketAddrV4>,
     ipv6: Vec<SocketAddrV6>,
@@ -133,6 +134,7 @@ impl Group {
         &mut self,
         id: &str,
         member: String,
+        label: String,
         cert: Vec<u8>,
         outgoing: mpsc::Sender<Event>,
     ) -> Result<Arc<Session>, Code> {
@@ -156,6 +158,7 @@ impl Group {
             id.to_owned(),
             Device {
                 member,
+                label,
                 cert,
                 outgoing,
                 session: session.clone(),
@@ -220,6 +223,7 @@ impl Group {
             services.extend(d.publications.iter().map(|s| Offering {
                 owner: id.clone(),
                 member: d.member.clone(),
+                device: Some(d.label.clone()),
                 service: s.clone(),
             }));
         }

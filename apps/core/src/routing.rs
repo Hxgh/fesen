@@ -281,6 +281,7 @@ mod tests {
         let offer = |id: &str, ips, ports| Offering {
             owner: id.into(),
             member: id.into(),
+            device: None,
             service: Publication {
                 id: id.into(),
                 name: id.into(),

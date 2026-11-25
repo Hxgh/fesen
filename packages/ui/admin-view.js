@@ -61,8 +61,11 @@ export function createAdminWorkspace(opts) {
 
   function getData() { return data; }
 
-  async function refresh() {
-    if (loading) return;
+  async function refresh({ throwOnError = false } = {}) {
+    if (loading) {
+      if (throwOnError) throw new Error(t("busy"));
+      return;
+    }
     loading = true;
     errorText = "";
     emitUpdate();
@@ -76,6 +79,7 @@ export function createAdminWorkspace(opts) {
       } else {
         errorText = err instanceof Error ? err.message : failure(err);
       }
+      if (throwOnError) throw err;
     } finally {
       loading = false;
       emitUpdate();
@@ -270,7 +274,8 @@ export function createAdminWorkspace(opts) {
         if (os) title.append(el("span", "host-os-tag", osLabel(os)));
         if (kind !== "tcp") title.append(el("span", "proto-tag", kind.toUpperCase()));
         const clean = ip ? meaningfulHostName(s.name, ip, os) : s.name;
-        const sub = [clean, s.member].filter(Boolean).join(" · ");
+        const source = [s.device, s.member].filter(Boolean).join(" · ");
+        const sub = [clean, source].filter(Boolean).join(" · ");
         const main = el("div", "service-main", title, ...(sub ? [el("span", "entity-meta", sub)] : []));
         wrap.append(el("article", "service-row", main, el("span", "state-dot good", t("broadcasting"))));
         continue;
@@ -280,7 +285,8 @@ export function createAdminWorkspace(opts) {
       const title = el("div", "host-title-line", el("p", "endpoint", entry.ip));
       if (os) title.append(el("span", "host-os-tag", osLabel(os)));
       const clean = meaningfulHostName(first.name, entry.ip, os);
-      const sub = [clean, first.member].filter(Boolean).join(" · ");
+      const source = [first.device, first.member].filter(Boolean).join(" · ");
+      const sub = [clean, source].filter(Boolean).join(" · ");
       const head = el("div", "host-head",
         el("div", "host-info", title, ...(sub ? [el("span", "entity-meta", sub)] : [])),
         el("span", "state-dot good", t("broadcasting"))

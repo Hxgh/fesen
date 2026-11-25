@@ -57,6 +57,7 @@ pub enum Command {
     },
     Start,
     Stop,
+    Quit,
     Logout,
     Save {
         id: Option<String>,
@@ -270,10 +271,10 @@ impl Core {
             is_admin: state.is_admin,
             admin_ready: state.admin_token.is_some(),
             services: state.view.clone(),
-            shares: state.local.shares.clone(),
+            shares: state.local.shares().to_vec(),
             active,
             active_flows: self.flows.load(Ordering::Acquire),
-            labels: state.local.labels.clone(),
+            labels: state.local.labels().to_vec(),
             virtual_ips: routes.mappings.clone(),
             aliases: routes.aliases.clone(),
             error: state.error,
@@ -337,6 +338,10 @@ impl Core {
             }
             Command::Detach => {
                 self.state.lock().unwrap().ui_until = None;
+                return Ok(self.status());
+            }
+            Command::Quit => {
+                self.stop();
                 return Ok(self.status());
             }
             Command::TestConnection { id, ip, port } => {
@@ -435,6 +440,7 @@ impl Core {
             Command::Status { .. }
             | Command::Attach
             | Command::Detach
+            | Command::Quit
             | Command::TestConnection { .. }
             | Command::TestLocalSite { .. }
             | Command::ProbeHost { .. }
@@ -450,8 +456,7 @@ impl Core {
                         return Err(Code::Busy);
                     }
                     local.server = address;
-                    local.identities.clear();
-                    local.labels.clear();
+                    local.clear_group();
                     Ok(())
                 });
                 if res.is_ok() {
@@ -547,10 +552,11 @@ impl Core {
                     return Err(Code::Busy);
                 }
                 self.edit(|local| {
-                    if let Some(old) = local.shares.iter_mut().find(|s| s.id == id) {
+                    let shares = local.shares_mut()?;
+                    if let Some(old) = shares.iter_mut().find(|s| s.id == id) {
                         *old = rule;
-                    } else if local.shares.len() < 32 {
-                        local.shares.push(rule);
+                    } else if shares.len() < 32 {
+                        shares.push(rule);
                     } else {
                         return Err(Code::Limit);
                     }
@@ -569,14 +575,14 @@ impl Core {
             Command::Remove { id } => {
                 self.share(id.clone(), false).await?;
                 self.edit(|l| {
-                    let removed_ip = l
-                        .shares
+                    let shares = l.shares_mut()?;
+                    let removed_ip = shares
                         .iter()
                         .find(|s| s.id == id)
                         .and_then(Publication::single_ip);
-                    l.shares.retain(|s| s.id != id);
+                    shares.retain(|s| s.id != id);
                     if let Some(ip) = removed_ip {
-                        let keeps_os = l.shares.iter().any(|s| {
+                        let keeps_os = shares.iter().any(|s| {
                             s.single_ip() == Some(ip)
                                 && matches!(
                                     s.effective_kind(),
@@ -584,7 +590,7 @@ impl Core {
                                 )
                         });
                         if !keeps_os {
-                            for s in &mut l.shares {
+                            for s in shares {
                                 if s.single_ip() == Some(ip) {
                                     s.host_os = None;
                                 }
@@ -617,20 +623,20 @@ impl Core {
                     return Err(Code::Invalid);
                 }
                 self.edit(|local| {
+                    let labels = local.labels_mut()?;
                     if let Some(alias) = &alias
-                        && local
-                            .labels
+                        && labels
                             .iter()
                             .any(|l| l.service != id && l.alias.as_ref() == Some(alias))
                     {
                         return Err(Code::Conflict);
                     }
-                    local.labels.retain(|l| l.service != id);
+                    labels.retain(|l| l.service != id);
                     if !remark.is_empty() || alias.is_some() {
-                        if local.labels.len() >= 256 {
+                        if labels.len() >= 256 {
                             return Err(Code::Limit);
                         }
-                        local.labels.push(Label {
+                        labels.push(Label {
                             service: id,
                             remark,
                             alias,
@@ -697,6 +703,7 @@ impl Core {
                     return Err(Code::Limit);
                 }
                 next.identities.insert(member.to_owned(), identity);
+                next.migrate_to_member(&session.member);
                 next.session = Some(Login {
                     member: session.member.clone(),
                     token: token.clone(),
@@ -753,7 +760,7 @@ impl Core {
             }
             let service = state
                 .local
-                .shares
+                .shares()
                 .iter()
                 .find(|s| s.id == id)
                 .cloned()
@@ -809,7 +816,7 @@ impl Core {
             let state = self.state.lock().unwrap();
             if unique
                 .iter()
-                .any(|id| !state.local.shares.iter().any(|s| &s.id == id))
+                .any(|id| !state.local.shares().iter().any(|s| &s.id == id))
             {
                 return Err(Code::Invalid);
             }
@@ -863,55 +870,58 @@ impl Core {
 
         let target_ids = {
             let mut state = self.state.lock().unwrap();
+            let sharing_ids: HashSet<String> = state.sharing.keys().cloned().collect();
             let mut next = state.local.clone();
             let mut target_ids = Vec::with_capacity(services.len());
             let mut new_entries = Vec::new();
-
-            for svc in &services {
-                let existing = next.shares.iter_mut().find(|s| {
-                    s.single_ip() == Some(ip)
-                        && matches!(
-                            s.rules.ports.as_slice(),
-                            [p] if p.start == svc.port && p.end == svc.port
-                        )
-                });
-                if let Some(share) = existing {
-                    target_ids.push(share.id.clone());
-                    if !state.sharing.contains_key(&share.id) {
-                        share.name = label.clone();
-                        share.kind = Some(svc.kind);
-                        share.http = svc.kind == ServiceKind::Http;
-                        if host_os.is_some() {
-                            share.host_os = host_os;
+            {
+                let shares = next.shares_mut()?;
+                for svc in &services {
+                    let existing = shares.iter_mut().find(|s| {
+                        s.single_ip() == Some(ip)
+                            && matches!(
+                                s.rules.ports.as_slice(),
+                                [p] if p.start == svc.port && p.end == svc.port
+                            )
+                    });
+                    if let Some(share) = existing {
+                        target_ids.push(share.id.clone());
+                        if !sharing_ids.contains(&share.id) {
+                            share.name = label.clone();
+                            share.kind = Some(svc.kind);
+                            share.http = svc.kind == ServiceKind::Http;
+                            if host_os.is_some() {
+                                share.host_os = host_os;
+                            }
+                        }
+                    } else {
+                        let id = hex::encode(rand::random::<[u8; 16]>());
+                        let rule = Publication {
+                            id: id.clone(),
+                            name: label.clone(),
+                            rules: Rules::parse(&ip_text, &svc.port.to_string())
+                                .map_err(|_| Code::Invalid)?,
+                            http: svc.kind == ServiceKind::Http,
+                            kind: Some(svc.kind),
+                            host_os,
+                        }
+                        .checked()?;
+                        target_ids.push(id);
+                        new_entries.push(rule);
+                    }
+                }
+                if shares.len() + new_entries.len() > 32 {
+                    return Err(Code::Limit);
+                }
+                if let Some(os) = host_os {
+                    for share in shares.iter_mut() {
+                        if share.single_ip() == Some(ip) && !sharing_ids.contains(&share.id) {
+                            share.host_os = Some(os);
                         }
                     }
-                } else {
-                    let id = hex::encode(rand::random::<[u8; 16]>());
-                    let rule = Publication {
-                        id: id.clone(),
-                        name: label.clone(),
-                        rules: Rules::parse(&ip_text, &svc.port.to_string())
-                            .map_err(|_| Code::Invalid)?,
-                        http: svc.kind == ServiceKind::Http,
-                        kind: Some(svc.kind),
-                        host_os,
-                    }
-                    .checked()?;
-                    target_ids.push(id);
-                    new_entries.push(rule);
                 }
+                shares.extend(new_entries);
             }
-            if next.shares.len() + new_entries.len() > 32 {
-                return Err(Code::Limit);
-            }
-            if let Some(os) = host_os {
-                for share in &mut next.shares {
-                    if share.single_ip() == Some(ip) && !state.sharing.contains_key(&share.id) {
-                        share.host_os = Some(os);
-                    }
-                }
-            }
-            next.shares.extend(new_entries);
             next.save(&self.dir)?;
             state.local = next;
             target_ids
@@ -1038,7 +1048,7 @@ impl Core {
                 (
                     s.network.clone(),
                     s.view.clone(),
-                    s.local.labels.clone(),
+                    s.local.labels().to_vec(),
                     s.link.as_ref().map(|l| l.server_ip),
                     s.wanted,
                 )
@@ -1313,7 +1323,7 @@ impl Core {
             }
             let site = state
                 .local
-                .shares
+                .shares()
                 .iter()
                 .find(|s| s.id == id)
                 .ok_or(Code::Offline)?;
@@ -1559,6 +1569,7 @@ mod tests {
             services: vec![Offering {
                 owner: "peer".into(),
                 member: "member".into(),
+                device: None,
                 service: Publication {
                     id: "fixture".into(),
                     name: "Site".into(),
@@ -1726,6 +1737,11 @@ mod tests {
             Some(Code::NotConnected)
         );
 
+        core.state.lock().unwrap().local.session = Some(Login {
+            member: "alice".into(),
+            token: "t".repeat(64),
+        });
+
         assert_eq!(
             core.execute(Command::SaveHost {
                 ip: Ipv4Addr::LOCALHOST,
@@ -1818,6 +1834,44 @@ mod tests {
         assert_eq!(s3.shares.len(), 1);
         assert_eq!(s3.shares[0].id, original_id);
         assert_eq!(s3.shares[0].host_os, None);
+
+        // Switching local session to another member isolates shares cleanly, and switching back restores them.
+        core.state.lock().unwrap().local.session = Some(Login {
+            member: "bob".into(),
+            token: "b".repeat(64),
+        });
+        assert!(core.status().shares.is_empty());
+        core.state.lock().unwrap().local.session = Some(Login {
+            member: "alice".into(),
+            token: "t".repeat(64),
+        });
+        assert_eq!(core.status().shares.len(), 1);
+        assert_eq!(core.status().shares[0].id, original_id);
+
+        // Verify legacy flat device.json migrates automatically into accounts[member].
+        let legacy_dir = tempfile::tempdir().unwrap();
+        let legacy_json = serde_json::json!({
+            "server": "https://example.com/",
+            "session": { "member": "alice", "token": "a".repeat(64) },
+            "shares": [{
+                "id": original_id,
+                "name": "Legacy",
+                "rules": {
+                    "ips": [{ "start": "198.51.100.35", "end": "198.51.100.35" }],
+                    "ports": [{ "start": 80, "end": 80 }]
+                },
+                "http": true
+            }]
+        });
+        crate::local::save(
+            &legacy_dir.path().join("device.json"),
+            legacy_json.to_string().as_bytes(),
+        )
+        .unwrap();
+        let migrated = Local::load(legacy_dir.path()).unwrap();
+        assert!(migrated.shares.is_empty());
+        assert_eq!(migrated.shares().len(), 1);
+        assert_eq!(migrated.shares()[0].name, "Legacy");
 
         core.stop();
         core.wait_stopped().await;

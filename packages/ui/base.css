@@ -272,10 +272,6 @@ dialog:focus { outline: none; }
 
 .workspace { padding-block: clamp(18px, 3.5vh, 28px) 40px; }
 .panel.panel-enter { animation: fesen-enter var(--dur-mid) var(--ease) both; }
-.tool-btn.pulse-hint {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 28%, transparent);
-}
 .panel-bar {
   display: flex;
   align-items: center;

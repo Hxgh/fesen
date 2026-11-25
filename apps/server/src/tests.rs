@@ -81,10 +81,10 @@ fn tcp_only_center_exchanges_bounded_ipv6_candidates() {
     let (access_out, mut access_in) = mpsc::channel(4);
     let (owner_out, mut owner_in) = mpsc::channel(4);
     let access = group
-        .connect("access", "member-a".into(), vec![1], access_out)
+        .connect("access", "member-a".into(), "DeviceA".into(), vec![1], access_out)
         .unwrap();
     let owner = group
-        .connect("owner", "member-b".into(), vec![2], owner_out)
+        .connect("owner", "member-b".into(), "DeviceB".into(), vec![2], owner_out)
         .unwrap();
     use fesen_proto::{Call, Publication};
     group
@@ -614,6 +614,22 @@ async fn admin_entry_loads_page_and_assets() {
         assert_eq!(page.status(), StatusCode::OK);
         assert!(page.headers().contains_key(header::CONTENT_SECURITY_POLICY));
     }
+    // Non-canonical Host (e.g. apex domain vs www) redirects to canonical origin /admin/ before login.
+    let no_redirect = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let alt_host = no_redirect
+        .get(format!("{base}admin/"))
+        .header(header::HOST, "example.com:8866")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(alt_host.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        alt_host.headers()[header::LOCATION],
+        format!("{base}admin/")
+    );
     for path in [
         "admin/style.css",
         "admin/app.js",
@@ -1592,6 +1608,10 @@ async fn same_account_supports_multiple_concurrent_devices() {
     .await
     .unwrap();
     eventually(|| phone.status().services.iter().any(|o| o.service.id == share_id)).await;
+    let phone_view = phone.status().services;
+    let offered = phone_view.iter().find(|o| o.service.id == share_id).unwrap();
+    assert_eq!(offered.member, "boss");
+    assert_eq!(offered.device.as_deref(), Some("BossMac"));
     assert!(mac.status().services.is_empty());
 
     // Logging out Phone only logs out Phone; Mac stays online with active share & valid admin session.

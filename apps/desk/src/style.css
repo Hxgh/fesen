@@ -2,6 +2,26 @@
 @import "../../../packages/ui/base.css";
 
 :root { --wrap: 780px; }
+.os-macos .topbar-inner {
+  width: 100%;
+  max-width: var(--wrap);
+  min-height: 52px;
+  padding-inline: 98px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.os-macos .identity { gap: 9px; }
+.os-macos .topbar-tabs { margin-left: 6px; gap: 14px; }
+.os-macos .topbar-tabs button { min-height: 52px; }
+.os-desktop:not(.os-macos) #brand-name { display: none; }
+.os-macos .brand-mark { pointer-events: none; }
+@media (min-width: 980px) {
+  .os-macos .topbar-inner {
+    padding-inline: max(24px, calc(98px - (100vw - var(--wrap)) / 2)) 24px;
+  }
+}
 body {
   padding-block: env(safe-area-inset-top, 0px) env(safe-area-inset-bottom, 0px);
   padding-inline: env(safe-area-inset-left, 0px) env(safe-area-inset-right, 0px);
@@ -43,6 +63,15 @@ body {
   color: var(--muted);
 }
 .flow-head .count { font-size: 11px; }
+.source-tag {
+  font-size: 11.5px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.source-tag.self {
+  color: var(--accent-ink);
+  font-weight: 550;
+}
 .empty-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 8px; }
 
 .toast {

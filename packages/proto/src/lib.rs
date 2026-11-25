@@ -148,6 +148,8 @@ pub fn valid_password(s: &str) -> bool {
 pub struct Offering {
     pub owner: String,
     pub member: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
     #[serde(flatten)]
     pub service: Publication,
 }

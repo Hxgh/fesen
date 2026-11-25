@@ -61,8 +61,9 @@ const CLIENT_COPY = {
   group_disconnected: ["未连接服务器", "Not connected"],
   connecting_now: ["正在连接…", "Connecting…"],
   connect_now: ["连接", "Connect"],
-  section_group: ["组内可用", "Available"],
+  section_group: ["来自组内", "From group"],
   section_mine: ["本机共享", "This device"],
+  source_self: ["本账号", "My account"],
   refresh_status: ["检测状态", "Check status"],
   unchecked: ["未测", "Test"],
   available: ["正常", "OK"],
@@ -111,6 +112,10 @@ const CLIENT_COPY = {
   connecting: ["连接中 · 点击取消", "Connecting · Click to cancel"],
   disconnected: ["点击连接", "Click to connect"],
   connect_first: ["未连接服务器，请先点击右上角连接", "Not connected; click connect in the top bar first"],
+  connect_prompt_title: ["需要连接服务器", "Server connection required"],
+  connect_prompt_body: ["开启「{target}」前需要先连接服务器，是否立即连接并开启？", "Connect to the server to start sharing \"{target}\"?"],
+  connect_and_share: ["连接并开启", "Connect & share"],
+  logging_in: ["登录中…", "Signing in…"],
   routing_unavailable: ["当前安装包未含系统路由扩展，仅支持对外共享。", "Unsigned build without system routing; publishing only."],
 } as const;
 

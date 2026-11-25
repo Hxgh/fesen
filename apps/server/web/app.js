@@ -157,20 +157,31 @@ byId("login").addEventListener("submit", async (e) => {
   const btn = form.querySelector("[type=submit]");
   const errEl = byId("login-error");
   if (btn.disabled) return;
-  const body = Object.fromEntries(new FormData(form));
+  const raw = new FormData(form);
+  const body = {
+    username: String(raw.get("username") || "").trim(),
+    password: String(raw.get("password") || ""),
+  };
   form.elements.password.value = "";
   btn.disabled = true;
+  btn.textContent = t("logging_in");
   errEl.hidden = true;
   topMark.setState("connecting");
   try {
     await api("login", body);
-    await admin.refresh();
+    try {
+      await admin.refresh({ throwOnError: true });
+    } catch (err) {
+      if (err?.status === 401) throw new Error(t("cookie_blocked"));
+      throw err;
+    }
   } catch (err) {
     topMark.setState("idle");
     errEl.textContent = err instanceof Error ? err.message : failure(err);
     errEl.hidden = false;
   } finally {
     btn.disabled = false;
+    btn.textContent = t("login");
   }
 });
 

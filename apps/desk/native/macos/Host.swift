@@ -14,7 +14,9 @@ func phSiteViewportTop(_ ptr: UnsafeMutableRawPointer) -> Int32 {
     let rect = view.convert(view.bounds, to: parent)
     let top = parent.isFlipped ? rect.minY - parent.bounds.minY : parent.bounds.maxY - rect.maxY
     let contentInset = view.enclosingScrollView?.contentInsets.top ?? 0
-    let windowInset = window.frame.height - window.contentLayoutRect.maxY
+    let windowInset = window.styleMask.contains(.fullSizeContentView)
+        ? 0
+        : window.frame.height - window.contentLayoutRect.maxY
     return Int32((max(top + contentInset, windowInset, 0) * window.backingScaleFactor).rounded())
 }
 
@@ -164,15 +166,25 @@ final class AppleHost {
 
     func openTray() {
         guard MenuBarPreference.local.enabled else { closeTray(); return }
+        for app in NSWorkspace.shared.runningApplications where MenuBarPreference.isMenu(app.executableURL, in: bundleURLIfAny()) {
+            if !app.isTerminated { return }
+        }
         if tray?.isRunning == true { return }
         let executable = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/fesen-menu")
         let process = Process()
         process.executableURL = executable
         process.arguments = [invalidPackage == nil ? "--extension" : "--local"]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
         if (try? process.run()) != nil { tray = process }
     }
 
+    private func bundleURLIfAny() -> URL { Bundle.main.bundleURL }
+
     func closeTray() {
+        tray?.terminate()
+        tray = nil
         // Reopened GUIs don't own the old Process handle. Match only the menu executable, never the core.
         let bundle = Bundle.main.bundleURL
         DistributedNotificationCenter.default().postNotificationName(MenuBarPreference.changed,
@@ -183,13 +195,30 @@ final class AppleHost {
     }
 }
 
+@_cdecl("ph_host_configure_window")
+@MainActor func hostConfigureWindow(_ ptr: UnsafeMutableRawPointer) {
+    let window = Unmanaged<NSWindow>.fromOpaque(ptr).takeUnretainedValue()
+    window.titlebarAppearsTransparent = true
+    window.titlebarSeparatorStyle = .none
+    if let close = window.standardWindowButton(.closeButton),
+       let titlebarView = close.superview {
+        for sub in titlebarView.subviews where !(sub is NSControl) {
+            sub.isHidden = true
+        }
+    }
+}
+
 @_cdecl("ph_host_publisher_main")
 @MainActor func hostPublisherMain() {
     guard Bundle.main.bundleIdentifier == "io.fesen.client" else { return }
-    Publisher(bundle: Bundle.main.bundleURL).run()
+    let publisher = Publisher()
+    let app = NSApplication.shared
+    app.setActivationPolicy(.prohibited)
+    app.delegate = publisher
+    withExtendedLifetime(publisher) { app.run() }
 }
 
-@MainActor private final class Publisher: Accessory {
+@MainActor private final class Publisher: NSObject, NSApplicationDelegate {
     private let physical = PhysicalNetwork()
     private var finished = false
     private var terminating = false
@@ -281,16 +310,23 @@ typealias Callback = @convention(c) (UInt, UnsafePointer<UInt8>?, Int) -> Void
 func hostLaunchPublisher(_ context: UInt, _ done: @escaping @convention(c) (UInt, Int32) -> Void) {
     DispatchQueue.main.async {
         let bundle = Bundle.main
-        guard bundle.bundleIdentifier == "io.fesen.client", bundle.bundleURL.pathExtension == "app" else {
+        guard bundle.bundleIdentifier == "io.fesen.client",
+              bundle.bundleURL.pathExtension == "app",
+              let executable = bundle.executableURL
+        else {
             done(context, 0); return
         }
-        let config = NSWorkspace.OpenConfiguration()
-        config.createsNewApplicationInstance = true
-        config.activates = false
-        config.addsToRecentItems = false
-        config.arguments = ["--publisher"]
-        NSWorkspace.shared.openApplication(at: bundle.bundleURL, configuration: config) { app, error in
-            done(context, app != nil && error == nil ? 1 : 0)
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = ["--publisher"]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            done(context, 1)
+        } catch {
+            done(context, 0)
         }
     }
 }
@@ -342,5 +378,14 @@ func hostTray() {
         MainActor.assumeIsolated { AppleHost.shared.openTray() }
     } else {
         DispatchQueue.main.sync { AppleHost.shared.openTray() }
+    }
+}
+
+@_cdecl("ph_host_close_tray")
+func hostCloseTray() {
+    if Thread.isMainThread {
+        MainActor.assumeIsolated { AppleHost.shared.closeTray() }
+    } else {
+        DispatchQueue.main.sync { AppleHost.shared.closeTray() }
     }
 }

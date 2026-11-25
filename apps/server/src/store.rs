@@ -101,7 +101,7 @@ pub fn authorize_device(
     cert: &[u8],
     new_login: Option<(&str, &str)>,
     token: &str,
-) -> Result<(String, String), Code> {
+) -> Result<(String, String, String), Code> {
     if let Some((member, label)) = new_login {
         let id = hex::encode(rand::random::<[u8; 16]>());
         db.query_row(
@@ -109,9 +109,9 @@ pub fn authorize_device(
              VALUES(?1,?2,?3,?4,?5,unixepoch()) ON CONFLICT(cert) DO UPDATE
              SET token=excluded.token,label=excluded.label,seen=unixepoch()
              WHERE devices.member=excluded.member AND devices.revoked=0
-             RETURNING id,member",
+             RETURNING id,member,label",
             params![id, member, label, cert, hash_secret(token)],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .map_err(sql_code)
     } else {
@@ -119,9 +119,9 @@ pub fn authorize_device(
             "UPDATE devices SET seen=unixepoch()
              WHERE token=?1 AND cert=?2 AND revoked=0
              AND EXISTS(SELECT 1 FROM users WHERE name=devices.member AND disabled=0)
-             RETURNING id,member",
+             RETURNING id,member,label",
             params![hash_secret(token), cert],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .map_err(sql_code)
     }

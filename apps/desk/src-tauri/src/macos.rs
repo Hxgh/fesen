@@ -7,14 +7,22 @@ type Reply = unsafe extern "C" fn(usize, *const u8, usize);
 
 unsafe extern "C" {
     fn ph_site_viewport_top(view: *mut std::ffi::c_void) -> i32;
+    fn ph_host_configure_window(window: *mut std::ffi::c_void);
     fn ph_host_call(bytes: *const u8, count: usize, mode: i32, context: usize, callback: Reply);
     fn ph_host_open_settings() -> i32;
     fn ph_host_menu_bar_setting(value: i32) -> i32;
     fn ph_host_can_route() -> i32;
     fn ph_host_notify_status(state: i32);
     fn ph_host_tray();
+    fn ph_host_close_tray();
     fn ph_host_launch_publisher(context: usize, done: unsafe extern "C" fn(usize, i32));
     fn ph_host_publisher_main();
+}
+
+pub fn configure_window(window: &tauri::WebviewWindow) {
+    if let Ok(ns_window) = window.ns_window() {
+        unsafe { ph_host_configure_window(ns_window) };
+    }
 }
 
 // Runs on the executable's main thread, before Tauri, its WebView or the GUI singleton.
@@ -145,6 +153,10 @@ pub fn open_settings() -> Result<(), String> {
 
 pub fn tray() {
     unsafe { ph_host_tray() }
+}
+
+pub fn close_tray() {
+    unsafe { ph_host_close_tray() }
 }
 
 pub fn menu_bar_setting(enabled: Option<bool>) -> Result<bool, String> {

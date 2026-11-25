@@ -295,7 +295,7 @@ async fn control(mut socket: WebSocket, app: App) {
                 None => {}
             }
         }
-        let (id, member) = store::authorize_device(
+        let (id, member, label) = store::authorize_device(
             &g.db,
             cert,
             login.as_ref().map(|(u, l, _)| (u.as_str(), l.as_str())),
@@ -309,7 +309,7 @@ async fn control(mut socket: WebSocket, app: App) {
         } else {
             None
         };
-        let session = g.connect(&id, member.clone(), cert.clone(), tx)?;
+        let session = g.connect(&id, member.clone(), label, cert.clone(), tx)?;
         Ok((id, member, login.map(|_| token), is_admin, admin_token, session))
     }
     .await;

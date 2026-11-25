@@ -52,6 +52,11 @@ private enum LocalCoreIPC {
         send(json: "{\"op\":\"stop\"}", timeoutMs: 800) != nil
     }
 
+    @discardableResult
+    static func sendQuit() -> Bool {
+        send(json: "{\"op\":\"quit\"}", timeoutMs: 600) != nil
+    }
+
     static func sendStart() -> (state: MarkState, signedIn: Bool)? {
         guard let reply = send(json: "{\"op\":\"start\"}", timeoutMs: 3000) else { return nil }
         guard let data = reply["data"] as? [String: Any] else {
@@ -304,7 +309,7 @@ private let trigramPaths: [[UInt8]] = [
         toggleItem?.target = self
         toggleItem?.isEnabled = true
         menu.addItem(.separator())
-        menu.addItem(withTitle: zh ? "退出菜单栏" : "Quit menu bar", action: #selector(quitMenu), keyEquivalent: "").target = self
+        menu.addItem(withTitle: zh ? "退出飞弦" : "Quit Fesen", action: #selector(quitApp), keyEquivalent: "").target = self
         status.menu = menu
         if usesExtension { Task { await refreshTunnel() } }
         else { syncStatus() }
@@ -342,13 +347,18 @@ private let trigramPaths: [[UInt8]] = [
     }
 
     private func launchBackgroundPublisher(completion: @escaping @Sendable (Bool) -> Void) {
-        let config = NSWorkspace.OpenConfiguration()
-        config.createsNewApplicationInstance = true
-        config.activates = false
-        config.addsToRecentItems = false
-        config.arguments = ["--publisher"]
-        NSWorkspace.shared.openApplication(at: bundle, configuration: config) { app, error in
-            completion(app != nil && error == nil)
+        let executable = bundle.appendingPathComponent("Contents/MacOS/fesen")
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = ["--publisher"]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            completion(true)
+        } catch {
+            completion(false)
         }
     }
 
@@ -427,6 +437,27 @@ private let trigramPaths: [[UInt8]] = [
                     }
                     self?.setMark(.idle)
                 }
+            }
+        }
+    }
+
+    @objc private func quitApp() {
+        animTimer?.invalidate()
+        animTimer = nil
+        _ = instance(.regular)?.terminate()
+        if usesExtension {
+            tunnel?.connection.stopVPNTunnel()
+            NSApp.terminate(nil)
+            return
+        }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let quitOk = LocalCoreIPC.sendQuit()
+            DispatchQueue.main.async {
+                if !quitOk {
+                    _ = self?.instance(.prohibited)?.terminate()
+                    _ = self?.instance(.accessory)?.terminate()
+                }
+                NSApp.terminate(nil)
             }
         }
     }

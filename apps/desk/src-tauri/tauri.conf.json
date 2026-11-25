@@ -17,7 +17,10 @@
       "height": 740,
       "minWidth": 360,
       "minHeight": 540,
-      "center": true
+      "center": true,
+      "titleBarStyle": "Overlay",
+      "hiddenTitle": true,
+      "trafficLightPosition": { "x": 16, "y": 28 }
     }],
     "security": {
       "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; style-src 'self'; img-src 'self' data:; base-uri 'none'; object-src 'none'"

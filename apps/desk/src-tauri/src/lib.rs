@@ -158,6 +158,13 @@ pub fn run() {
         site::site_view,
         site::service_action
     ]);
+    #[cfg(target_os = "macos")]
+    let app = app.setup(|app| {
+        if let Some(window) = app.get_webview_window("main") {
+            macos::configure_window(&window);
+        }
+        Ok(())
+    });
     #[cfg(any(windows, target_os = "macos"))]
     let app = app.on_window_event(|window, event| {
         if window.label() != "main" {
@@ -170,7 +177,7 @@ pub fn run() {
             let keep_menu = macos::menu_bar_setting(None).unwrap_or(true);
             tauri::async_runtime::spawn(async move {
                 #[cfg(target_os = "macos")]
-                let op = if keep_menu { "detach" } else { "stop" };
+                let op = if keep_menu { "detach" } else { "quit" };
                 #[cfg(not(target_os = "macos"))]
                 let op = "detach";
                 let _ = tokio::time::timeout(
@@ -181,6 +188,8 @@ pub fn run() {
                 #[cfg(target_os = "macos")]
                 if keep_menu {
                     macos::tray();
+                } else {
+                    macos::close_tray();
                 }
                 handle.exit(0);
             });

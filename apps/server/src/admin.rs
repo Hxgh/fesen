@@ -4,8 +4,8 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    extract::{DefaultBodyLimit, OriginalUri, State},
+    http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -18,11 +18,35 @@ fn js_asset(body: &'static str) -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], body)
 }
 
+fn canonical_entry(uri: &Uri, headers: &HeaderMap, app: &App) -> Option<Response> {
+    let host = uri
+        .authority()
+        .map(|a| a.as_str())
+        .or_else(|| headers.get(header::HOST).and_then(|v| v.to_str().ok()))?;
+    let expected_host = app.origin.host_str()?;
+    let expected_authority = match app.origin.port() {
+        Some(p) => format!("{expected_host}:{p}"),
+        None => expected_host.to_owned(),
+    };
+    if host.eq_ignore_ascii_case(&expected_authority) {
+        return None;
+    }
+    let target = app.origin.join("/admin/").ok()?;
+    Some(axum::response::Redirect::temporary(target.as_str()).into_response())
+}
+
 pub fn router() -> Router<App> {
     Router::new()
         .route(
             "/",
-            get(|| async { Html(include_str!("../web/index.html")) }),
+            get(
+                |State(app): State<App>, OriginalUri(uri): OriginalUri, headers: HeaderMap| async move {
+                    if let Some(redirect) = canonical_entry(&uri, &headers, &app) {
+                        return redirect;
+                    }
+                    Html(include_str!("../web/index.html")).into_response()
+                },
+            ),
         )
         .route("/app.js", get(|| async { js_asset(include_str!("../web/app.js")) }))
         .route("/icons.js", get(|| async { js_asset(include_str!("../../../packages/ui/icons.js")) }))

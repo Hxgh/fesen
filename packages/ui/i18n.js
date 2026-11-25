@@ -39,6 +39,8 @@ export const SHARED_COPY = {
   devices_empty: ["暂无设备接入", "No devices yet"],
   services_empty: ["暂无广播服务", "No active services"],
   login: ["登录", "Sign in"],
+  logging_in: ["登录中…", "Signing in…"],
+  cookie_blocked: ["登录未生效，请确认通过正确域名访问且浏览器未禁用 Cookie", "Sign-in did not persist; verify the canonical URL and enable cookies"],
   logout: ["退出登录", "Sign out"],
   join: ["接入链接", "Join link"],
   copy_link: ["复制链接", "Copy link"],

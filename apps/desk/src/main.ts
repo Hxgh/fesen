@@ -35,7 +35,7 @@ type Share = {
   host_os?: HostOs;
   rules: { ips: Span<string>[]; ports: Span<number>[] };
 };
-type Offering = Share & { owner: string; member: string };
+type Offering = Share & { owner: string; member: string; device?: string };
 type Label = { service: string; remark: string; alias: string | null; ip: string | null };
 type Mapping = { original: Span<string>; virtual_ip: Span<string> };
 type ProbeOutcome = {
@@ -95,6 +95,8 @@ type MenuEntry =
 const effectiveKind = (s: Share): ServiceKind => rawEffectiveKind(s) as ServiceKind;
 const mac = /Macintosh/.test(navigator.userAgent);
 const desktop = !/Android/i.test(navigator.userAgent);
+if (desktop) document.documentElement.classList.add("os-desktop");
+if (mac) document.documentElement.classList.add("os-macos");
 const theme = createTheme("fesen_theme");
 
 const DEFAULT_WIN = { w: 430, h: 740 };
@@ -347,6 +349,7 @@ function form(action: (values: FormData) => void, ...rows: HTMLElement[]) {
   const view = el("form", "stack", ...rows);
   view.addEventListener("submit", (event) => {
     event.preventDefault();
+    if (busy) return;
     const data = new FormData(view);
     const password = view.querySelector<HTMLInputElement>('[type="password"]');
     if (password) password.value = "";
@@ -361,14 +364,29 @@ const flowErrors = new Set(["offline", "direct_failed", "target_unavailable", "t
 const showError = () => {
   const last = status?.error;
   const code = message === "extension_setup" ? "" : message || (status?.online && last && flowErrors.has(last) ? "" : last);
-  errorLine.hidden = !code;
-  errorLine.textContent = code ? failure(code) : "";
+  const inlineError = content.querySelector<HTMLParagraphElement>(".signin [role=alert]");
+  if (inlineError) {
+    inlineError.hidden = !code;
+    inlineError.textContent = code ? failure(code) : "";
+    errorLine.hidden = true;
+    errorLine.textContent = "";
+  } else {
+    errorLine.hidden = !code;
+    errorLine.textContent = code ? failure(code) : "";
+  }
   const dialogError = editor.querySelector<HTMLParagraphElement>("[role=alert]");
   if (dialogError) {
     dialogError.hidden = !message;
     dialogError.textContent = message ? failure(message) : "";
   }
 };
+
+function syncSigninSubmit() {
+  const btn = content.querySelector<HTMLButtonElement>('.signin button[type="submit"]');
+  if (!btn) return;
+  btn.disabled = busy;
+  if (btn.dataset.loginBtn === "1") btn.textContent = t(busy ? "logging_in" : "login");
+}
 
 async function request(body: Request, launch: boolean): Promise<Status> {
   const reply = await invoke<Reply>("core_command", { request: body, launch });
@@ -381,6 +399,7 @@ async function act(body: Request, done?: () => void) {
   busy = true;
   message = "";
   showError();
+  syncSigninSubmit();
   syncBrand();
   try {
     status = await request(body, true);
@@ -393,6 +412,7 @@ async function act(body: Request, done?: () => void) {
     else showError();
   } finally {
     busy = false;
+    syncSigninSubmit();
     syncBrand();
     applyJoinLink();
   }
@@ -778,11 +798,20 @@ function probeVisual(service: Offering, data: Status, routing: boolean) {
   return { ips, overlapped, badge, httpTag, note, pending, result };
 }
 
-function serviceRow(address: string, subtitle: string, tags: HTMLElement[], ...controls: HTMLElement[]) {
+function sourceText(service: Offering, currentMember: string | null): { text: string; self: boolean } {
+  const self = !!currentMember && service.member === currentMember;
+  const dev = service.device?.trim() || "";
+  if (self) {
+    return { text: dev ? `${t("source_self")} · ${dev}` : t("source_self"), self: true };
+  }
+  return { text: dev ? `${service.member} · ${dev}` : service.member, self: false };
+}
+
+function serviceRow(address: string, metaNodes: (HTMLElement | string)[], tags: HTMLElement[], ...controls: HTMLElement[]) {
   return el("article", "service-row",
     el("div", "service-main",
       el("div", "host-title-line", el("p", "endpoint", address), ...tags),
-      ...(subtitle ? [el("div", "service-meta", el("span", "service-name", subtitle))] : [])
+      ...(metaNodes.length ? [el("div", "service-meta", ...metaNodes)] : [])
     ),
     el("div", "service-actions", ...controls)
   );
@@ -798,7 +827,17 @@ function groupSingleRow(service: Offering, data: Status, routing: boolean) {
   const os = resolveHostOs([service], [result?.hostOs]) as HostOs | null;
   const displayName = ip ? meaningfulHostName(rawName, ip, os) : rawName;
   const alias = label?.alias && data.aliases[label.alias] ? label.alias : null;
-  const subtitle = [displayName, alias].filter(Boolean).join(" · ");
+  const src = sourceText(service, data.member);
+
+  const metaParts: (HTMLElement | string)[] = [];
+  if (displayName) metaParts.push(el("span", "service-name", displayName));
+  if (metaParts.length) metaParts.push(el("span", "meta-sep", "·"));
+  metaParts.push(el("span", src.self ? "source-tag self" : "source-tag", src.text));
+  if (alias) {
+    metaParts.push(el("span", "meta-sep", "·"));
+    metaParts.push(el("span", "mono", alias));
+  }
+
   const tags: HTMLElement[] = [];
   if (os) tags.push(el("span", "host-os-tag", osLabel(os)));
   if (kind !== "tcp") tags.push(el("span", "proto-tag", kindBadgeText(kind)));
@@ -809,7 +848,7 @@ function groupSingleRow(service: Offering, data: Status, routing: boolean) {
     tags.push(ov);
   }
   const row = serviceRow(
-    address, subtitle, tags, badge,
+    address, metaParts, tags, badge,
     rowActions(service, rawName, service.owner, routing, () => customize(service, label, routing))
   );
   if (overlapped) row.append(el("p", "probe-note", `${t("original_ip")} ${ranges(service.rules.ips)}`));
@@ -827,6 +866,7 @@ function groupHostCard(ip: string, items: Offering[], data: Status, routing: boo
   const anyPending = probed.some(p => p && !p.result);
   const hostOs = resolveHostOs(items, probed.map(p => p?.result?.hostOs)) as HostOs | null;
   const cleanName = meaningfulHostName(rawHostName, ip, hostOs);
+  const src = sourceText(items[0]!, data.member);
 
   const testAll = tool("refresh", t("test_host"), () => testHostServices(items));
   testAll.disabled = anyPending || !data.online || busy;
@@ -842,12 +882,14 @@ function groupHostCard(ip: string, items: Offering[], data: Status, routing: boo
 
   const metaParts: (HTMLElement | string)[] = [];
   if (cleanName) metaParts.push(el("span", "service-name", cleanName));
+  if (metaParts.length) metaParts.push(el("span", "meta-sep", "·"));
+  metaParts.push(el("span", src.self ? "source-tag self" : "source-tag", src.text));
   if (alias) {
-    if (metaParts.length) metaParts.push(el("span", "meta-sep", "·"));
+    metaParts.push(el("span", "meta-sep", "·"));
     metaParts.push(el("span", "mono", alias));
   }
   if (overlapped) {
-    if (metaParts.length) metaParts.push(el("span", "meta-sep", "·"));
+    metaParts.push(el("span", "meta-sep", "·"));
     metaParts.push(el("span", "mono", `${t("original_ip")} ${ip}`));
   }
 
@@ -1384,19 +1426,63 @@ function shareEditAction(s: Share, address: string) {
   };
 }
 
-let pulseTimer: number | undefined;
-function hintConnectFirst() {
-  notify(t("connect_first"));
-  const connBtn = actions.querySelector<HTMLButtonElement>("[data-connect-btn]");
-  if (!connBtn) return;
-  window.clearTimeout(pulseTimer);
-  connBtn.classList.add("pulse-hint");
-  pulseTimer = window.setTimeout(() => connBtn.classList.remove("pulse-hint"), 900);
+function confirmConnectAndShare(targetLabel: string, shareReq: Request) {
+  if (busy) return;
+  message = "";
+  const cancelBtn = button(t("cancel"), () => { if (!busy) editor.close(); }, "button");
+  const confirmBtn = button(t("connect_and_share"), () => void run(), "button primary");
+
+  async function run() {
+    if (busy) return;
+    busy = true;
+    message = "";
+    showError();
+    syncBrand();
+    cancelBtn.disabled = true;
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = t("connecting_now");
+    try {
+      let cur = await request({ op: "start" }, true);
+      status = cur;
+      if (!cur.online) {
+        for (let i = 0; i < 25; i++) {
+          await new Promise((r) => window.setTimeout(r, 120));
+          cur = await request({ op: "status", ui: true }, false);
+          status = cur;
+          if (cur.online) break;
+          if (!cur.running) break;
+        }
+      }
+      if (!cur.online) {
+        throw cur.error ?? "not_connected";
+      }
+      status = await request(shareReq, true);
+      editor.close();
+      render(true);
+    } catch (error) {
+      message = typeof error === "string" ? error : "internal";
+      showError();
+    } finally {
+      busy = false;
+      cancelBtn.disabled = false;
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = t("connect_and_share");
+      syncBrand();
+      applyJoinLink();
+    }
+  }
+
+  showDialog(
+    t("connect_prompt_title"),
+    [el("p", "muted", t("connect_prompt_body").replace("{target}", targetLabel))],
+    [cancelBtn, confirmBtn],
+    true
+  );
 }
 
-function makeToggle(checked: boolean, label: string, offlineBlocked: boolean, onToggle: () => void, fraction?: string) {
+function makeToggle(checked: boolean, label: string, onOffline: (() => void) | null, onToggle: () => void, fraction?: string) {
   const sw = button("", () => {
-    if (offlineBlocked) { hintConnectFirst(); return; }
+    if (onOffline) { onOffline(); return; }
     onToggle();
   }, "switch");
   if (fraction) sw.append(el("span", "switch-fraction", fraction));
@@ -1407,9 +1493,9 @@ function makeToggle(checked: boolean, label: string, offlineBlocked: boolean, on
   sw.setAttribute("aria-label", label);
   sw.setAttribute("aria-checked", String(checked));
   if (fraction) sw.setAttribute("data-partial", "true");
-  if (offlineBlocked) {
+  if (onOffline) {
     sw.setAttribute("data-offline", "true");
-    sw.title = t("connect_first");
+    sw.title = t("connect_prompt_title");
   }
   return sw;
 }
@@ -1417,17 +1503,22 @@ function makeToggle(checked: boolean, label: string, offlineBlocked: boolean, on
 function mineSingleRow(s: Share, data: Status) {
   const kind = effectiveKind(s);
   const active = data.active.includes(s.id);
-  const publish = makeToggle(active, `${t("publish")} · ${s.name}`, !data.online && !active,
-    () => void act({ op: "share", id: s.id, enabled: !active }));
-  const address = endpoint(s.rules.ips, s.rules.ports);
   const ip = singleIp(s);
+  const targetLabel = ip ? `${ip}:${ranges(s.rules.ports)}` : s.name;
+  const publish = makeToggle(
+    active,
+    `${t("publish")} · ${s.name}`,
+    !data.online && !active ? () => confirmConnectAndShare(targetLabel, { op: "share", id: s.id, enabled: true }) : null,
+    () => void act({ op: "share", id: s.id, enabled: !active })
+  );
+  const address = endpoint(s.rules.ips, s.rules.ports);
   const os = resolveHostOs([s]) as HostOs | null;
   const subtitle = ip ? meaningfulHostName(s.name, ip, os) : s.name;
   const tags: HTMLElement[] = [];
   if (os) tags.push(el("span", "host-os-tag", osLabel(os)));
   if (kind !== "tcp") tags.push(el("span", "proto-tag", kindBadgeText(kind)));
   return serviceRow(
-    address, subtitle, tags, publish,
+    address, subtitle ? [el("span", "service-name", subtitle)] : [], tags, publish,
     rowActions(s, s.name, undefined, true, shareEditAction(s, address))
   );
 }
@@ -1444,7 +1535,9 @@ function mineHostCard(ip: string, items: Share[], data: Status) {
   const master = makeToggle(
     allActive,
     `${t("publish")} · ${cleanName || ip}`,
-    !data.online && activeCount === 0,
+    !data.online && activeCount === 0
+      ? () => confirmConnectAndShare(cleanName ? `${cleanName} (${ip})` : ip, { op: "share_many", ids: items.map(s => s.id), enabled: true })
+      : null,
     () => void act({ op: "share_many", ids: items.map(s => s.id), enabled: !allActive }),
     partial ? `${activeCount}/${items.length}` : undefined
   );
@@ -1463,9 +1556,13 @@ function mineHostCard(ip: string, items: Share[], data: Status) {
   const portsWrap = el("div", "host-ports", ...items.map((s) => {
     const kind = effectiveKind(s);
     const active = data.active.includes(s.id);
-    const publish = makeToggle(active, `${t("publish")} · ${s.name}`, !data.online && !active,
-      () => void act({ op: "share", id: s.id, enabled: !active }));
     const portText = `:${ranges(s.rules.ports)}`;
+    const publish = makeToggle(
+      active,
+      `${t("publish")} · ${s.name}`,
+      !data.online && !active ? () => confirmConnectAndShare(`${ip}${portText}`, { op: "share", id: s.id, enabled: true }) : null,
+      () => void act({ op: "share", id: s.id, enabled: !active })
+    );
     const subName = s.name !== rawHostName ? meaningfulHostName(s.name, ip, hostOs) : "";
     const address = endpoint(s.rules.ips, s.rules.ports);
     const row = el("div", "port-row",
@@ -1509,23 +1606,23 @@ function servicesView(data: Status) {
   }
 
   const routing = data.system_routing !== false;
-  const makeRemoteBlock = (withHead: boolean) => el("div", "flow-section",
-    ...(withHead ? [el("div", "flow-head", el("span", "", t("section_group")), el("span", "count", String(data.services.length)))] : []),
+  const makeRemoteBlock = () => el("div", "flow-section",
+    el("div", "flow-head", el("span", "", t("section_group")), el("span", "count", String(data.services.length))),
     groupList(data),
     ...(routing ? [] : [el("p", "routing-note", t("routing_unavailable"))])
   );
-  const makeLocalBlock = (withHead: boolean) => el("div", "flow-section",
-    ...(withHead ? [el("div", "flow-head", el("span", "", t("section_mine")), el("span", "count", String(data.shares.length)))] : []),
+  const makeLocalBlock = () => el("div", "flow-section",
+    el("div", "flow-head", el("span", "", t("section_mine")), el("span", "count", String(data.shares.length))),
     mineList(data)
   );
 
   if (hasRemote && hasLocal) {
     const blocks = routing
-      ? [makeRemoteBlock(true), makeLocalBlock(true)]
-      : [makeLocalBlock(true), makeRemoteBlock(true)];
+      ? [makeRemoteBlock(), makeLocalBlock()]
+      : [makeLocalBlock(), makeRemoteBlock()];
     return el("div", "service-flow", ...blocks);
   }
-  return el("div", "service-flow", hasRemote ? makeRemoteBlock(false) : makeLocalBlock(false));
+  return el("div", "service-flow", hasRemote ? makeRemoteBlock() : makeLocalBlock());
 }
 
 function addShare(emptyState = false) {
@@ -1687,17 +1784,23 @@ function render(force = false) {
   }
   if (!data.member) {
     navTabs.replaceChildren();
+    const inlineAlert = el("p", "feedback error");
+    inlineAlert.setAttribute("role", "alert");
+    inlineAlert.hidden = true;
     if (!data.server || joining) {
       content.replaceChildren(el("section", "signin", form((values) => {
-        void act({ op: "join", address: str(values, "address") }, () => { joining = false; });
+        void act({ op: "join", address: str(values, "address").trim() }, () => { joining = false; });
       }, el("h2", "form-title", t("join_group")),
       field(t("join_link"), "address", data.server, { required: true, maxLength: 1024, placeholder: "fesen://join…" }),
+      inlineAlert,
       data.server
         ? el("div", "signin-actions",
             button(t("cancel"), () => { joining = false; render(true); }, "button"),
             submit(t("save")))
         : submit(t("save")))));
     } else {
+      const loginBtn = submit(t("login"));
+      loginBtn.dataset.loginBtn = "1";
       content.replaceChildren(el("section", "signin",
         form((values) => void act({ op: "login", username: str(values, "username").trim(),
           password: str(values, "password"), label: str(values, "label").trim() }),
@@ -1709,8 +1812,11 @@ function render(force = false) {
         field(t("password"), "password", "", { required: true, type: "password", autocomplete: "current-password" }),
         field(t("device"), "label", /Android/i.test(navigator.userAgent) ? "Android" : /Windows/i.test(navigator.userAgent) ? "Windows" : "Mac",
           { required: true, maxLength: 64 }),
-        submit(t("login")))));
+        inlineAlert,
+        loginBtn)));
     }
+    showError();
+    syncSigninSubmit();
     return;
   }
 
@@ -1787,8 +1893,8 @@ async function boot() {
   render(true);
   void getCurrent().then(deepLink).catch(() => {});
   void onOpenUrl(deepLink).catch(() => {});
-  window.setInterval(async () => {
-    if (busy || polling || (mac && !status) || document.visibilityState === "hidden") return;
+  const pollOnce = async () => {
+    if (busy || polling || (mac && !status) || (!desktop && document.visibilityState === "hidden")) return;
     polling = true;
     try {
       const next = await request({ op: "status", ui: true }, false);
@@ -1797,12 +1903,27 @@ async function boot() {
         render();
       }
     } catch {
+      if (mac && status) {
+        try {
+          const reattached = await request({ op: "attach" }, false);
+          if (!busy) {
+            status = reattached;
+            render();
+            return;
+          }
+        } catch {}
+      }
       if (status?.online || status?.running) {
         status = { ...status, running: false, online: false, active: [], active_flows: 0, services: [], virtual_ips: [], aliases: {} };
         render();
       }
     } finally { polling = false; }
-  }, 1800);
+  };
+  window.addEventListener("focus", () => { void pollOnce(); });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") void pollOnce();
+  });
+  window.setInterval(() => { void pollOnce(); }, 1800);
 }
 
 void boot();
