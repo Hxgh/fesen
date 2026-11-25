@@ -614,9 +614,19 @@ async fn admin_entry_loads_page_and_assets() {
         assert_eq!(page.status(), StatusCode::OK);
         assert!(page.headers().contains_key(header::CONTENT_SECURITY_POLICY));
     }
-    for path in ["admin/style.css", "admin/app.js", "admin/icons.js"] {
+    for path in [
+        "admin/style.css",
+        "admin/app.js",
+        "admin/icons.js",
+        "admin/theme.js",
+        "admin/i18n.js",
+        "admin/popover.js",
+        "admin/host-card.js",
+        "admin/settings.js",
+        "admin/admin-view.js",
+    ] {
         let asset = client.get(format!("{base}{path}")).send().await.unwrap();
-        assert_eq!(asset.status(), StatusCode::OK);
+        assert_eq!(asset.status(), StatusCode::OK, "{path}");
     }
     for (preferred, expected, text) in [
         ("zh-CN,en;q=0.8", "zh-CN", "接入组"),
@@ -1383,6 +1393,215 @@ async fn lab_host_discovery_and_quic_tunnel() {
     eventually(|| publisher.status().active.is_empty() && reader.status().services.is_empty()).await;
 
     for core in [publisher, reader] {
+        core.stop();
+        core.wait_stopped().await;
+    }
+    web.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_core_admin_bridge_follows_single_account_role() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = store::db(&dir.path().join("db")).unwrap();
+    let hash = store::password_hash(PASSWORD).unwrap();
+    store::create(&db, "boss", &hash, true).unwrap();
+    store::create(&db, "member", &hash, false).unwrap();
+
+    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = http.local_addr().unwrap();
+    let base = origin(&format!("http://{server}")).unwrap();
+    let app = App::new(db, base.clone(), 0, None).unwrap();
+    let web = tokio::spawn(axum::serve(http, router(app)).into_future());
+
+    // 1. Admin account unlocks admin_ready directly on normal device login (single login).
+    let boss_net = Adapter::new("boss", Ipv4Addr::LOCALHOST, None);
+    let boss = Core::new(dir.path().join("boss"), boss_net, false).unwrap();
+    boss.execute(Command::Join {
+        address: base.to_string(),
+    })
+    .await
+    .unwrap();
+    let s = boss
+        .execute(Command::Login {
+            username: "boss".into(),
+            password: PASSWORD.into(),
+            label: "BossMac".into(),
+        })
+        .await
+        .unwrap();
+    assert!(s.is_admin && s.admin_ready);
+    let snap = boss.execute(Command::AdminSession).await.unwrap();
+    let data = snap.admin_data.expect("admin_data");
+    assert_eq!(data["admin"], "boss");
+    assert_eq!(data["users"].as_array().unwrap().len(), 2);
+
+    // Create a new member and confirm self-demote is rejected.
+    boss.execute(Command::AdminAction {
+        action: json!({"op": "create", "username": "rookie", "password": PASSWORD}),
+    })
+    .await
+    .unwrap();
+    let snap2 = boss.execute(Command::AdminSession).await.unwrap();
+    assert_eq!(snap2.admin_data.unwrap()["users"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        boss.execute(Command::AdminAction {
+            action: json!({"op": "set_admin", "username": "boss", "admin": false}),
+        })
+        .await
+        .err(),
+        Some(Code::Invalid)
+    );
+
+    // 2. Normal member has no admin module; once promoted, resuming its own session unlocks admin directly.
+    let mem_net = Adapter::new("mem", Ipv4Addr::LOCALHOST, None);
+    let mem = Core::new(dir.path().join("mem"), mem_net, false).unwrap();
+    mem.execute(Command::Join {
+        address: base.to_string(),
+    })
+    .await
+    .unwrap();
+    let ms = mem
+        .execute(Command::Login {
+            username: "member".into(),
+            password: PASSWORD.into(),
+            label: "MemMac".into(),
+        })
+        .await
+        .unwrap();
+    assert!(!ms.is_admin && !ms.admin_ready);
+    assert_eq!(
+        mem.execute(Command::AdminSession).await.err(),
+        Some(Code::Unauthorized)
+    );
+
+    boss.execute(Command::AdminAction {
+        action: json!({"op": "set_admin", "username": "member", "admin": true}),
+    })
+    .await
+    .unwrap();
+    mem.execute(Command::Stop).await.unwrap();
+    let ms2 = mem.execute(Command::Start).await.unwrap();
+    assert!(ms2.is_admin && ms2.admin_ready);
+    assert_eq!(
+        mem.execute(Command::AdminSession)
+            .await
+            .unwrap()
+            .admin_data
+            .unwrap()["admin"],
+        "member"
+    );
+
+    // Demoting revokes admin_sessions immediately and clears role on resume.
+    boss.execute(Command::AdminAction {
+        action: json!({"op": "set_admin", "username": "member", "admin": false}),
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        mem.execute(Command::AdminSession).await.err(),
+        Some(Code::Unauthorized)
+    );
+    mem.execute(Command::Stop).await.unwrap();
+    let ms3 = mem.execute(Command::Start).await.unwrap();
+    assert!(!ms3.is_admin && !ms3.admin_ready);
+
+    for core in [boss, mem] {
+        core.stop();
+        core.wait_stopped().await;
+    }
+    web.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_account_supports_multiple_concurrent_devices() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = store::db(&dir.path().join("db")).unwrap();
+    let hash = store::password_hash(PASSWORD).unwrap();
+    store::create(&db, "boss", &hash, true).unwrap();
+
+    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = http.local_addr().unwrap();
+    let base = origin(&format!("http://{server}")).unwrap();
+    let app = App::new(db, base.clone(), 0, None).unwrap();
+    let web = tokio::spawn(axum::serve(http, router(app)).into_future());
+
+    let mac = Core::new(
+        dir.path().join("mac"),
+        Adapter::new("mac", Ipv4Addr::new(192, 0, 2, 10), None),
+        false,
+    )
+    .unwrap();
+    let phone = Core::new(
+        dir.path().join("phone"),
+        Adapter::new("phone", Ipv4Addr::new(198, 51, 100, 20), None),
+        false,
+    )
+    .unwrap();
+
+    for (core, label) in [(&mac, "BossMac"), (&phone, "BossPhone")] {
+        core.execute(Command::Join {
+            address: base.to_string(),
+        })
+        .await
+        .unwrap();
+        let st = core
+            .execute(Command::Login {
+                username: "boss".into(),
+                password: PASSWORD.into(),
+                label: label.into(),
+            })
+            .await
+            .unwrap();
+        assert!(st.is_admin && st.admin_ready);
+        eventually(|| core.status().online).await;
+    }
+
+    // Both concurrent devices under the same account show up online in admin session.
+    let snap = mac
+        .execute(Command::AdminSession)
+        .await
+        .unwrap()
+        .admin_data
+        .unwrap();
+    let online_devices: Vec<_> = snap["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["member"] == "boss" && d["online"] == true)
+        .collect();
+    assert_eq!(online_devices.len(), 2);
+
+    // Mac publishes a service; same-account Phone receives it while Mac does not duplicate itself.
+    let saved = mac
+        .execute(Command::Save {
+            id: None,
+            name: "Office".into(),
+            ips: "192.0.2.35".into(),
+            ports: "80".into(),
+            http: true,
+            kind: Some(fesen_proto::ServiceKind::Http),
+            host_os: None,
+        })
+        .await
+        .unwrap();
+    let share_id = saved.shares[0].id.clone();
+    mac.execute(Command::Share {
+        id: share_id.clone(),
+        enabled: true,
+    })
+    .await
+    .unwrap();
+    eventually(|| phone.status().services.iter().any(|o| o.service.id == share_id)).await;
+    assert!(mac.status().services.is_empty());
+
+    // Logging out Phone only logs out Phone; Mac stays online with active share & valid admin session.
+    phone.execute(Command::Logout).await.unwrap();
+    assert!(phone.status().member.is_none());
+    let mac_st = mac.status();
+    assert!(mac_st.online && mac_st.active.contains(&share_id));
+    assert!(mac.execute(Command::AdminSession).await.is_ok());
+
+    for core in [mac, phone] {
         core.stop();
         core.wait_stopped().await;
     }

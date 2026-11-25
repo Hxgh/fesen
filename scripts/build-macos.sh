@@ -62,6 +62,9 @@ swiftc -target arm64-apple-macos14.0 -swift-version 5 -O -module-name FesenTunne
 swiftc -target arm64-apple-macos14.0 -swift-version 5 -O \
   "$desk/native/macos/Accessory.swift" "$desk/native/macos/MenuBarPreference.swift" "$desk/native/macos/Menu.swift" \
   -o "$app/Contents/MacOS/fesen-menu"
+mkdir -p "$app/Contents/Resources"
+cp -R "$desk/native/macos/zh-Hans.lproj" "$desk/native/macos/en.lproj" "$app/Contents/Resources/"
+plutil -replace LSHasLocalizedDisplayName -bool true "$app/Contents/Info.plist"
 
 if ! $unsigned; then
   signing="$(mktemp -d)"

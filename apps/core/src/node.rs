@@ -1,4 +1,5 @@
 use crate::{
+    admin_client,
     control::{Link, Session},
     direct::{self, Allowed},
     local::{Identity, Local, Log, Login, private_dir},
@@ -112,6 +113,10 @@ pub enum Command {
         #[serde(default)]
         ports: Vec<u16>,
     },
+    AdminSession,
+    AdminAction {
+        action: serde_json::Value,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -124,6 +129,10 @@ pub struct Status {
     pub system_routing: bool,
     #[serde(default)]
     pub routes_ready: bool,
+    #[serde(default)]
+    pub is_admin: bool,
+    #[serde(default)]
+    pub admin_ready: bool,
     pub services: Vec<Offering>,
     pub shares: Vec<Publication>,
     pub active: Vec<String>,
@@ -139,6 +148,8 @@ pub struct Status {
     pub probe: Option<probe::ProbeOutcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_probe: Option<probe::HostProbe>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin_data: Option<serde_json::Value>,
 }
 
 struct Sharing {
@@ -156,6 +167,8 @@ struct State {
     wanted: bool,
     ui_until: Option<Instant>,
     error: Option<Code>,
+    is_admin: bool,
+    admin_token: Option<String>,
 }
 
 pub struct Core {
@@ -199,6 +212,8 @@ impl Core {
                 wanted: false,
                 ui_until: Some(Instant::now() + Duration::from_secs(20)),
                 error: None,
+                is_admin: false,
+                admin_token: None,
             }),
             operations: tokio::sync::Mutex::new(()),
             host_probe_lock: tokio::sync::Mutex::new(()),
@@ -252,6 +267,8 @@ impl Core {
             background: self.has_work(&state),
             system_routing: self.platform.system_routing(),
             routes_ready: routes.ready_for(&state.view),
+            is_admin: state.is_admin,
+            admin_ready: state.admin_token.is_some(),
             services: state.view.clone(),
             shares: state.local.shares.clone(),
             active,
@@ -263,6 +280,7 @@ impl Core {
             http_status: None,
             probe: None,
             host_probe: None,
+            admin_data: None,
         }
     }
 
@@ -351,6 +369,53 @@ impl Core {
                     ..self.status()
                 });
             }
+            Command::AdminSession => {
+                let (server, token) = {
+                    let state = self.state.lock().unwrap();
+                    (
+                        state.local.server.clone(),
+                        state.admin_token.clone().ok_or(Code::Unauthorized)?,
+                    )
+                };
+                match admin_client::session(&*self.platform, &server, &token).await {
+                    Ok(data) => {
+                        return Ok(Status {
+                            admin_data: Some(data),
+                            ..self.status()
+                        });
+                    }
+                    Err(e) => {
+                        if e == Code::Unauthorized {
+                            self.state.lock().unwrap().admin_token = None;
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            Command::AdminAction { action } => {
+                let (server, token) = {
+                    let state = self.state.lock().unwrap();
+                    (
+                        state.local.server.clone(),
+                        state.admin_token.clone().ok_or(Code::Unauthorized)?,
+                    )
+                };
+                let is_logout = action.get("op").and_then(|v| v.as_str()) == Some("logout");
+                match admin_client::action(&*self.platform, &server, &token, &action).await {
+                    Ok(()) => {
+                        if is_logout {
+                            self.state.lock().unwrap().admin_token = None;
+                        }
+                        return Ok(self.status());
+                    }
+                    Err(e) => {
+                        if e == Code::Unauthorized {
+                            self.state.lock().unwrap().admin_token = None;
+                        }
+                        return Err(e);
+                    }
+                }
+            }
             _ => {}
         }
         let _lock = self.operations.lock().await;
@@ -372,10 +437,12 @@ impl Core {
             | Command::Detach
             | Command::TestConnection { .. }
             | Command::TestLocalSite { .. }
-            | Command::ProbeHost { .. } => unreachable!(),
+            | Command::ProbeHost { .. }
+            | Command::AdminSession
+            | Command::AdminAction { .. } => unreachable!(),
             Command::Join { address } => {
                 let address = origin(&address)?.to_string();
-                self.edit(|local| {
+                let res = self.edit(|local| {
                     if local.server == address {
                         return Ok(());
                     }
@@ -386,7 +453,13 @@ impl Core {
                     local.identities.clear();
                     local.labels.clear();
                     Ok(())
-                })
+                });
+                if res.is_ok() {
+                    let mut s = self.state.lock().unwrap();
+                    s.is_admin = false;
+                    s.admin_token = None;
+                }
+                res
             }
             Command::Login {
                 username,
@@ -416,7 +489,24 @@ impl Core {
                 Ok(())
             }
             Command::Logout => {
-                let live = self.state.lock().unwrap().link.clone();
+                let (live, server, admin_token) = {
+                    let mut s = self.state.lock().unwrap();
+                    s.is_admin = false;
+                    (
+                        s.link.clone(),
+                        s.local.server.clone(),
+                        s.admin_token.take(),
+                    )
+                };
+                if let Some(tok) = admin_token {
+                    let _ = admin_client::action(
+                        &*self.platform,
+                        &server,
+                        &tok,
+                        &serde_json::json!({"op": "logout"}),
+                    )
+                    .await;
+                }
                 // Close functioning streams before asking the server to invalidate the token.
                 self.restrict_local();
                 if let Some(link) = live {
@@ -615,6 +705,8 @@ impl Core {
                 state.local = next;
             }
             state.wanted = true;
+            state.is_admin = session.is_admin;
+            state.admin_token = session.admin_token.clone();
             if state.error != Some(Code::NetworkChanged) {
                 state.error = None;
             }
@@ -1201,7 +1293,7 @@ impl Core {
                 service,
                 target,
             } => {
-                self.with_peer(&owner, Open { service, target }, async |tx, rx| {
+                self.with_peer(&owner, Open { service, target }, async |tx, rx, _| {
                     let mut remote = tokio::io::join(rx, tx);
                     let _ =
                         copy_bidirectional_with_sizes(&mut app, &mut remote, 16384, 16384).await;
@@ -1296,16 +1388,15 @@ impl Core {
             )
         };
         let _flow = Flow::new(&self.flows);
-        let started = Instant::now();
         timeout(
             Duration::from_secs(24),
-            self.with_peer(&owner, request, async |mut tx, mut rx| {
-                let mut outcome = match kind {
+            self.with_peer(&owner, request, async |mut tx, mut rx, open_rtt_ms| {
+                let outcome = match kind {
                     ServiceKind::Http => {
                         let code = probe::http(tokio::io::join(rx, tx), access).await?;
                         probe::ProbeOutcome {
                             kind,
-                            rtt_ms: 0,
+                            rtt_ms: open_rtt_ms,
                             http_status: Some(code),
                             host_os: None,
                             detail: None,
@@ -1315,7 +1406,7 @@ impl Core {
                         probe::tls(tokio::io::join(rx, tx), Duration::from_secs(5)).await?;
                         probe::ProbeOutcome {
                             kind,
-                            rtt_ms: 0,
+                            rtt_ms: open_rtt_ms,
                             http_status: None,
                             host_os: None,
                             detail: None,
@@ -1326,7 +1417,7 @@ impl Core {
                         let _ = tx.finish();
                         probe::ProbeOutcome {
                             kind,
-                            rtt_ms: 0,
+                            rtt_ms: open_rtt_ms,
                             http_status: None,
                             host_os: info.os,
                             detail: Some(info.banner),
@@ -1337,7 +1428,7 @@ impl Core {
                             probe::rdp(tokio::io::join(rx, tx), Duration::from_secs(4)).await?;
                         probe::ProbeOutcome {
                             kind,
-                            rtt_ms: 0,
+                            rtt_ms: open_rtt_ms,
                             http_status: None,
                             host_os: Some(HostOs::Windows),
                             detail: Some(if info.nla { "NLA" } else { "RDP" }.into()),
@@ -1348,14 +1439,13 @@ impl Core {
                         let _ = rx.stop(0u32.into());
                         probe::ProbeOutcome {
                             kind,
-                            rtt_ms: 0,
+                            rtt_ms: open_rtt_ms,
                             http_status: None,
                             host_os: None,
                             detail: None,
                         }
                     }
                 };
-                outcome.rtt_ms = started.elapsed().as_millis().clamp(1, u32::MAX as u128) as u32;
                 Ok(outcome)
             }),
         )
@@ -1367,7 +1457,7 @@ impl Core {
         &self,
         owner: &str,
         request: Open,
-        on_open: impl AsyncFnOnce(quinn::SendStream, quinn::RecvStream) -> Result<R, Code>,
+        on_open: impl AsyncFnOnce(quinn::SendStream, quinn::RecvStream, u32) -> Result<R, Code>,
     ) -> Result<R, Code> {
         let link = {
             let state = self.state.lock().unwrap();
@@ -1386,8 +1476,10 @@ impl Core {
             _ = peer.cancel.cancelled() => Err(Code::Offline),
             _ = link.direct.cancel.cancelled() => Err(Code::NotConnected),
             result = async {
+                let open_started = Instant::now();
                 let (tx, rx) = direct::open(&conn, request).await?;
-                on_open(tx, rx).await
+                let open_rtt_ms = open_started.elapsed().as_millis().clamp(1, u32::MAX as u128) as u32;
+                on_open(tx, rx, open_rtt_ms).await
             } => result,
         }
     }

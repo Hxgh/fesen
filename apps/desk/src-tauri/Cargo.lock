@@ -1306,6 +1306,7 @@ dependencies = [
  "serde_json",
  "socket2",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tokio-util",
  "url",

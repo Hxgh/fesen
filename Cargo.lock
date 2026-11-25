@@ -521,6 +521,7 @@ dependencies = [
  "socket2",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tokio-util",
  "url",

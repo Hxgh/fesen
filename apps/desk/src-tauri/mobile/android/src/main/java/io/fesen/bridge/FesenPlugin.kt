@@ -70,7 +70,7 @@ class FesenPlugin(private val activity: Activity) : Plugin(activity) {
     override fun onConfigurationChanged(newConfig: Configuration) {
         val dark = newConfig.uiMode and Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES
         val root = activity.findViewById<View>(android.R.id.content)
-        root.setBackgroundColor(if (dark) 0xff0c0e0d.toInt() else 0xfff7f8f7.toInt())
+        root.setBackgroundColor(if (dark) 0xff0c0d0c.toInt() else 0xfff7f5f0.toInt())
         WindowCompat.getInsetsController(activity.window, activity.window.decorView).apply {
             isAppearanceLightStatusBars = !dark
             isAppearanceLightNavigationBars = !dark

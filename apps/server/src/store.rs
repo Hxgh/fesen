@@ -87,6 +87,15 @@ pub fn login_hash(db: &Connection, name: &str, admin: bool) -> Option<String> {
     .ok()
 }
 
+pub fn is_admin(db: &Connection, name: &str) -> bool {
+    db.query_row(
+        "SELECT 1 FROM users WHERE name=?1 AND admin=1 AND disabled=0",
+        [name],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
 pub fn authorize_device(
     db: &Connection,
     cert: &[u8],
@@ -219,6 +228,42 @@ pub fn change_user(
     }
     tx.execute("UPDATE devices SET token=NULL WHERE member=?1", [member])
         .map_err(sql_code)?;
+    tx.commit().map_err(sql_code)
+}
+
+pub fn set_admin(
+    db: &mut Connection,
+    actor: &str,
+    member: &str,
+    admin: bool,
+) -> Result<(), Code> {
+    if !admin && actor == member {
+        return Err(Code::Invalid);
+    }
+    let tx = db.transaction().map_err(sql_code)?;
+    let n = tx
+        .execute(
+            "UPDATE users SET admin=?2 WHERE name=?1 AND disabled=0",
+            params![member, admin],
+        )
+        .map_err(sql_code)?;
+    if n != 1 {
+        return Err(Code::Invalid);
+    }
+    if !admin {
+        let remaining: i64 = tx
+            .query_row(
+                "SELECT count(*) FROM users WHERE admin=1 AND disabled=0",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(sql_code)?;
+        if remaining < 1 {
+            return Err(Code::Invalid);
+        }
+        tx.execute("DELETE FROM admin_sessions WHERE member=?1", [member])
+            .map_err(sql_code)?;
+    }
     tx.commit().map_err(sql_code)
 }
 

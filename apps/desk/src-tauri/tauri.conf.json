@@ -12,7 +12,7 @@
   "app": {
     "windows": [{
       "label": "main",
-      "title": "Fesen",
+      "title": "",
       "width": 430,
       "height": 740,
       "minWidth": 360,

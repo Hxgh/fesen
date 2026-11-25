@@ -87,7 +87,7 @@ impl Endpoint {
     }
 
     pub async fn serve(self, core: Arc<Core>) {
-        let capacity = Arc::new(Semaphore::new(24));
+        let capacity = Arc::new(Semaphore::new(48));
         loop {
             let conn = tokio::select! {
                 _ = core.quit.cancelled() => break,

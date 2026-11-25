@@ -301,11 +301,19 @@ async fn control(mut socket: WebSocket, app: App) {
             login.as_ref().map(|(u, l, _)| (u.as_str(), l.as_str())),
             &token,
         )?;
+        let is_admin = store::is_admin(&g.db, &member);
+        let admin_token = if is_admin {
+            let t = store::secret();
+            store::admin_cookie(&g.db, &member, &t)?;
+            Some(t)
+        } else {
+            None
+        };
         let session = g.connect(&id, member.clone(), cert.clone(), tx)?;
-        Ok((id, member, login.map(|_| token), session))
+        Ok((id, member, login.map(|_| token), is_admin, admin_token, session))
     }
     .await;
-    let (id, member, token, session) = match authorized {
+    let (id, member, token, is_admin, admin_token, session) = match authorized {
         Ok(v) => v,
         Err(error) => {
             let _ = send(&mut socket, Event::Rejected { error }).await;
@@ -316,7 +324,7 @@ async fn control(mut socket: WebSocket, app: App) {
     let _ = async {
         send(&mut socket, Event::Welcome {
             device: id.clone(), member, token, probe: session.probe.clone(),
-            udp_port: app.udp_port, stun: app.stun.clone(),
+            udp_port: app.udp_port, stun: app.stun.clone(), is_admin, admin_token,
         }).await?;
         let mut tick = interval(HEARTBEAT);
         let mut last = Instant::now();

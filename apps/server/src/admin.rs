@@ -14,30 +14,24 @@ use fesen_proto::Code;
 use serde::Deserialize;
 use serde_json::json;
 
+fn js_asset(body: &'static str) -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], body)
+}
+
 pub fn router() -> Router<App> {
     Router::new()
         .route(
             "/",
             get(|| async { Html(include_str!("../web/index.html")) }),
         )
-        .route(
-            "/app.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../web/app.js"),
-                )
-            }),
-        )
-        .route(
-            "/icons.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../../../packages/ui/icons.js"),
-                )
-            }),
-        )
+        .route("/app.js", get(|| async { js_asset(include_str!("../web/app.js")) }))
+        .route("/icons.js", get(|| async { js_asset(include_str!("../../../packages/ui/icons.js")) }))
+        .route("/theme.js", get(|| async { js_asset(include_str!("../../../packages/ui/theme.js")) }))
+        .route("/i18n.js", get(|| async { js_asset(include_str!("../../../packages/ui/i18n.js")) }))
+        .route("/popover.js", get(|| async { js_asset(include_str!("../../../packages/ui/popover.js")) }))
+        .route("/host-card.js", get(|| async { js_asset(include_str!("../../../packages/ui/host-card.js")) }))
+        .route("/settings.js", get(|| async { js_asset(include_str!("../../../packages/ui/settings.js")) }))
+        .route("/admin-view.js", get(|| async { js_asset(include_str!("../../../packages/ui/admin-view.js")) }))
         .route(
             "/style.css",
             get(|| async {
@@ -190,9 +184,15 @@ async fn session(State(app): State<App>, headers: HeaderMap) -> Result<Response,
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Action {
-    Create { username: String, password: String },
+    Create {
+        username: String,
+        password: String,
+        #[serde(default)]
+        admin: bool,
+    },
     Reset { username: String, password: String },
     Enable { username: String, enabled: bool },
+    SetAdmin { username: String, admin: bool },
     Revoke { device: String },
     Logout,
 }
@@ -205,11 +205,15 @@ async fn action(
     check(&headers, &app)?;
     gate(&app.inner.lock().unwrap(), &headers)?;
     let changed = match action {
-        Action::Create { username, password } => {
+        Action::Create {
+            username,
+            password,
+            admin,
+        } => {
             let hash = app.hash(password).await?;
             let g = app.inner.lock().unwrap();
             gate(&g, &headers)?;
-            store::create(&g.db, &username, &hash, false)?;
+            store::create(&g.db, &username, &hash, admin)?;
             false
         }
         Action::Reset { username, password } => {
@@ -226,6 +230,12 @@ async fn action(
             store::change_user(&mut g.db, &username, None, Some(!enabled))?;
             g.remove_member(&username);
             true
+        }
+        Action::SetAdmin { username, admin } => {
+            let mut g = app.inner.lock().unwrap();
+            let actor = gate(&g, &headers)?;
+            store::set_admin(&mut g.db, &actor, &username, admin)?;
+            false
         }
         Action::Revoke { device } => {
             let mut g = app.inner.lock().unwrap();

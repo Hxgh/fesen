@@ -66,6 +66,8 @@ const TRIGRAM_PATHS = [
   [0b010, 0b110],
   [0b001, 0b011, 0b111, 0b110],
   [0b010, 0b011, 0b111, 0b101],
+  [0b001, 0b011, 0b010, 0b110],
+  [0b010, 0b110, 0b111, 0b101],
 ];
 
 const YAO_ROWS = [
@@ -89,11 +91,12 @@ function buildTrigramSvg(mask, state) {
     const g = document.createElementNS(NS, "g");
     g.setAttribute("class", row.cls);
     g.setAttribute("data-yang", (mask & row.bit) ? "1" : "0");
-    for (const [x, w, cls] of [[4, 24, "yao-side"], [36, 24, "yao-side"], [27.5, 9, "yao-bridge"]]) {
+    g.setAttribute("data-hot", "0");
+    for (const [x, cls] of [[4, "yao-l"], [32, "yao-r"]]) {
       const rect = document.createElementNS(NS, "rect");
       rect.setAttribute("x", String(x));
       rect.setAttribute("y", String(row.y));
-      rect.setAttribute("width", String(w));
+      rect.setAttribute("width", "28");
       rect.setAttribute("height", "12");
       rect.setAttribute("class", cls);
       g.append(rect);
@@ -103,19 +106,20 @@ function buildTrigramSvg(mask, state) {
   return svg;
 }
 
-function applyTrigramMask(svg, mask) {
+function applyTrigramMask(svg, mask, changedBit = 0) {
   svg.setAttribute("data-mask", String(mask));
   for (const row of YAO_ROWS) {
     const g = svg.querySelector(`.${row.cls}`);
-    if (g) g.setAttribute("data-yang", (mask & row.bit) ? "1" : "0");
+    if (!g) continue;
+    g.setAttribute("data-yang", (mask & row.bit) ? "1" : "0");
+    g.setAttribute("data-hot", changedBit === 0 || (changedBit & row.bit) ? "1" : "0");
   }
 }
 
 function shortestSingleYaoPath(from, to) {
   const steps = [];
   let cur = from;
-  // Close top yang first when resolving into Gen (0b100), or drop extra bits cleanly one yao at a time.
-  const order = [4, 1, 2];
+  const order = Math.random() < 0.5 ? [4, 1, 2] : [4, 2, 1];
   for (const bit of order) {
     if ((cur & bit) !== (to & bit)) {
       cur ^= bit;
@@ -127,9 +131,11 @@ function shortestSingleYaoPath(from, to) {
 
 /**
  * Reusable Bagua state-machine brand mark component.
+ * Uses organic 2-stroke ink fusion (left & right strokes extend/retract toward center)
+ * + active-yao ink breath + calligraphic variable cadence.
  * - idle: Kun ☷ (0b000, Death Gate / disconnected)
- * - connecting: orderly single-yao transitions along classical paths (with controlled randomness)
- * - active: Gen ☶ (0b100, Life Gate / connected), resolving smoothly via shortest single-yao steps
+ * - connecting: orderly single-yao transitions with organic rhythm
+ * - active: Gen ☶ (0b100, Life Gate / connected)
  * @param {"idle" | "connecting" | "active"} [initialState]
  */
 export function createTrigram(initialState = "idle") {
@@ -141,6 +147,7 @@ export function createTrigram(initialState = "idle") {
   let timer = 0;
   let queue = [];
   let lastPathIdx = -1;
+  let stepIndex = 0;
 
   const reducedMotion = () =>
     typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
@@ -152,10 +159,11 @@ export function createTrigram(initialState = "idle") {
     }
   }
 
-  function setMask(next) {
+  function setMask(next, highlightChanged = false) {
+    const diff = highlightChanged ? (mask ^ next) : 0;
     prevMask = mask;
     mask = next;
-    applyTrigramMask(el, mask);
+    applyTrigramMask(el, mask, diff);
   }
 
   function nextWalkMask() {
@@ -168,26 +176,34 @@ export function createTrigram(initialState = "idle") {
     return candidates[Math.floor(Math.random() * candidates.length)];
   }
 
+  // Calligraphic variable rhythm (no robotic metronome).
+  function nextDelay() {
+    const base = [240, 320, 210, 360, 260][stepIndex % 5];
+    stepIndex += 1;
+    return base + Math.round((Math.random() - 0.5) * 70);
+  }
+
   function stepConnecting() {
     if (state !== "connecting") return;
     const next = queue.length ? queue.shift() : nextWalkMask();
-    setMask(next);
-    timer = window.setTimeout(stepConnecting, 340);
+    setMask(next, true);
+    timer = window.setTimeout(stepConnecting, nextDelay());
   }
 
   function stepClosing() {
     if (state !== "active") return;
     if (!queue.length) {
-      setMask(0b100);
+      setMask(0b100, false);
       el.setAttribute("data-state", "active");
       return;
     }
     const next = queue.shift();
-    setMask(next);
-    if (!queue.length) {
+    const isFinal = queue.length === 0;
+    setMask(next, !isFinal);
+    if (isFinal) {
       el.setAttribute("data-state", "active");
     } else {
-      timer = window.setTimeout(stepClosing, 150);
+      timer = window.setTimeout(stepClosing, queue.length === 1 ? 230 : 170);
     }
   }
 
@@ -212,17 +228,18 @@ export function createTrigram(initialState = "idle") {
 
     if (instant || reducedMotion()) {
       el.setAttribute("data-state", nextState);
-      setMask(nextState === "active" ? 0b100 : nextState === "connecting" ? 0b010 : 0b000);
+      setMask(nextState === "active" ? 0b100 : nextState === "connecting" ? 0b010 : 0b000, false);
       return;
     }
 
     if (nextState === "idle") {
       el.setAttribute("data-state", "idle");
-      setMask(0b000);
+      setMask(0b000, false);
       return;
     }
 
     if (nextState === "connecting") {
+      stepIndex = 0;
       el.setAttribute("data-state", "connecting");
       const path = pickPath();
       if (mask !== 0b000) {
@@ -237,23 +254,22 @@ export function createTrigram(initialState = "idle") {
 
     // nextState === "active": resolve cleanly into Life Gate ☶ (0b100).
     if (prior === "idle") {
-      // Fast connect skipped connecting state: play a crisp 2-step classical resolution into ☶.
       const quick = Math.random() < 0.5 ? [0b001, 0b101, 0b100] : [0b010, 0b110, 0b100];
       el.setAttribute("data-state", "connecting");
       queue = quick;
-      timer = window.setTimeout(stepClosing, 40);
+      timer = window.setTimeout(stepClosing, 50);
       return;
     }
 
     const closing = shortestSingleYaoPath(mask, 0b100);
     if (!closing.length) {
       el.setAttribute("data-state", "active");
-      setMask(0b100);
+      setMask(0b100, false);
       return;
     }
     el.setAttribute("data-state", "connecting");
     queue = closing;
-    timer = window.setTimeout(stepClosing, 120);
+    timer = window.setTimeout(stepClosing, 140);
   }
 
   return {

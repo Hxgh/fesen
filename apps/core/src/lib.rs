@@ -1,3 +1,4 @@
+mod admin_client;
 mod control;
 mod direct;
 pub mod ipc;

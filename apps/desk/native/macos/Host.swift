@@ -63,6 +63,17 @@ private let invalidPackage = packageFailure()
 @_cdecl("ph_host_can_route")
 func hostCanRoute() -> Int32 { invalidPackage == nil ? 1 : 0 }
 
+@_cdecl("ph_host_notify_status")
+func hostNotifyStatus(_ state: Int32) {
+    let path = Bundle.main.bundleURL.standardizedFileURL.path
+    DistributedNotificationCenter.default().postNotificationName(
+        MenuBarPreference.statusChanged,
+        object: path,
+        userInfo: ["state": Int(state)],
+        deliverImmediately: true
+    )
+}
+
 @MainActor
 final class AppleHost {
     static let shared = AppleHost()

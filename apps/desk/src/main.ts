@@ -1,9 +1,27 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
+import { LogicalSize } from "@tauri-apps/api/dpi";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
-import { failure, getLocale, setLocale, isZh, t, type Locale } from "./i18n";
+import { failure, i18n, isZh, t } from "./i18n";
 import { checkSiteDialog, refreshSiteDialogI18n, showSiteDialog } from "./site-dialog";
 import { createTrigram, icon } from "../../../packages/ui/icons.js";
+import { createTheme } from "../../../packages/ui/theme.js";
+import { closePopoverMenu, openPopoverMenu } from "../../../packages/ui/popover.js";
+import { openSettingsModal } from "../../../packages/ui/settings.js";
+import { createAdminWorkspace } from "../../../packages/ui/admin-view.js";
+import {
+  effectiveKind as rawEffectiveKind,
+  formatEndpoint,
+  formatRanges,
+  groupByHost,
+  meaningfulHostName,
+  osLabel,
+  resolveHostOs,
+  singleIp,
+  singlePort,
+  singleSpan,
+} from "../../../packages/ui/host-card.js";
 import "./style.css";
 
 type Span<T> = { start: T; end: T };
@@ -51,6 +69,8 @@ type Status = {
   running: boolean;
   background: boolean;
   system_routing?: boolean;
+  is_admin?: boolean;
+  admin_ready?: boolean;
   shares: Share[];
   active: string[];
   active_flows?: number;
@@ -62,46 +82,116 @@ type Status = {
   http_status?: number;
   probe?: ProbeOutcome;
   host_probe?: HostProbe;
+  admin_data?: unknown;
 };
 type Request = Record<string, unknown> & { op: string };
 type Reply = { data?: Status; error?: string };
 type BrandState = "idle" | "connecting" | "active";
+type IconName = Parameters<typeof icon>[0];
+type MenuEntry =
+  | { sep: true }
+  | { icon: IconName; label: string; danger?: boolean; onSelect: () => void };
 
-document.documentElement.lang = getLocale();
+const effectiveKind = (s: Share): ServiceKind => rawEffectiveKind(s) as ServiceKind;
 const mac = /Macintosh/.test(navigator.userAgent);
+const desktop = !/Android/i.test(navigator.userAgent);
+const theme = createTheme("fesen_theme");
 
-type Theme = "system" | "light" | "dark";
+const DEFAULT_WIN = { w: 430, h: 740 };
+const WIN_SIZE_KEY = "fesen_window_size";
+let winSize = { ...DEFAULT_WIN };
+let hasCustomWinSize = false;
+let applyingWinSize = false;
+let resizeSaveTimer: number | undefined;
+
+function readSavedWinSize(): { w: number; h: number } | null {
+  try {
+    const raw = localStorage.getItem(WIN_SIZE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    const w = Number(parsed?.w);
+    const h = Number(parsed?.h);
+    if (Number.isFinite(w) && Number.isFinite(h) && w >= 360 && h >= 540 && w <= 3840 && h <= 2400) {
+      return { w: Math.round(w), h: Math.round(h) };
+    }
+  } catch {}
+  return null;
+}
+
+function isDefaultWinSize(s: { w: number; h: number }): boolean {
+  return Math.abs(s.w - DEFAULT_WIN.w) <= 2 && Math.abs(s.h - DEFAULT_WIN.h) <= 2;
+}
+
+function refreshWindowSizeRow() {
+  const val = settingsDialog.querySelector<HTMLElement>("[data-win-size-val]");
+  const btn = settingsDialog.querySelector<HTMLButtonElement>("[data-win-size-reset]");
+  if (val) val.textContent = `${winSize.w} × ${winSize.h}`;
+  if (btn) btn.disabled = !hasCustomWinSize && isDefaultWinSize(winSize);
+}
+
+async function initDesktopWindowSize() {
+  if (!desktop) return;
+  const win = getCurrentWindow();
+  const saved = readSavedWinSize();
+  if (saved) {
+    winSize = saved;
+    hasCustomWinSize = !isDefaultWinSize(saved);
+    if (hasCustomWinSize) {
+      applyingWinSize = true;
+      try { await win.setSize(new LogicalSize(saved.w, saved.h)); } catch {}
+      window.setTimeout(() => { applyingWinSize = false; }, 300);
+    }
+  } else {
+    try {
+      const [phys, factor] = await Promise.all([win.innerSize(), win.scaleFactor()]);
+      if (phys.width > 0 && phys.height > 0 && factor > 0) {
+        winSize = { w: Math.round(phys.width / factor), h: Math.round(phys.height / factor) };
+      }
+    } catch {}
+  }
+  try {
+    await win.onResized(({ payload }) => {
+      if (applyingWinSize || payload.width <= 0 || payload.height <= 0) return;
+      window.clearTimeout(resizeSaveTimer);
+      resizeSaveTimer = window.setTimeout(async () => {
+        try {
+          const factor = await win.scaleFactor();
+          if (factor <= 0) return;
+          const w = Math.round(payload.width / factor);
+          const h = Math.round(payload.height / factor);
+          if (w < 360 || h < 540) return;
+          winSize = { w, h };
+          if (isDefaultWinSize(winSize)) {
+            hasCustomWinSize = false;
+            try { localStorage.removeItem(WIN_SIZE_KEY); } catch {}
+          } else {
+            hasCustomWinSize = true;
+            try { localStorage.setItem(WIN_SIZE_KEY, JSON.stringify(winSize)); } catch {}
+          }
+          refreshWindowSizeRow();
+        } catch {}
+      }, 220);
+    });
+  } catch {}
+}
+
+async function resetDesktopWindowSize() {
+  if (!desktop) return;
+  applyingWinSize = true;
+  window.clearTimeout(resizeSaveTimer);
+  winSize = { ...DEFAULT_WIN };
+  hasCustomWinSize = false;
+  try { localStorage.removeItem(WIN_SIZE_KEY); } catch {}
+  refreshWindowSizeRow();
+  try {
+    const win = getCurrentWindow();
+    await win.setSize(new LogicalSize(DEFAULT_WIN.w, DEFAULT_WIN.h));
+    await win.center();
+  } catch {}
+  window.setTimeout(() => { applyingWinSize = false; }, 300);
+}
+
 type CloseBehavior = "tray" | "quit";
-
-function getTheme(): Theme {
-  try {
-    const v = localStorage.getItem("fesen_theme");
-    if (v === "light" || v === "dark" || v === "system") return v;
-  } catch {}
-  return "system";
-}
-
-function applyTheme(theme: Theme = getTheme()) {
-  const root = document.documentElement;
-  root.setAttribute("data-theme", theme);
-  const isDark =
-    theme === "dark" ||
-    (theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
-  root.classList.toggle("dark", isDark);
-}
-
-function setTheme(theme: Theme) {
-  try {
-    localStorage.setItem("fesen_theme", theme);
-  } catch {}
-  applyTheme(theme);
-}
-
-window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
-  if (getTheme() === "system") applyTheme("system");
-});
-
-applyTheme(getTheme());
 
 function getCloseBehavior(): CloseBehavior {
   try {
@@ -112,9 +202,7 @@ function getCloseBehavior(): CloseBehavior {
 }
 
 async function syncCloseBehavior(behavior: CloseBehavior): Promise<boolean> {
-  try {
-    localStorage.setItem("fesen_close_behavior", behavior);
-  } catch {}
+  try { localStorage.setItem("fesen_close_behavior", behavior); } catch {}
   if (mac) {
     try {
       const saved = await invoke<boolean>("menu_bar_setting", { enabled: behavior === "tray" });
@@ -129,13 +217,14 @@ async function syncCloseBehavior(behavior: CloseBehavior): Promise<boolean> {
 if (mac) void syncCloseBehavior(getCloseBehavior());
 
 let status: Status | undefined;
-let tab: "group" | "mine" = "group";
+let tab: "services" | "admin" = "services";
 let tabOwner = "";
 let joining = false;
 let busy = false;
 let polling = false;
 let message = "";
 let applied = "";
+let lastViewKey = "";
 let pendingJoin: string | undefined;
 let appVersion = "";
 
@@ -184,7 +273,9 @@ function computeBrandState(): BrandState {
 
 function syncBrand(instant = false) {
   const name = t("brand");
-  document.title = name;
+  const title = tab === "admin" ? t("admin_title") : name;
+  document.title = title;
+  void getCurrentWindow().setTitle(title).catch(() => {});
   brandNameEl.textContent = name;
   const state = computeBrandState();
   topMark.setState(state, instant);
@@ -234,7 +325,7 @@ function button(text: string, action: () => void, style = "button") {
   return b;
 }
 
-function tool(name: Parameters<typeof icon>[0], title: string, action: () => void) {
+function tool(name: IconName, title: string, action: () => void) {
   const b = button("", action, "button icon-button");
   b.append(icon(name));
   b.title = title;
@@ -242,8 +333,8 @@ function tool(name: Parameters<typeof icon>[0], title: string, action: () => voi
   return b;
 }
 
-function empty(text: string, action?: HTMLButtonElement) {
-  return el("div", "empty", el("p", "", text), ...(action ? [action] : []));
+function empty(text: string, ...controls: HTMLElement[]) {
+  return el("div", "empty", el("p", "", text), ...(controls.length ? [el("div", "empty-actions", ...controls)] : []));
 }
 
 function field(title: string, name: string, value = "", options: Partial<HTMLInputElement> = {}) {
@@ -279,8 +370,8 @@ const showError = () => {
   }
 };
 
-async function request(request: Request, launch: boolean): Promise<Status> {
-  const reply = await invoke<Reply>("core_command", { request, launch });
+async function request(body: Request, launch: boolean): Promise<Status> {
+  const reply = await invoke<Reply>("core_command", { request: body, launch });
   if (!reply.data) throw reply.error ?? "internal";
   return reply.data;
 }
@@ -307,8 +398,50 @@ async function act(body: Request, done?: () => void) {
   }
 }
 
-const ranges = <T>(spans: Span<T>[]) => spans.map(({ start, end }) =>
-  start === end ? String(start) : `${start}–${end}`).join(isZh() ? "、" : ", ");
+const adminWorkspace = createAdminWorkspace({
+  t: (k) => t(k as Parameters<typeof t>[0]),
+  isZh,
+  failure,
+  dialog: editor,
+  transport: {
+    session: async () => {
+      const reply = await request({ op: "admin_session" }, false);
+      status = reply;
+      return reply.admin_data;
+    },
+    action: async (body) => {
+      status = await request({ op: "admin_action", action: body }, false);
+    },
+  },
+  onUnauthorized() {
+    if (status) status = { ...status, admin_ready: false };
+    if (tab === "admin") tab = "services";
+    render(true);
+  },
+});
+
+adminWorkspace.onUpdate(() => {
+  if (tab === "admin") render(true);
+});
+
+window.addEventListener("keydown", (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "m") {
+    if (!status?.member || !status.admin_ready) return;
+    event.preventDefault();
+    selectTab(tab === "admin" ? "services" : "admin");
+  }
+});
+
+function selectTab(next: "services" | "admin") {
+  if (next === "admin" && !status?.admin_ready) return;
+  if (tab === next) return;
+  closePopoverMenu();
+  tab = next;
+  render(true);
+  if (next === "admin") void adminWorkspace.refresh();
+}
+
+const ranges = <T>(spans: Span<T>[]) => formatRanges(spans, isZh());
 const inputRanges = <T>(spans: Span<T>[]) => spans.map(({ start, end }) =>
   start === end ? String(start) : `${start}-${end}`).join(", ");
 const toInt = (ip: string) => ip.split(".").reduce((n, part) => n * 256 + Number(part), 0);
@@ -337,12 +470,7 @@ function addresses(ips: Span<string>[], maps: Mapping[]) {
 const accessIp = (ip: string, maps: Mapping[]) =>
   addresses([{ start: ip, end: ip }], maps).virtual[0]?.start ?? ip;
 
-const single = <T>(spans: Span<T>[]) => spans.length === 1 && spans[0]!.start === spans[0]!.end;
-const singleIp = (s: Share) => single(s.rules.ips) ? s.rules.ips[0]!.start : null;
-const singlePort = (s: Share) => single(s.rules.ports) ? s.rules.ports[0]!.start : null;
-const effectiveKind = (s: Share): ServiceKind => s.kind ?? (s.http ? "http" : "tcp");
 const kindBadgeText = (kind: ServiceKind) => kind.toUpperCase();
-const osLabel = (os?: HostOs | null) => os === "windows" ? "Windows" : os === "linux" ? "Linux" : "";
 
 function inferDefaultKind(port: number): ServiceKind {
   if (port === 22) return "ssh";
@@ -363,47 +491,6 @@ function isUsableHostIp(ip: string): boolean {
   if (first === 169 && second === 254) return false;
   if (first === 198 && (second === 18 || second === 19)) return false;
   return true;
-}
-
-type ListEntry<T extends Share> =
-  | { grouped: true; ip: string; items: T[] }
-  | { grouped: false; item: T };
-
-function groupByHost<T extends Share>(items: T[], keyOf: (item: T) => string | null): ListEntry<T>[] {
-  const entries: ListEntry<T>[] = [];
-  const buckets = new Map<string, { grouped: true; ip: string; items: T[] }>();
-  for (const item of items) {
-    const ip = singleIp(item);
-    const key = ip ? keyOf(item) : null;
-    if (!ip || !key) {
-      entries.push({ grouped: false, item });
-      continue;
-    }
-    let bucket = buckets.get(key);
-    if (!bucket) {
-      bucket = { grouped: true, ip, items: [] };
-      buckets.set(key, bucket);
-      entries.push(bucket);
-    }
-    bucket.items.push(item);
-  }
-  for (const entry of entries) {
-    if (entry.grouped && entry.items.length > 1) {
-      entry.items.sort((a, b) => (a.rules.ports[0]?.start ?? 0) - (b.rules.ports[0]?.start ?? 0));
-    }
-  }
-  return entries;
-}
-
-function resolveHostOs(items: Share[], probedOs: (HostOs | undefined)[] = []): HostOs | null {
-  const hasOsCapable = items.some(s => effectiveKind(s) === "ssh" || effectiveKind(s) === "rdp");
-  if (!hasOsCapable) return null;
-  for (const s of items) if (s.host_os === "windows") return "windows";
-  for (const os of probedOs) if (os === "windows") return "windows";
-  for (const s of items) if (effectiveKind(s) === "rdp") return "windows";
-  for (const s of items) if (s.host_os === "linux") return "linux";
-  for (const os of probedOs) if (os === "linux") return "linux";
-  return null;
 }
 
 function dialogHeader(title: string, onClose: () => void) {
@@ -493,17 +580,28 @@ async function testConnection(service: Offering, ip: string, port: number) {
 
 function testHostServices(items: Offering[]) {
   if (busy || !status?.online) return;
+  const tasks: { service: Offering; ip: string; port: number }[] = [];
   for (const service of items) {
     const ip = singleIp(service);
     const port = singlePort(service);
-    if (ip && port) void testConnection(service, ip, port);
+    if (ip && port) tasks.push({ service, ip, port });
+  }
+  let cursor = 0;
+  const workers = Math.min(4, tasks.length);
+  for (let i = 0; i < workers; i++) {
+    void (async () => {
+      while (cursor < tasks.length) {
+        const next = tasks[cursor++]!;
+        await testConnection(next.service, next.ip, next.port);
+      }
+    })();
   }
 }
 
 function chooseTarget(service: Share, title: string, action: (ip: string, port: number) => void,
   previous?: Probe, submitLabel = t("test")) {
   const { ips, ports } = service.rules;
-  if (single(ips) && single(ports)) {
+  if (singleSpan(ips) && singleSpan(ports)) {
     action(ips[0]!.start, ports[0]!.start);
     return;
   }
@@ -531,101 +629,6 @@ function runServiceAction(service: Share, owner: string | undefined, kind: "copy
   }, owner ? probes.get(`${owner}:${service.id}`) : undefined, label);
 }
 
-type IconName = Parameters<typeof icon>[0];
-type MenuEntry =
-  | { sep: true }
-  | { icon: IconName; label: string; danger?: boolean; onSelect: () => void };
-
-let activeMenu: { el: HTMLDivElement; anchor: HTMLButtonElement; cleanup: () => void } | null = null;
-
-function closeMenu() {
-  if (!activeMenu) return;
-  activeMenu.cleanup();
-  activeMenu.anchor.setAttribute("aria-expanded", "false");
-  activeMenu.el.remove();
-  activeMenu = null;
-}
-
-function openMenu(anchor: HTMLButtonElement, entries: MenuEntry[]) {
-  if (activeMenu?.anchor === anchor) {
-    closeMenu();
-    return;
-  }
-  closeMenu();
-  const menu = el("div", "popover-menu");
-  menu.setAttribute("role", "menu");
-  const buttons: HTMLButtonElement[] = [];
-  for (const entry of entries) {
-    if ("sep" in entry) {
-      const sep = el("div", "menu-sep");
-      sep.setAttribute("role", "separator");
-      menu.append(sep);
-      continue;
-    }
-    const item = button(entry.label, () => {
-      closeMenu();
-      entry.onSelect();
-    }, `menu-item${entry.danger ? " danger" : ""}`);
-    item.setAttribute("role", "menuitem");
-    item.prepend(icon(entry.icon));
-    buttons.push(item);
-    menu.append(item);
-  }
-  document.body.append(menu);
-  const rect = anchor.getBoundingClientRect();
-  const mw = menu.offsetWidth;
-  const mh = menu.offsetHeight;
-  const left = Math.max(12, Math.min(rect.right - mw, window.innerWidth - mw - 12));
-  const flipUp = rect.bottom + mh + 12 > window.innerHeight && rect.top - mh - 12 >= 0;
-  const top = flipUp ? rect.top - mh - 6 : rect.bottom + 6;
-  menu.style.left = `${Math.round(left)}px`;
-  menu.style.top = `${Math.round(top)}px`;
-  menu.setAttribute("data-origin", flipUp ? "bottom" : "top");
-  anchor.setAttribute("aria-expanded", "true");
-
-  const onPointerDown = (event: Event) => {
-    const target = event.target as Node | null;
-    if (target && (menu.contains(target) || anchor.contains(target))) return;
-    closeMenu();
-  };
-  const onKeyDown = (event: KeyboardEvent) => {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      closeMenu();
-      anchor.focus();
-      return;
-    }
-    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-      event.preventDefault();
-      const cur = buttons.indexOf(document.activeElement as HTMLButtonElement);
-      const next = event.key === "ArrowDown"
-        ? (cur + 1) % buttons.length
-        : (cur - 1 + buttons.length) % buttons.length;
-      buttons[next]?.focus();
-    }
-  };
-  const onDismiss = (event: Event) => {
-    const target = event.target as Node | null;
-    if (event.type === "scroll" && target && menu.contains(target)) return;
-    closeMenu();
-  };
-
-  window.addEventListener("pointerdown", onPointerDown, true);
-  window.addEventListener("keydown", onKeyDown, true);
-  window.addEventListener("resize", onDismiss);
-  window.addEventListener("scroll", onDismiss, true);
-  activeMenu = {
-    el: menu,
-    anchor,
-    cleanup: () => {
-      window.removeEventListener("pointerdown", onPointerDown, true);
-      window.removeEventListener("keydown", onKeyDown, true);
-      window.removeEventListener("resize", onDismiss);
-      window.removeEventListener("scroll", onDismiss, true);
-    },
-  };
-}
-
 function openWebPreview(service: Share, owner?: string) {
   const title = t(owner ? "web_test" : "local_web_test");
   message = ""; showError();
@@ -643,19 +646,17 @@ function openWebPreview(service: Share, owner?: string) {
     };
     showSiteDialog({ id: service.id, owner: owner ?? null, ip, port }, access, valid, (result) => {
       if (!owner) return;
-      probes.set(`${owner}:${service.id}`, { ip, port, access, kind: "http",
-        result: result === "visible" ? { visible: true } : result });
+      const key = `${owner}:${service.id}`;
+      const prev = probes.get(key)?.result;
+      probes.set(key, {
+        ip, port, access, kind: "http",
+        result: result === "visible"
+          ? { visible: true, rttMs: prev?.rttMs, httpStatus: prev?.httpStatus }
+          : result,
+      });
       render(true);
     });
   });
-}
-
-function meaningfulHostName(name: string, ip: string, os: HostOs | null): string {
-  const trimmed = name.trim();
-  if (!trimmed || trimmed === ip) return "";
-  const tag = osLabel(os);
-  if (tag && trimmed === `${tag} · ${ip}`) return "";
-  return trimmed;
 }
 
 function rowActions(service: Share, name: string, owner: string | undefined, routing: boolean, configure: () => void) {
@@ -704,7 +705,7 @@ function rowActions(service: Share, name: string, owner: string | undefined, rou
         onSelect: () => openAddShare({ ip: hostIp, name: meaningfulHostName(service.name, hostIp, service.host_os ?? null) }),
       });
     }
-    openMenu(more, [...primary, { sep: true }, ...secondary]);
+    openPopoverMenu(more, [...primary, { sep: true }, ...secondary]);
   });
   more.setAttribute("aria-haspopup", "menu");
   more.setAttribute("aria-expanded", "false");
@@ -712,90 +713,106 @@ function rowActions(service: Share, name: string, owner: string | undefined, rou
 }
 
 function endpoint(ips: Span<string>[], ports: Span<number>[]) {
-  return `${ranges(ips)}${single(ips) && single(ports) ? ":" : " · "}${ranges(ports)}`;
+  return formatEndpoint({ ips, ports }, isZh());
 }
 
 function probeVisual(service: Offering, data: Status, routing: boolean) {
   const kind = effectiveKind(service);
   const ips = addresses(service.rules.ips, data.virtual_ips);
-  const one = single(service.rules.ips) && single(service.rules.ports);
+  const overlapped = ips.virtual.length > 0;
+  const one = singleSpan(service.rules.ips) && singleSpan(service.rules.ports);
   const probe = probes.get(serviceKey(service));
   const result = probe?.result;
   const http = result?.httpStatus;
   const pending = !!probe && !result;
-  const conflict = ips.virtual.length > 0 || result?.error === "conflict";
-  const failed = !!result?.error || (http !== undefined && (http < 200 || http >= 400));
-  const state = pending ? "testing" : conflict ? "overlap" : !result ? "unchecked"
-    : failed ? "unavailable" : http !== undefined ? "http" : "available";
-  const caption = state === "http"
-    ? (result?.rttMs !== undefined ? `${http} · ${result.rttMs}ms` : `${http}`)
-    : state === "available"
-      ? (result?.visible
-        ? t("page_visible")
-        : result?.rttMs !== undefined ? `${result.rttMs}ms` : t("reachable"))
-      : t(state);
-  const tone = (state === "available" || state === "http") && routing ? "good"
-    : state === "overlap" ? "warn"
-    : state === "unavailable" ? "bad" : "";
+  const httpBad = http !== undefined && (http < 200 || http >= 400);
+  const errCode = result?.error;
+
+  let caption: string;
+  let tone = "";
+  let detailTip = t("reprobe");
+
+  if (pending) {
+    caption = t("testing");
+  } else if (!result) {
+    caption = t("unchecked");
+  } else if (errCode) {
+    caption = failure(errCode);
+    tone = errCode === "conflict" ? "warn" : "bad";
+    detailTip = `${caption} · ${t("reprobe")}`;
+  } else if (httpBad) {
+    caption = result.rttMs !== undefined ? `${result.rttMs}ms` : `HTTP ${http}`;
+    tone = "bad";
+    detailTip = `HTTP ${http}${result.rttMs !== undefined ? ` · ${result.rttMs}ms` : ""} · ${t("reprobe")}`;
+  } else {
+    caption = result.rttMs !== undefined
+      ? `${result.rttMs}ms`
+      : result.visible ? t("page_visible") : t("reachable");
+    tone = routing ? "good" : "";
+    detailTip = [http !== undefined ? `HTTP ${http}` : "", result.rttMs !== undefined ? `${result.rttMs}ms` : "", t("reprobe")]
+      .filter(Boolean).join(" · ");
+  }
+
   const badge = button(caption, () => chooseTarget(service, t("test_connection"),
     (ip, port) => void testConnection(service, ip, port), probe), `probe-badge badge ${tone}`);
-  badge.title = ips.virtual.length ? t("local_overlap") : t("reprobe");
+  badge.title = detailTip;
   badge.setAttribute("aria-label", `${t("refresh_status")}：${caption}`);
   badge.setAttribute("data-pending", String(pending));
   badge.disabled = pending || !data.online;
 
+  let httpTag: HTMLElement | null = null;
+  if (http !== undefined && !pending && !errCode) {
+    httpTag = el("span", httpBad ? "http-code bad" : "http-code", String(http));
+    httpTag.title = `HTTP ${http}`;
+  }
+
   let note: HTMLElement | null = null;
-  if (probe && result && (!one || conflict || failed)) {
-    const outcome = result.error ? failure(result.error)
+  if (probe && result && !one) {
+    const outcome = errCode ? failure(errCode)
       : result.visible ? t("page_visible")
       : http !== undefined ? `HTTP ${http}`
       : kind === "tcp" ? t("reachable") : kindBadgeText(kind);
-    note = el("p", failed ? "probe-note problem" : "probe-note", one ? outcome : `${probe.access}:${probe.port} · ${outcome}`);
+    note = el("p", errCode || httpBad ? "probe-note problem" : "probe-note", `${probe.access}:${probe.port} · ${outcome}`);
     note.setAttribute("role", "status");
   }
-  return { ips, badge, note, pending, result };
+  return { ips, overlapped, badge, httpTag, note, pending, result };
 }
 
-function serviceRow(
-  address: string,
-  subtitle: string,
-  tags: HTMLElement[],
-  ...controls: HTMLElement[]
-) {
-  const actionsWrap = el("div", "service-actions", ...controls);
+function serviceRow(address: string, subtitle: string, tags: HTMLElement[], ...controls: HTMLElement[]) {
   return el("article", "service-row",
     el("div", "service-main",
       el("div", "host-title-line", el("p", "endpoint", address), ...tags),
       ...(subtitle ? [el("div", "service-meta", el("span", "service-name", subtitle))] : [])
     ),
-    actionsWrap
+    el("div", "service-actions", ...controls)
   );
 }
 
 function groupSingleRow(service: Offering, data: Status, routing: boolean) {
   const kind = effectiveKind(service);
   const label = data.labels.find((l) => l.service === service.id);
-  const { ips, badge, note, result } = probeVisual(service, data, routing);
+  const { ips, overlapped, badge, httpTag, note, result } = probeVisual(service, data, routing);
   const address = endpoint([...ips.original, ...ips.virtual], service.rules.ports);
   const rawName = label?.remark || service.name;
   const ip = singleIp(service);
-  const os = resolveHostOs([service], [result?.hostOs]);
+  const os = resolveHostOs([service], [result?.hostOs]) as HostOs | null;
   const displayName = ip ? meaningfulHostName(rawName, ip, os) : rawName;
   const alias = label?.alias && data.aliases[label.alias] ? label.alias : null;
   const subtitle = [displayName, alias].filter(Boolean).join(" · ");
   const tags: HTMLElement[] = [];
   if (os) tags.push(el("span", "host-os-tag", osLabel(os)));
   if (kind !== "tcp") tags.push(el("span", "proto-tag", kindBadgeText(kind)));
+  if (httpTag) tags.push(httpTag);
+  if (overlapped) {
+    const ov = el("span", "badge warn", t("overlap"));
+    ov.title = t("local_overlap");
+    tags.push(ov);
+  }
   const row = serviceRow(
-    address,
-    subtitle,
-    tags,
-    badge,
+    address, subtitle, tags, badge,
     rowActions(service, rawName, service.owner, routing, () => customize(service, label, routing))
   );
-  if (ips.virtual.length) {
-    row.append(el("p", "probe-note", `${t("original_ip")} ${ranges(service.rules.ips)}`));
-  }
+  if (overlapped) row.append(el("p", "probe-note", `${t("original_ip")} ${ranges(service.rules.ips)}`));
   if (note) row.append(note);
   return row;
 }
@@ -808,7 +825,7 @@ function groupHostCard(ip: string, items: Offering[], data: Status, routing: boo
   const alias = labels.map(l => l?.alias).find((a): a is string => !!a && !!data.aliases[a]) ?? null;
   const probed = items.map(s => probes.get(serviceKey(s)));
   const anyPending = probed.some(p => p && !p.result);
-  const hostOs = resolveHostOs(items, probed.map(p => p?.result?.hostOs));
+  const hostOs = resolveHostOs(items, probed.map(p => p?.result?.hostOs)) as HostOs | null;
   const cleanName = meaningfulHostName(rawHostName, ip, hostOs);
 
   const testAll = tool("refresh", t("test_host"), () => testHostServices(items));
@@ -817,7 +834,11 @@ function groupHostCard(ip: string, items: Offering[], data: Status, routing: boo
 
   const titleParts: HTMLElement[] = [el("p", "endpoint", access)];
   if (hostOs) titleParts.push(el("span", "host-os-tag", osLabel(hostOs)));
-  if (overlapped) titleParts.push(el("span", "badge warn", t("overlap")));
+  if (overlapped) {
+    const ov = el("span", "badge warn", t("overlap"));
+    ov.title = t("local_overlap");
+    titleParts.push(ov);
+  }
 
   const metaParts: (HTMLElement | string)[] = [];
   if (cleanName) metaParts.push(el("span", "service-name", cleanName));
@@ -841,7 +862,7 @@ function groupHostCard(ip: string, items: Offering[], data: Status, routing: boo
   const portsWrap = el("div", "host-ports", ...items.map((service, idx) => {
     const kind = effectiveKind(service);
     const label = labels[idx];
-    const { badge, note } = probeVisual(service, data, routing);
+    const { badge, httpTag, note } = probeVisual(service, data, routing);
     const portText = `:${ranges(service.rules.ports)}`;
     const rowRawName = label?.remark || service.name;
     const subName = rowRawName !== rawHostName ? meaningfulHostName(rowRawName, ip, hostOs) : "";
@@ -849,6 +870,7 @@ function groupHostCard(ip: string, items: Offering[], data: Status, routing: boo
       el("div", "port-main",
         el("span", "port-num", portText),
         el("span", "proto-tag", kindBadgeText(kind)),
+        ...(httpTag ? [httpTag] : []),
         ...(subName ? [el("span", "port-subname", subName)] : [])
       ),
       el("div", "port-actions",
@@ -863,16 +885,15 @@ function groupHostCard(ip: string, items: Offering[], data: Status, routing: boo
   return el("article", "host-card", head, portsWrap);
 }
 
-function groupView(data: Status) {
-  if (!data.services.length) return empty(t(data.online ? "no_services" : "group_disconnected"));
+function groupList(data: Status) {
   const routing = data.system_routing !== false;
-  const entries = groupByHost(data.services, (s) => `${s.owner}:${singleIp(s)}`);
+  const entries = groupByHost(data.services, (s: Offering) => `${s.owner}:${singleIp(s)}`);
   return el("div", "service-list", ...entries.map((entry) => {
     if (!entry.grouped || entry.items.length === 1) {
-      const item = entry.grouped ? entry.items[0]! : entry.item;
+      const item = (entry.grouped ? entry.items[0] : entry.item) as Offering;
       return groupSingleRow(item, data, routing);
     }
-    return groupHostCard(entry.ip, entry.items, data, routing);
+    return groupHostCard(entry.ip, entry.items as Offering[], data, routing);
   }));
 }
 
@@ -893,9 +914,7 @@ function protocolSelect(selected: ServiceKind, cls = "kind-select", onChange?: (
     opt.selected = value === selected;
     select.append(opt);
   }
-  if (onChange) {
-    select.addEventListener("change", () => onChange(select.value as ServiceKind));
-  }
+  if (onChange) select.addEventListener("change", () => onChange(select.value as ServiceKind));
   return select;
 }
 
@@ -977,29 +996,16 @@ function openAddShare(prefill?: { ip?: string; name?: string }) {
   let keepPortFocus = false;
   editor.addEventListener("close", () => { dialogOpen = false; }, { once: true });
 
-  const existingForIp = (ip: string) => {
-    const out: Share[] = [];
-    for (const s of status?.shares ?? []) {
-      if (singleIp(s) === ip && singlePort(s) !== null) out.push(s);
-    }
-    return out;
-  };
+  const existingForIp = (ip: string) =>
+    (status?.shares ?? []).filter(s => singleIp(s) === ip && singlePort(s) !== null);
 
   if (ipVal) {
-    const existing = existingForIp(ipVal);
-    items = existing
+    items = existingForIp(ipVal)
       .map(s => {
         const port = singlePort(s)!;
         const kind = effectiveKind(s);
-        const osHint = kind === "rdp" ? "windows" : (kind === "ssh" ? s.host_os : undefined);
-        return {
-          spec: String(port),
-          port,
-          kind,
-          checked: true,
-          saved: true,
-          osHint,
-        };
+        const osHint: HostOs | undefined = kind === "rdp" ? "windows" : (kind === "ssh" ? s.host_os : undefined);
+        return { spec: String(port), port, kind, checked: true, saved: true, osHint };
       })
       .sort((a, b) => (a.port ?? 0) - (b.port ?? 0));
   }
@@ -1028,7 +1034,7 @@ function openAddShare(prefill?: { ip?: string; name?: string }) {
       if (p.open) anyOpen = true;
       const spec = String(p.port);
       const prev = bySpec.get(spec);
-      const hint = p.os_hint ?? (p.kind === "rdp" ? "windows" : undefined);
+      const hint: HostOs | undefined = p.os_hint ?? (p.kind === "rdp" ? "windows" : undefined);
       if (onlySpecific) {
         if (!prev) continue;
         prev.probing = false;
@@ -1036,10 +1042,7 @@ function openAddShare(prefill?: { ip?: string; name?: string }) {
         prev.rttMs = p.rtt_ms;
         prev.httpStatus = p.http_status;
         prev.detail = p.detail;
-        if (p.open) {
-          prev.kind = p.kind;
-          prev.osHint = hint;
-        }
+        if (p.open) { prev.kind = p.kind; prev.osHint = hint; }
       } else if (p.open) {
         if (prev) {
           prev.probing = false;
@@ -1083,11 +1086,7 @@ function openAddShare(prefill?: { ip?: string; name?: string }) {
   async function detectCommonServices() {
     if (probingAll || busy) return;
     const ip = ipVal.trim();
-    if (!isUsableHostIp(ip)) {
-      localError = t("invalid_host_ip");
-      draw();
-      return;
-    }
+    if (!isUsableHostIp(ip)) { localError = t("invalid_host_ip"); draw(); return; }
     localError = "";
     message = "";
     emptyDetect = false;
@@ -1113,11 +1112,7 @@ function openAddShare(prefill?: { ip?: string; name?: string }) {
     const raw = portDraft.trim();
     if (!raw) return true;
     const parsed = parsePortEntries(raw);
-    if (!parsed || !parsed.length) {
-      localError = t("invalid_port_input");
-      draw();
-      return false;
-    }
+    if (!parsed || !parsed.length) { localError = t("invalid_port_input"); draw(); return false; }
     const ip = ipVal.trim();
     const singleHost = isUsableHostIp(ip);
     const existingSet = new Set(singleHost ? existingForIp(ip).map(s => singlePort(s)!) : []);
@@ -1127,11 +1122,7 @@ function openAddShare(prefill?: { ip?: string; name?: string }) {
       if (prev) {
         prev.checked = true;
       } else {
-        if (items.length >= 10) {
-          localError = t("invalid_port_input");
-          draw();
-          return false;
-        }
+        if (items.length >= 10) { localError = t("invalid_port_input"); draw(); return false; }
         const kind = token.port !== undefined ? inferDefaultKind(token.port) : "tcp";
         items.push({
           spec: token.spec,
@@ -1154,18 +1145,14 @@ function openAddShare(prefill?: { ip?: string; name?: string }) {
 
     if (addedSingle.length && singleHost) {
       void request({ op: "probe_host", ip, ports: addedSingle }, true)
-        .then((reply) => {
-          if (reply.host_probe) mergeProbeResults(reply.host_probe, true);
-        })
+        .then((reply) => { if (reply.host_probe) mergeProbeResults(reply.host_probe, true); })
         .catch(() => {
           for (const port of addedSingle) {
             const entry = items.find(i => i.port === port);
             if (entry) { entry.probing = false; entry.open = false; }
           }
         })
-        .finally(() => {
-          if (dialogOpen && editor.open) draw();
-        });
+        .finally(() => { if (dialogOpen && editor.open) draw(); });
     }
     return true;
   }
@@ -1175,7 +1162,6 @@ function openAddShare(prefill?: { ip?: string; name?: string }) {
     const parts: string[] = [];
     if (item.saved) parts.push(t("already_added"));
     if (item.open === false) parts.push(t("port_offline"));
-    else if (item.httpStatus) parts.push(String(item.httpStatus));
     else if (item.kind === "rdp" && item.detail === "NLA") parts.push("NLA");
     return parts.join(" · ");
   }
@@ -1226,9 +1212,7 @@ function openAddShare(prefill?: { ip?: string; name?: string }) {
     body.append(el("div", "field-group", ipHead, el("div", "host-ip-row", ipInput, detectBtn)));
 
     const portsBox = el("div", "ports-box");
-    if (emptyDetect && !items.length) {
-      portsBox.append(el("div", "ports-empty-note", t("host_none_open")));
-    }
+    if (emptyDetect && !items.length) portsBox.append(el("div", "ports-empty-note", t("host_none_open")));
     for (const item of items) {
       const cb = el("input");
       Object.assign(cb, { type: "checkbox", checked: item.checked });
@@ -1254,10 +1238,15 @@ function openAddShare(prefill?: { ip?: string; name?: string }) {
       removeBtn.setAttribute("aria-label", `${t("remove")} :${item.spec}`);
       removeBtn.append(icon("close"));
 
+      const httpCode = item.httpStatus !== undefined
+        ? el("span", item.httpStatus >= 400 ? "http-code bad" : "http-code", String(item.httpStatus))
+        : null;
+      if (httpCode) httpCode.title = `HTTP ${item.httpStatus}`;
       row.append(
         cb,
         el("span", "host-service-port", `:${item.spec}`),
         kindSel,
+        ...(httpCode ? [httpCode] : []),
         el("span", "host-service-detail", detail),
         ...(item.rttMs !== undefined ? [el("span", "host-service-rtt", `${item.rttMs}ms`)] : []),
         ...(item.saved ? [] : [removeBtn])
@@ -1279,19 +1268,12 @@ function openAddShare(prefill?: { ip?: string; name?: string }) {
       if (localError) { localError = ""; alertBox.hidden = true; alertBox.textContent = ""; }
       if (/[,，]$/.test(portDraft)) {
         const trimmed = portDraft.replace(/[,，]+$/, "").trim();
-        if (trimmed) {
-          portDraft = trimmed;
-          commitPortInput(true);
-          return;
-        }
+        if (trimmed) { portDraft = trimmed; commitPortInput(true); return; }
       }
       updateSubmit();
     });
     portInput.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        commitPortInput(true);
-      }
+      if (e.key === "Enter") { e.preventDefault(); commitPortInput(true); }
     });
     portsBox.append(portInput);
     body.append(el("div", "field-group", el("span", "field-label", t("add_ports_label")), portsBox));
@@ -1311,10 +1293,7 @@ function openAddShare(prefill?: { ip?: string; name?: string }) {
       if (status?.online && isUsableHostIp(ipVal.trim()) && items.every(i => i.port !== undefined)) {
         const pubCheck = el("input");
         Object.assign(pubCheck, { type: "checkbox", checked: publishNow });
-        pubCheck.addEventListener("change", () => {
-          publishNow = pubCheck.checked;
-          updateSubmit();
-        });
+        pubCheck.addEventListener("change", () => { publishNow = pubCheck.checked; updateSubmit(); });
         body.append(el("label", "check-row", pubCheck, t("save_and_publish")));
       }
     }
@@ -1405,8 +1384,21 @@ function shareEditAction(s: Share, address: string) {
   };
 }
 
-function makeToggle(checked: boolean, label: string, disabled: boolean, onToggle: () => void, fraction?: string) {
-  const sw = button("", onToggle, "switch");
+let pulseTimer: number | undefined;
+function hintConnectFirst() {
+  notify(t("connect_first"));
+  const connBtn = actions.querySelector<HTMLButtonElement>("[data-connect-btn]");
+  if (!connBtn) return;
+  window.clearTimeout(pulseTimer);
+  connBtn.classList.add("pulse-hint");
+  pulseTimer = window.setTimeout(() => connBtn.classList.remove("pulse-hint"), 900);
+}
+
+function makeToggle(checked: boolean, label: string, offlineBlocked: boolean, onToggle: () => void, fraction?: string) {
+  const sw = button("", () => {
+    if (offlineBlocked) { hintConnectFirst(); return; }
+    onToggle();
+  }, "switch");
   if (fraction) sw.append(el("span", "switch-fraction", fraction));
   const track = el("span", "switch-track");
   track.setAttribute("aria-hidden", "true");
@@ -1415,7 +1407,10 @@ function makeToggle(checked: boolean, label: string, disabled: boolean, onToggle
   sw.setAttribute("aria-label", label);
   sw.setAttribute("aria-checked", String(checked));
   if (fraction) sw.setAttribute("data-partial", "true");
-  sw.disabled = disabled;
+  if (offlineBlocked) {
+    sw.setAttribute("data-offline", "true");
+    sw.title = t("connect_first");
+  }
   return sw;
 }
 
@@ -1426,23 +1421,20 @@ function mineSingleRow(s: Share, data: Status) {
     () => void act({ op: "share", id: s.id, enabled: !active }));
   const address = endpoint(s.rules.ips, s.rules.ports);
   const ip = singleIp(s);
-  const os = resolveHostOs([s]);
+  const os = resolveHostOs([s]) as HostOs | null;
   const subtitle = ip ? meaningfulHostName(s.name, ip, os) : s.name;
   const tags: HTMLElement[] = [];
   if (os) tags.push(el("span", "host-os-tag", osLabel(os)));
   if (kind !== "tcp") tags.push(el("span", "proto-tag", kindBadgeText(kind)));
   return serviceRow(
-    address,
-    subtitle,
-    tags,
-    publish,
+    address, subtitle, tags, publish,
     rowActions(s, s.name, undefined, true, shareEditAction(s, address))
   );
 }
 
 function mineHostCard(ip: string, items: Share[], data: Status) {
   const rawHostName = items[0]!.name;
-  const hostOs = resolveHostOs(items);
+  const hostOs = resolveHostOs(items) as HostOs | null;
   const cleanName = meaningfulHostName(rawHostName, ip, hostOs);
   const activeCount = items.filter(s => data.active.includes(s.id)).length;
   const allActive = activeCount === items.length;
@@ -1460,7 +1452,6 @@ function mineHostCard(ip: string, items: Share[], data: Status) {
   const titleParts: HTMLElement[] = [el("p", "endpoint", ip)];
   if (hostOs) titleParts.push(el("span", "host-os-tag", osLabel(hostOs)));
 
-  // Exact column alignment: [master switch] aligns directly over port switches, [+] aligns over [⋯].
   const head = el("div", "host-head",
     el("div", "host-info",
       el("div", "host-title-line", ...titleParts),
@@ -1474,7 +1465,6 @@ function mineHostCard(ip: string, items: Share[], data: Status) {
     const active = data.active.includes(s.id);
     const publish = makeToggle(active, `${t("publish")} · ${s.name}`, !data.online && !active,
       () => void act({ op: "share", id: s.id, enabled: !active }));
-
     const portText = `:${ranges(s.rules.ports)}`;
     const subName = s.name !== rawHostName ? meaningfulHostName(s.name, ip, hostOs) : "";
     const address = endpoint(s.rules.ips, s.rules.ports);
@@ -1484,10 +1474,7 @@ function mineHostCard(ip: string, items: Share[], data: Status) {
         el("span", "proto-tag", kindBadgeText(kind)),
         ...(subName ? [el("span", "port-subname", subName)] : [])
       ),
-      el("div", "port-actions",
-        publish,
-        rowActions(s, s.name, undefined, true, shareEditAction(s, address))
-      )
+      el("div", "port-actions", publish, rowActions(s, s.name, undefined, true, shareEditAction(s, address)))
     );
     return el("div", "port-row-wrap", row);
   }));
@@ -1495,16 +1482,50 @@ function mineHostCard(ip: string, items: Share[], data: Status) {
   return el("article", "host-card", head, portsWrap);
 }
 
-function mineView(data: Status) {
-  if (!data.shares.length) return empty(t("no_presets"), addShare(true));
-  const entries = groupByHost(data.shares, (s) => singleIp(s));
+function mineList(data: Status) {
+  const entries = groupByHost(data.shares, (s: Share) => singleIp(s));
   return el("div", "service-list", ...entries.map((entry) => {
     if (!entry.grouped || entry.items.length === 1) {
-      const item = entry.grouped ? entry.items[0]! : entry.item;
+      const item = (entry.grouped ? entry.items[0] : entry.item) as Share;
       return mineSingleRow(item, data);
     }
-    return mineHostCard(entry.ip, entry.items, data);
+    return mineHostCard(entry.ip, entry.items as Share[], data);
   }));
+}
+
+function servicesView(data: Status) {
+  const hasRemote = data.services.length > 0;
+  const hasLocal = data.shares.length > 0;
+  if (!hasRemote && !hasLocal) {
+    if (data.running && !data.online) return empty(t("connecting_now"));
+    if (!data.online) {
+      return empty(
+        t("group_disconnected"),
+        button(t("connect_now"), () => void act({ op: "start" }), "button primary"),
+        button(t("new_share"), () => openAddShare(), "button")
+      );
+    }
+    return empty(t("no_services"), addShare(true));
+  }
+
+  const routing = data.system_routing !== false;
+  const makeRemoteBlock = (withHead: boolean) => el("div", "flow-section",
+    ...(withHead ? [el("div", "flow-head", el("span", "", t("section_group")), el("span", "count", String(data.services.length)))] : []),
+    groupList(data),
+    ...(routing ? [] : [el("p", "routing-note", t("routing_unavailable"))])
+  );
+  const makeLocalBlock = (withHead: boolean) => el("div", "flow-section",
+    ...(withHead ? [el("div", "flow-head", el("span", "", t("section_mine")), el("span", "count", String(data.shares.length)))] : []),
+    mineList(data)
+  );
+
+  if (hasRemote && hasLocal) {
+    const blocks = routing
+      ? [makeRemoteBlock(true), makeLocalBlock(true)]
+      : [makeLocalBlock(true), makeRemoteBlock(true)];
+    return el("div", "service-flow", ...blocks);
+  }
+  return el("div", "service-flow", hasRemote ? makeRemoteBlock(false) : makeLocalBlock(false));
 }
 
 function addShare(emptyState = false) {
@@ -1520,88 +1541,72 @@ function openSettings() {
   let currentBehavior = getCloseBehavior();
   let saveError = false;
 
-  function renderSettings() {
-    settingsDialog.replaceChildren();
-
-    const heading = el("h2", "settings-title", t("settings"));
-    heading.id = "settings-heading";
-    const closeBtn = tool("close", t("close"), () => settingsDialog.close());
-    const header = el("div", "settings-header", heading, closeBtn);
-
-    const body = el("div", "settings-body");
-
-    const themeSeg = el("div", "segmented");
-    for (const [id, key] of [["system", "theme_system"], ["light", "theme_light"], ["dark", "theme_dark"]] as const) {
-      const btn = button(t(key), () => {
-        setTheme(id);
-        renderSettings();
-      }, id === getTheme() ? "active" : "");
-      btn.setAttribute("aria-pressed", String(id === getTheme()));
-      themeSeg.append(btn);
-    }
-    body.append(el("div", "settings-row", el("span", "settings-label", t("appearance")), themeSeg));
-
-    const langSeg = el("div", "segmented");
-    for (const [id, key] of [["zh-CN", "lang_zh"], ["en", "lang_en"]] as const) {
-      const btn = button(t(key), () => {
-        setLocale(id);
-        refreshSiteDialogI18n();
-        syncBrand();
-        renderSettings();
-        render(true);
-      }, id === getLocale() ? "active" : "");
-      btn.setAttribute("aria-pressed", String(id === getLocale()));
-      langSeg.append(btn);
-    }
-    body.append(el("div", "settings-row", el("span", "settings-label", t("language")), langSeg));
-
-    if (mac) {
-      const closeSeg = el("div", "segmented");
-      for (const [id, key] of [["tray", "close_to_tray"], ["quit", "close_quit"]] as const) {
-        const btn = button(t(key), () => {
-          if (currentBehavior === id) return;
-          currentBehavior = id;
-          saveError = false;
-          void syncCloseBehavior(id).then((ok) => {
-            saveError = !ok;
-            if (settingsDialog.open) renderSettings();
-          });
-          renderSettings();
-        }, id === currentBehavior ? "active" : "");
-        btn.setAttribute("aria-pressed", String(id === currentBehavior));
-        closeSeg.append(btn);
+  openSettingsModal(settingsDialog, {
+    t: (k) => t(k as Parameters<typeof t>[0]),
+    theme,
+    i18n,
+    onLocaleChange: () => {
+      refreshSiteDialogI18n();
+      syncBrand();
+      render(true);
+    },
+    extraBody(redraw) {
+      const nodes: HTMLElement[] = [];
+      if (mac) {
+        const closeSeg = el("div", "segmented");
+        for (const [id, key] of [["tray", "close_to_tray"], ["quit", "close_quit"]] as const) {
+          const btn = button(t(key), () => {
+            if (currentBehavior === id) return;
+            currentBehavior = id;
+            saveError = false;
+            void syncCloseBehavior(id).then((ok) => {
+              saveError = !ok;
+              if (settingsDialog.open) redraw();
+            });
+            redraw();
+          }, id === currentBehavior ? "active" : "");
+          btn.setAttribute("aria-pressed", String(id === currentBehavior));
+          closeSeg.append(btn);
+        }
+        nodes.push(el("div", "settings-row", el("span", "settings-label", t("on_window_close")), closeSeg));
+        if (saveError) {
+          const fb = el("p", "feedback error", t("menu_save_failed"));
+          fb.setAttribute("role", "alert");
+          nodes.push(fb);
+        }
       }
-      body.append(el("div", "settings-row", el("span", "settings-label", t("on_window_close")), closeSeg));
-      if (saveError) {
-        const fb = el("p", "feedback error", t("menu_save_failed"));
-        fb.setAttribute("role", "alert");
-        body.append(fb);
+
+      if (desktop) {
+        const sizeVal = el("span", "settings-window-val", `${winSize.w} × ${winSize.h}`);
+        sizeVal.setAttribute("data-win-size-val", "1");
+        const resetBtn = button(t("reset_window"), () => void resetDesktopWindowSize(), "button");
+        resetBtn.setAttribute("data-win-size-reset", "1");
+        resetBtn.disabled = !hasCustomWinSize && isDefaultWinSize(winSize);
+        nodes.push(el("div", "settings-row",
+          el("span", "settings-label", t("window_size")),
+          el("div", "settings-window", sizeVal, resetBtn)
+        ));
       }
-    }
 
-    if (status?.member && status.server) {
-      const acctInfo = el("span", "settings-account-info", `${status.member} · ${new URL(status.server).host}`);
-      const logoutBtn = button(t("logout"), () => {
-        settingsDialog.close();
-        void act({ op: "logout" });
-      }, "button danger");
-      body.append(
-        el("div", "settings-divider"),
-        el("div", "settings-account", acctInfo, logoutBtn),
-        ...(status.system_routing === false ? [el("p", "settings-note", t("routing_unavailable"))] : [])
-      );
-    }
+      if (status?.member && status.server) {
+        nodes.push(el("div", "settings-divider"));
 
-    const footer = el("div", "settings-footer",
-      el("span", "settings-version", appVersion ? `${t("brand")} v${appVersion}` : t("brand")));
+        const acctInfo = el("span", "settings-account-info", `${status.member} · ${new URL(status.server).host}`);
+        const logoutBtn = button(t("logout"), () => {
+          settingsDialog.close();
+          tab = "services";
+          void act({ op: "logout" });
+        }, "button danger");
 
-    settingsDialog.append(header, body, footer);
-  }
-
-  settingsDialog.tabIndex = -1;
-  renderSettings();
-  settingsDialog.showModal();
-  settingsDialog.focus();
+        nodes.push(el("div", "settings-account-block",
+          el("div", "settings-account-top", el("span", "settings-label", t("account")), acctInfo),
+          el("div", "settings-account-btns", el("div", "settings-btn-pair", logoutBtn))
+        ));
+      }
+      return nodes;
+    },
+    footerText: () => (appVersion ? `${t("brand")} v${appVersion}` : t("brand")),
+  });
 }
 
 function buildConnectionControl(data: Status): HTMLElement {
@@ -1616,6 +1621,7 @@ function buildConnectionControl(data: Status): HTMLElement {
       ? "tool-btn icon-only muted-icon spinning"
       : "tool-btn icon-only muted-icon";
   const b = button("", () => void act({ op: running ? "stop" : "start" }), cls);
+  b.setAttribute("data-connect-btn", "1");
   b.append(icon(symbol));
   b.title = tip;
   b.setAttribute("aria-label", tip);
@@ -1626,10 +1632,14 @@ function buildConnectionControl(data: Status): HTMLElement {
 function render(force = false) {
   checkSiteDialog();
   showError();
-  syncBrand(!brandBooted);
   const data = status;
+  if (!data?.admin_ready && tab === "admin") tab = "services";
+  syncBrand(!brandBooted);
   const owner = data?.member ? JSON.stringify([data.server, data.member]) : "";
-  if (owner !== tabOwner) { tabOwner = owner; tab = data?.system_routing === false ? "mine" : "group"; }
+  if (owner !== tabOwner) {
+    tabOwner = owner;
+    tab = "services";
+  }
   if (!data?.online) probes.clear();
   else if (probes.size) {
     const listed = new Map(data.services.map(s => [serviceKey(s), s]));
@@ -1642,12 +1652,12 @@ function render(force = false) {
     }
   }
   const next = JSON.stringify([data && {
-    ...data, error: null, background: null, active_flows: null, probe: null, host_probe: null,
+    ...data, error: null, background: null, active_flows: null, probe: null, host_probe: null, admin_data: null,
   }, tab, joining]);
   if (!force && applied === next) return;
   if (!force && !data?.member && content.contains(document.activeElement)) return;
   applied = next;
-  closeMenu();
+  closePopoverMenu();
   actions.replaceChildren();
   const settingsBtn = button("", () => openSettings(), "tool-btn icon-only");
   settingsBtn.append(icon("settings"));
@@ -1655,9 +1665,11 @@ function render(force = false) {
   settingsBtn.setAttribute("aria-label", t("settings"));
   settingsBtn.setAttribute("aria-haspopup", "dialog");
   actions.append(settingsBtn);
+
   const loggedIn = !!data?.member;
-  brandNameEl.hidden = loggedIn;
-  navTabs.hidden = !loggedIn;
+  const showNav = loggedIn && !!data?.admin_ready;
+  brandNameEl.hidden = showNav;
+  navTabs.hidden = !showNav;
   if (!data) {
     navTabs.replaceChildren();
     const attach = (caption: string) => button(caption, () => void act({ op: "attach" }), "button primary");
@@ -1701,26 +1713,48 @@ function render(force = false) {
     }
     return;
   }
+
   actions.prepend(
-    ...(tab === "mine" && data.shares.length ? [addShare()] : []),
+    ...(tab === "services" ? [addShare()] : []),
     buildConnectionControl(data)
   );
-  navTabs.setAttribute("aria-label", t("services"));
-  navTabs.replaceChildren(...(["group", "mine"] as const).map((id) => {
-    const b = button(t(id), () => {
-      if (tab === id) return;
-      tab = id;
-      render(true);
-      navTabs.querySelector<HTMLButtonElement>('[aria-current="page"]')?.focus();
-    }, "");
-    b.append(el("span", "count", String(id === "group" ? data.services.length : data.shares.length)));
-    b.setAttribute("aria-current", id === tab ? "page" : "false");
-    return b;
-  }));
-  const panel = el("section", "panel", tab === "group" ? groupView(data) : mineView(data));
-  if (tab === "group" && data.services.length && data.system_routing === false) {
-    panel.append(el("p", "routing-note", t("routing_unavailable")));
+  if (data.admin_ready) {
+    const totalServices = data.services.length + data.shares.length;
+    navTabs.setAttribute("aria-label", t("services"));
+    const tabDefs: { id: "services" | "admin"; label: string; count?: number }[] = [
+      { id: "services", label: t("services"), count: totalServices },
+      { id: "admin", label: t("admin_tab") },
+    ];
+    navTabs.replaceChildren(...tabDefs.map((item) => {
+      const b = button(item.label, () => {
+        if (tab === item.id) return;
+        selectTab(item.id);
+        navTabs.querySelector<HTMLButtonElement>('[aria-current="page"]')?.focus();
+      }, "");
+      if (item.count !== undefined && item.count > 0) b.append(el("span", "count", String(item.count)));
+      b.setAttribute("aria-current", item.id === tab ? "page" : "false");
+      return b;
+    }));
+  } else {
+    navTabs.replaceChildren();
   }
+
+  if (tab === "admin" && data.admin_ready) {
+    const viewKey = `admin:${adminWorkspace.getTabIndex()}`;
+    const panel = adminWorkspace.renderPanel();
+    panel.prepend(adminWorkspace.renderSubbar());
+    if (viewKey !== lastViewKey) {
+      panel.classList.add("panel-enter");
+      lastViewKey = viewKey;
+    }
+    content.replaceChildren(panel);
+    return;
+  }
+
+  const viewKey = "client:services";
+  const animateEnter = viewKey !== lastViewKey;
+  lastViewKey = viewKey;
+  const panel = el("section", animateEnter ? "panel panel-enter" : "panel", servicesView(data));
   content.replaceChildren(panel);
 }
 
@@ -1739,6 +1773,13 @@ function deepLink(urls: string[] | null) {
 }
 
 async function boot() {
+  syncBrand(true);
+  void initDesktopWindowSize();
+  i18n.onChange(() => {
+    refreshSiteDialogI18n();
+    syncBrand();
+    render(true);
+  });
   try { status = await request({ op: "attach" }, !mac); }
   catch (error) { message = typeof error === "string" ? error : "not_connected"; }
   syncBrand(true);

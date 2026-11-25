@@ -49,10 +49,21 @@ private enum LocalCoreIPC {
 
     @discardableResult
     static func sendStop() -> Bool {
-        send(json: "{\"op\":\"stop\"}") != nil
+        send(json: "{\"op\":\"stop\"}", timeoutMs: 800) != nil
     }
 
-    private static func send(json: String) -> [String: Any]? {
+    static func sendStart() -> (state: MarkState, signedIn: Bool)? {
+        guard let reply = send(json: "{\"op\":\"start\"}", timeoutMs: 3000) else { return nil }
+        guard let data = reply["data"] as? [String: Any] else {
+            return (.idle, false)
+        }
+        let signedIn = data["member"] is String
+        if (data["online"] as? Bool) == true { return (.connected, signedIn) }
+        if (data["running"] as? Bool) == true { return (.connecting, signedIn) }
+        return (.idle, signedIn)
+    }
+
+    private static func send(json: String, timeoutMs: Int = 350) -> [String: Any]? {
         guard let raw = try? Data(contentsOf: ipcURL),
               let addr = try? JSONDecoder().decode(IpcAddress.self, from: raw),
               addr.token.count == 32, addr.port > 0
@@ -62,7 +73,7 @@ private enum LocalCoreIPC {
         guard fd >= 0 else { return nil }
         defer { close(fd) }
 
-        var tv = timeval(tv_sec: 0, tv_usec: 300_000)
+        var tv = timeval(tv_sec: timeoutMs / 1000, tv_usec: __darwin_suseconds_t((timeoutMs % 1000) * 1000))
         _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         var noSigPipe: Int32 = 1
@@ -136,8 +147,9 @@ private let trigramPaths: [[UInt8]] = [
 
 @MainActor private final class Menu: Accessory, NSMenuDelegate {
     private let usesExtension: Bool
+    private let zh = Locale.preferredLanguages.first?.hasPrefix("zh") == true
     private var item: NSStatusItem?
-    private var stop: NSMenuItem?
+    private var toggleItem: NSMenuItem?
     private var tunnel: NETunnelProviderManager?
     private var markState: MarkState = .idle
     private var currentMask: UInt8 = 0b000
@@ -153,8 +165,8 @@ private let trigramPaths: [[UInt8]] = [
 
     // Bitmask-driven Bagua @2x CGImage template (36x36px -> 18x18pt).
     // Bit 2 = top yao, Bit 1 = mid yao, Bit 0 = bot yao.
-    // 0b000 = Kun ☷ (Death Gate / disconnected), 0b100 = Gen ☶ (Life Gate / connected).
-    private func trigramImage(_ mask: UInt8, alpha: CGFloat) -> NSImage {
+    // hotBit highlights only the actively changing yao during connecting (0 = uniform alpha).
+    private func trigramImage(_ mask: UInt8, alpha: CGFloat, hotBit: UInt8 = 0) -> NSImage {
         let px = 36
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
@@ -169,10 +181,10 @@ private let trigramPaths: [[UInt8]] = [
         ) else {
             return NSImage(size: NSSize(width: 18, height: 18))
         }
-        ctx.setFillColor(red: 0, green: 0, blue: 0, alpha: alpha)
-        // CoreGraphics origin is bottom-left: y=5 bot, y=15 mid, y=25 top.
         let rows: [(bit: UInt8, y: CGFloat)] = [(1, 5), (2, 15), (4, 25)]
         for row in rows {
+            let rowAlpha: CGFloat = hotBit == 0 ? alpha : ((hotBit & row.bit) != 0 ? 1.0 : 0.36)
+            ctx.setFillColor(red: 0, green: 0, blue: 0, alpha: rowAlpha)
             if (mask & row.bit) != 0 {
                 ctx.fill(CGRect(x: 4, y: row.y, width: 28, height: 6))
             } else {
@@ -189,10 +201,11 @@ private let trigramPaths: [[UInt8]] = [
         return image
     }
 
-    private func renderMask(_ mask: UInt8, alpha: CGFloat) {
+    private func renderMask(_ mask: UInt8, alpha: CGFloat, highlightChanged: Bool = false) {
+        let diff: UInt8 = highlightChanged ? (currentMask ^ mask) : 0
         prevMask = currentMask
         currentMask = mask
-        item?.button?.image = trigramImage(mask, alpha: alpha)
+        item?.button?.image = trigramImage(mask, alpha: alpha, hotBit: diff)
     }
 
     private func nextWalkMask() -> UInt8 {
@@ -205,18 +218,23 @@ private let trigramPaths: [[UInt8]] = [
     private func setMark(_ state: MarkState) {
         let changed = state != markState
         markState = state
-        stop?.isEnabled = state != .idle
+        toggleItem?.title = switch state {
+        case .connected: zh ? "断开连接" : "Disconnect"
+        case .connecting: zh ? "取消连接" : "Cancel connecting"
+        case .idle: zh ? "连接" : "Connect"
+        }
+        toggleItem?.isEnabled = true
         if state == .connecting {
             if animTimer == nil {
                 queue = trigramPaths.randomElement() ?? [0b001, 0b101]
                 pollTicks = 0
                 let first = queue.isEmpty ? nextWalkMask() : queue.removeFirst()
-                renderMask(first, alpha: 0.88)
-                let timer = Timer(timeInterval: 0.34, repeats: true) { [weak self] _ in
+                renderMask(first, alpha: 0.9, highlightChanged: true)
+                let timer = Timer(timeInterval: 0.30, repeats: true) { [weak self] _ in
                     Task { @MainActor in
                         guard let self, self.markState == .connecting else { return }
                         let next = self.queue.isEmpty ? self.nextWalkMask() : self.queue.removeFirst()
-                        self.renderMask(next, alpha: 0.88)
+                        self.renderMask(next, alpha: 0.9, highlightChanged: true)
                         self.pollTicks += 1
                         if !self.usesExtension && self.pollTicks % 3 == 0 {
                             self.syncStatus()
@@ -266,6 +284,8 @@ private let trigramPaths: [[UInt8]] = [
     @objc func applicationDidFinishLaunching(_ notification: Notification) {
         DistributedNotificationCenter.default().addObserver(self, selector: #selector(preferenceChanged),
             name: MenuBarPreference.changed, object: bundle.path, suspensionBehavior: .deliverImmediately)
+        DistributedNotificationCenter.default().addObserver(self, selector: #selector(statusNotified),
+            name: MenuBarPreference.statusChanged, object: bundle.path, suspensionBehavior: .deliverImmediately)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(workspaceChanged),
             name: NSWorkspace.didLaunchApplicationNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(workspaceChanged),
@@ -279,11 +299,10 @@ private let trigramPaths: [[UInt8]] = [
         let menu = NSMenu()
         menu.delegate = self
         menu.autoenablesItems = false
-        let zh = Locale.preferredLanguages.first?.hasPrefix("zh") == true
         menu.addItem(withTitle: zh ? "打开飞弦" : "Open Fesen", action: #selector(openApp), keyEquivalent: "").target = self
-        stop = menu.addItem(withTitle: zh ? "断开连接" : "Disconnect", action: #selector(disconnect), keyEquivalent: "")
-        stop?.target = self
-        stop?.isEnabled = false
+        toggleItem = menu.addItem(withTitle: zh ? "连接" : "Connect", action: #selector(toggleConnection), keyEquivalent: "")
+        toggleItem?.target = self
+        toggleItem?.isEnabled = true
         menu.addItem(.separator())
         menu.addItem(withTitle: zh ? "退出菜单栏" : "Quit menu bar", action: #selector(quitMenu), keyEquivalent: "").target = self
         status.menu = menu
@@ -314,7 +333,89 @@ private let trigramPaths: [[UInt8]] = [
         syncStatus()
     }
 
-    @objc private func disconnect() {
+    @objc private func toggleConnection() {
+        if markState == .idle {
+            connect()
+        } else {
+            disconnect()
+        }
+    }
+
+    private func launchBackgroundPublisher(completion: @escaping @Sendable (Bool) -> Void) {
+        let config = NSWorkspace.OpenConfiguration()
+        config.createsNewApplicationInstance = true
+        config.activates = false
+        config.addsToRecentItems = false
+        config.arguments = ["--publisher"]
+        NSWorkspace.shared.openApplication(at: bundle, configuration: config) { app, error in
+            completion(app != nil && error == nil)
+        }
+    }
+
+    private func connect() {
+        setMark(.connecting)
+        if usesExtension {
+            Task { @MainActor in
+                if tunnel == nil { await refreshTunnel() }
+                guard let manager = tunnel else {
+                    setMark(.idle)
+                    openApp()
+                    return
+                }
+                do {
+                    try manager.connection.startVPNTunnel()
+                } catch {
+                    setMark(.idle)
+                    openApp()
+                }
+            }
+            return
+        }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            if let result = LocalCoreIPC.sendStart() {
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.setMark(result.state)
+                    if !result.signedIn { self.openApp() }
+                }
+                return
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.launchBackgroundPublisher { [weak self] ok in
+                    guard ok else {
+                        DispatchQueue.main.async {
+                            self?.setMark(.idle)
+                            self?.openApp()
+                        }
+                        return
+                    }
+                    DispatchQueue.global(qos: .utility).async {
+                        var result: (state: MarkState, signedIn: Bool)?
+                        for _ in 0..<25 {
+                            if let r = LocalCoreIPC.sendStart() {
+                                result = r
+                                break
+                            }
+                            Thread.sleep(forTimeInterval: 0.1)
+                        }
+                        DispatchQueue.main.async {
+                            guard let self else { return }
+                            if let result {
+                                self.setMark(result.state)
+                                if !result.signedIn { self.openApp() }
+                            } else {
+                                self.setMark(.idle)
+                                self.openApp()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func disconnect() {
         if usesExtension {
             tunnel?.connection.stopVPNTunnel()
         } else {
@@ -338,5 +439,17 @@ private let trigramPaths: [[UInt8]] = [
 
     @objc private func preferenceChanged(_ notification: Notification) {
         if !MenuBarPreference.local.refresh() { quitMenu() }
+    }
+
+    @objc private func statusNotified(_ notification: Notification) {
+        if let raw = notification.userInfo?["state"] as? Int {
+            switch raw {
+            case 2: setMark(.connected)
+            case 1: setMark(.connecting)
+            default: setMark(.idle)
+            }
+        } else {
+            syncStatus()
+        }
     }
 }

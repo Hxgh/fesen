@@ -225,6 +225,10 @@ pub enum Event {
         udp_port: u16,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stun: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        is_admin: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        admin_token: Option<String>,
     },
     Result {
         seq: u64,

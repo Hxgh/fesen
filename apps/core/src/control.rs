@@ -42,6 +42,8 @@ pub struct Link {
 pub struct Session {
     pub member: String,
     pub token: Option<String>,
+    pub is_admin: bool,
+    pub admin_token: Option<String>,
     pub link: Arc<Link>,
     worker: Worker,
 }
@@ -187,7 +189,7 @@ impl Session {
         let Some(Ok(Message::Text(text))) = event else {
             return Err(Code::NotConnected);
         };
-        let (id, member, token, probe, udp_port, stun) =
+        let (id, member, token, probe, udp_port, stun, is_admin, admin_token) =
             match serde_json::from_str(&text).map_err(|_| Code::Invalid)? {
                 Event::Welcome {
                     device,
@@ -196,7 +198,18 @@ impl Session {
                     probe,
                     udp_port,
                     stun,
-                } => (device, member, token, probe, udp_port, stun),
+                    is_admin,
+                    admin_token,
+                } => (
+                    device,
+                    member,
+                    token,
+                    probe,
+                    udp_port,
+                    stun,
+                    is_admin,
+                    admin_token,
+                ),
                 Event::Rejected { error } => return Err(error),
                 _ => return Err(Code::NotConnected),
             };
@@ -223,6 +236,8 @@ impl Session {
         Ok(Self {
             member,
             token,
+            is_admin,
+            admin_token,
             link,
             worker: Worker {
                 ws,

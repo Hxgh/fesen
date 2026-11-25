@@ -11,6 +11,7 @@ unsafe extern "C" {
     fn ph_host_open_settings() -> i32;
     fn ph_host_menu_bar_setting(value: i32) -> i32;
     fn ph_host_can_route() -> i32;
+    fn ph_host_notify_status(state: i32);
     fn ph_host_tray();
     fn ph_host_launch_publisher(context: usize, done: unsafe extern "C" fn(usize, i32));
     fn ph_host_publisher_main();
@@ -57,10 +58,33 @@ unsafe extern "C" fn done(context: usize, bytes: *const u8, len: usize) {
     let _ = reply.send(result);
 }
 
+fn notify_menu_status(reply: &Result<Value, String>) {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    static LAST: AtomicI32 = AtomicI32::new(-1);
+    let next = match reply {
+        Ok(val) => {
+            let data = &val["data"];
+            if data["online"].as_bool() == Some(true) {
+                2
+            } else if data["running"].as_bool() == Some(true) {
+                1
+            } else {
+                0
+            }
+        }
+        Err(_) => 0,
+    };
+    if LAST.swap(next, Ordering::AcqRel) != next {
+        unsafe { ph_host_notify_status(next) };
+    }
+}
+
 pub async fn request(value: Value, launch: bool) -> Result<Value, String> {
     if !can_route() {
         let start = launch || value["op"] == "attach";
-        return publisher(&value, start).await;
+        let res = publisher(&value, start).await;
+        notify_menu_status(&res);
+        return res;
     }
     let (tx, rx) = oneshot::channel();
     let mode = match (launch, value["op"] == "attach") {
@@ -74,7 +98,9 @@ pub async fn request(value: Value, launch: bool) -> Result<Value, String> {
     unsafe {
         ph_host_call(bytes.as_ptr(), bytes.len(), mode, context, done);
     }
-    rx.await.map_err(|_| String::from("not_connected"))?
+    let res = rx.await.map_err(|_| String::from("not_connected"))?;
+    notify_menu_status(&res);
+    res
 }
 
 fn can_route() -> bool {

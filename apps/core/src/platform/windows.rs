@@ -1,5 +1,5 @@
 use super::{Network, Platform, Tun, Underlay};
-use crate::Core;
+use crate::{Command as CoreCommand, Core};
 use fesen_acl::{Cidr, VIRTUAL};
 use socket2::Socket;
 use std::{
@@ -18,7 +18,7 @@ use std::{
     sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
-use tokio::sync::mpsc;
+use tokio::{runtime::Handle, sync::mpsc};
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
     Globalization::GetUserDefaultUILanguage,
@@ -592,6 +592,7 @@ fn core_visual_state(core: &Core) -> u8 {
 
 struct TrayState {
     core: Arc<Core>,
+    runtime: Handle,
     gui: PathBuf,
     visual: Cell<u8>,
     icon: Cell<HICON>,
@@ -646,13 +647,36 @@ unsafe extern "system" fn tray_window(window: HWND, message: u32, w: WPARAM, l: 
                     WM_RBUTTONUP => {
                         let menu = CreatePopupMenu();
                         let chinese = GetUserDefaultUILanguage() & 0x03ff == 0x04;
-                        let (show, stop) = if chinese {
-                            ("打开飞弦", "停止接入")
+                        let status = state.core.status();
+                        let (show, toggle, quit) = if chinese {
+                            (
+                                "打开飞弦",
+                                if status.online {
+                                    "断开连接"
+                                } else if status.running {
+                                    "取消连接"
+                                } else {
+                                    "连接"
+                                },
+                                "退出",
+                            )
                         } else {
-                            ("Open Fesen", "Disconnect")
+                            (
+                                "Open Fesen",
+                                if status.online {
+                                    "Disconnect"
+                                } else if status.running {
+                                    "Cancel connecting"
+                                } else {
+                                    "Connect"
+                                },
+                                "Quit",
+                            )
                         };
                         AppendMenuW(menu, MF_STRING, 1, wide(show).as_ptr());
-                        AppendMenuW(menu, MF_STRING, 2, wide(stop).as_ptr());
+                        AppendMenuW(menu, MF_STRING, 2, wide(toggle).as_ptr());
+                        AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+                        AppendMenuW(menu, MF_STRING, 3, wide(quit).as_ptr());
                         let mut at = POINT::default();
                         GetCursorPos(&mut at);
                         SetForegroundWindow(window);
@@ -666,7 +690,21 @@ unsafe extern "system" fn tray_window(window: HWND, message: u32, w: WPARAM, l: 
                             std::ptr::null(),
                         ) {
                             1 => open(),
-                            2 => state.core.stop(),
+                            2 => {
+                                let core = state.core.clone();
+                                if status.online || status.running {
+                                    state.runtime.spawn(async move {
+                                        let _ = core.execute(CoreCommand::Stop).await;
+                                    });
+                                } else if status.member.is_some() {
+                                    state.runtime.spawn(async move {
+                                        let _ = core.execute(CoreCommand::Start).await;
+                                    });
+                                } else {
+                                    open();
+                                }
+                            }
+                            3 => state.core.stop(),
                             _ => {}
                         }
                         DestroyMenu(menu);
@@ -683,9 +721,11 @@ pub async fn tray(core: Arc<Core>, gui: PathBuf) {
     let (ready, rx) = tokio::sync::oneshot::channel::<(u32, usize)>();
     let initial = core_visual_state(&core);
     let tray_core = core.clone();
+    let runtime = Handle::current();
     let thread = std::thread::spawn(move || unsafe {
         let state = TrayState {
             core: tray_core,
+            runtime,
             gui,
             visual: Cell::new(initial),
             icon: Cell::new(std::ptr::null_mut()),

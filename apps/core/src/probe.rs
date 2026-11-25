@@ -19,6 +19,12 @@ use tokio::{
 pub const DEFAULT_HOST_PORTS: [u16; 5] = [22, 3389, 445, 80, 443];
 pub const MAX_HOST_PROBE_PORTS: usize = 10;
 
+// Well-known non-HTTP binary/database/mail ports: never send synthetic HTTP HEAD noise to them.
+const NON_HTTP_PORTS: [u16; 18] = [
+    21, 25, 53, 110, 143, 465, 587, 993, 995, 1433, 1521, 3306, 5432, 5672, 6379, 9092, 11211,
+    27017,
+];
+
 // Standard X.224 Connection Request (TPKT + COTP CR + RDP Negotiation Request, zero credentials).
 const RDP_X224_REQ: [u8; 19] = [
     0x03, 0x00, 0x00, 0x13, 0x0e, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0x00, 0x03,
@@ -111,7 +117,7 @@ async fn check_http(
             while let Some(frame) = body.frame().await {
                 if let Ok(data) = frame.map_err(|_| Code::HttpInvalid)?.into_data() {
                     bytes += data.len();
-                    if bytes >= 64 * 1024 {
+                    if bytes >= 8 * 1024 {
                         break;
                     }
                 }
@@ -279,14 +285,15 @@ async fn probe_targets(
     ip: Ipv4Addr,
     targets: Vec<(u16, bool)>,
 ) -> Result<HostProbe, Code> {
-
     let started = Instant::now();
+    // Each port enforces its own bounded budget (<=2200ms) so one slow custom port never discards
+    // healthy results from sibling ports; outer timeout is a pure safety guard.
     let raw = timeout(
-        Duration::from_millis(2600),
+        Duration::from_millis(3200),
         join_all(
             targets
                 .into_iter()
-                .map(|(port, extra)| probe_host_port(platform, ip, port, extra)),
+                .map(|(port, extra)| probe_host_port_bounded(platform, ip, port, extra)),
         ),
     )
     .await
@@ -343,7 +350,7 @@ async fn probe_targets(
     })
 }
 
-async fn probe_host_port(
+async fn probe_host_port_bounded(
     platform: &dyn Platform,
     ip: Ipv4Addr,
     port: u16,
@@ -376,70 +383,81 @@ async fn probe_host_port(
             None,
         );
     };
+    // Measure pure TCP connect latency before protocol fingerprinting waits.
+    let rtt_ms = started.elapsed().as_millis().clamp(1, u32::MAX as u128) as u32;
 
-    let (kind, http_status, detail, os_hint) = match port {
-        22 => match ssh(&mut stream, Duration::from_millis(1150)).await {
-            Ok(info) => (ServiceKind::Ssh, None, Some(info.banner), info.os),
-            Err(_) => (ServiceKind::Tcp, None, None, None),
-        },
-        3389 => match rdp(&mut stream, Duration::from_millis(800)).await {
-            Ok(info) => (
-                ServiceKind::Rdp,
-                None,
-                Some(if info.nla { "NLA" } else { "RDP" }.into()),
-                Some(HostOs::Windows),
-            ),
-            Err(_) => (ServiceKind::Tcp, None, None, None),
-        },
-        445 => (ServiceKind::Smb, None, None, None),
-        80 => match probe_http_head(&mut stream, target, Duration::from_millis(800)).await {
-            HeadOutcome::Http(code) => (ServiceKind::Http, Some(code), None, None),
-            _ => (ServiceKind::Tcp, None, None, None),
-        },
-        443 => match tls(&mut stream, Duration::from_millis(800)).await {
-            Ok(()) => (ServiceKind::Https, None, None, None),
-            Err(_) => (ServiceKind::Tcp, None, None, None),
-        },
-        _ => {
-            // Custom user-requested port: check passive banner first (catches custom SSH like 2222).
-            let mut banner_buf = [0u8; 160];
-            match timeout(Duration::from_millis(260), stream.read(&mut banner_buf)).await {
-                Ok(Ok(n @ 1..)) => {
-                    if let Some(info) = parse_ssh_banner(&banner_buf[..n]) {
-                        (ServiceKind::Ssh, None, Some(info.banner), info.os)
-                    } else {
-                        (ServiceKind::Tcp, None, None, None)
-                    }
-                }
-                Ok(Ok(0)) | Ok(Err(_)) => (ServiceKind::Tcp, None, None, None),
-                Err(_) => {
-                    match probe_http_head(&mut stream, target, Duration::from_millis(700)).await {
-                        HeadOutcome::Http(code) => (ServiceKind::Http, Some(code), None, None),
-                        HeadOutcome::ClosedOrAlert => {
-                            drop(stream);
-                            if let Ok(mut tls_stream) = platform::tcp_timeout(
-                                platform,
-                                target,
-                                Duration::from_millis(600),
-                            )
-                            .await
-                                && tls(&mut tls_stream, Duration::from_millis(700))
-                                    .await
-                                    .is_ok()
-                            {
-                                (ServiceKind::Https, None, None, None)
-                            } else {
-                                (ServiceKind::Tcp, None, None, None)
-                            }
+    let fingerprint = async {
+        match port {
+            22 => match ssh(&mut stream, Duration::from_millis(1150)).await {
+                Ok(info) => (ServiceKind::Ssh, None, Some(info.banner), info.os),
+                Err(_) => (ServiceKind::Tcp, None, None, None),
+            },
+            3389 => match rdp(&mut stream, Duration::from_millis(800)).await {
+                Ok(info) => (
+                    ServiceKind::Rdp,
+                    None,
+                    Some(if info.nla { "NLA" } else { "RDP" }.into()),
+                    Some(HostOs::Windows),
+                ),
+                Err(_) => (ServiceKind::Tcp, None, None, None),
+            },
+            445 => (ServiceKind::Smb, None, None, None),
+            80 => match probe_http_head(&mut stream, target, Duration::from_millis(800)).await {
+                HeadOutcome::Http(code) => (ServiceKind::Http, Some(code), None, None),
+                _ => (ServiceKind::Tcp, None, None, None),
+            },
+            443 => match tls(&mut stream, Duration::from_millis(800)).await {
+                Ok(()) => (ServiceKind::Https, None, None, None),
+                Err(_) => (ServiceKind::Tcp, None, None, None),
+            },
+            _ => {
+                // Custom user-requested port: check passive banner first (catches custom SSH like 2222).
+                let mut banner_buf = [0u8; 160];
+                match timeout(Duration::from_millis(240), stream.read(&mut banner_buf)).await {
+                    Ok(Ok(n @ 1..)) => {
+                        if let Some(info) = parse_ssh_banner(&banner_buf[..n]) {
+                            (ServiceKind::Ssh, None, Some(info.banner), info.os)
+                        } else {
+                            (ServiceKind::Tcp, None, None, None)
                         }
-                        HeadOutcome::Other => (ServiceKind::Tcp, None, None, None),
+                    }
+                    Ok(Ok(0)) | Ok(Err(_)) => (ServiceKind::Tcp, None, None, None),
+                    Err(_) => {
+                        if NON_HTTP_PORTS.contains(&port) {
+                            return (ServiceKind::Tcp, None, None, None);
+                        }
+                        match probe_http_head(&mut stream, target, Duration::from_millis(650)).await {
+                            HeadOutcome::Http(code) => (ServiceKind::Http, Some(code), None, None),
+                            HeadOutcome::ClosedOrAlert => {
+                                drop(stream);
+                                if let Ok(mut tls_stream) = platform::tcp_timeout(
+                                    platform,
+                                    target,
+                                    Duration::from_millis(500),
+                                )
+                                .await
+                                    && tls(&mut tls_stream, Duration::from_millis(650))
+                                        .await
+                                        .is_ok()
+                                {
+                                    (ServiceKind::Https, None, None, None)
+                                } else {
+                                    (ServiceKind::Tcp, None, None, None)
+                                }
+                            }
+                            HeadOutcome::Other => (ServiceKind::Tcp, None, None, None),
+                        }
                     }
                 }
             }
         }
     };
 
-    let rtt_ms = started.elapsed().as_millis().clamp(1, u32::MAX as u128) as u32;
+    // If protocol identification exceeds remaining budget, still preserve the open TCP port.
+    let (kind, http_status, detail, os_hint) = timeout(Duration::from_millis(1200), fingerprint)
+        .await
+        .unwrap_or((ServiceKind::Tcp, None, None, None));
+
     (
         HostPortProbe {
             port,
@@ -773,15 +791,29 @@ mod tests {
         });
 
         let p = LoopbackPlatform;
-        let (ssh_res, ssh_os) = probe_host_port(&p, Ipv4Addr::LOCALHOST, ssh_port, true).await;
+        let (ssh_res, ssh_os) = probe_host_port_bounded(&p, Ipv4Addr::LOCALHOST, ssh_port, true).await;
         assert!(ssh_res.open && ssh_res.kind == ServiceKind::Ssh);
         assert_eq!(ssh_os, Some(HostOs::Linux));
 
-        let (http_res, _) = probe_host_port(&p, Ipv4Addr::LOCALHOST, http_port, true).await;
+        let (http_res, _) = probe_host_port_bounded(&p, Ipv4Addr::LOCALHOST, http_port, true).await;
         assert!(http_res.open && http_res.kind == ServiceKind::Http);
         assert_eq!(http_res.http_status, Some(200));
+        // Pure TCP connect latency must not include the 240ms passive SSH banner wait.
+        assert!(http_res.rtt_ms.unwrap() < 150, "rtt={:?}", http_res.rtt_ms);
 
-        let (tls_res, _) = probe_host_port(&p, Ipv4Addr::LOCALHOST, tls_port, true).await;
+        let (tls_res, _) = probe_host_port_bounded(&p, Ipv4Addr::LOCALHOST, tls_port, true).await;
         assert!(tls_res.open && tls_res.kind == ServiceKind::Https);
+
+        // Slow/silent peer on an extra port must stay bounded and fall back to open TCP without aborting.
+        let silent_ln = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let silent_port = silent_ln.local_addr().unwrap().port();
+        let _keep = tokio::spawn(async move {
+            if let Ok((_s, _)) = silent_ln.accept().await {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+        let (silent_res, _) =
+            probe_host_port_bounded(&p, Ipv4Addr::LOCALHOST, silent_port, true).await;
+        assert!(silent_res.open && silent_res.kind == ServiceKind::Tcp);
     }
 }
