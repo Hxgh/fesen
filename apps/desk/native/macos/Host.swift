@@ -189,8 +189,15 @@ final class AppleHost {
         let bundle = Bundle.main.bundleURL
         DistributedNotificationCenter.default().postNotificationName(MenuBarPreference.changed,
             object: bundle.standardizedFileURL.path, userInfo: nil, deliverImmediately: true)
-        for app in NSWorkspace.shared.runningApplications where MenuBarPreference.isMenu(app.executableURL, in: bundle) {
+        let running = NSWorkspace.shared.runningApplications.filter { MenuBarPreference.isMenu($0.executableURL, in: bundle) }
+        for app in running {
             _ = app.terminate()
+        }
+        if !running.isEmpty {
+            let deadline = Date().addingTimeInterval(0.45)
+            while Date() < deadline && running.contains(where: { !$0.isTerminated }) {
+                usleep(20_000)
+            }
         }
     }
 }
@@ -368,6 +375,7 @@ func hostOpenSettings() -> Int32 {
     if value != -1 {
         guard (value == 0 || value == 1), preference.set(value == 1) else { return -1 }
         if value == 0 { AppleHost.shared.closeTray() }
+        else { AppleHost.shared.openTray() }
     }
     return preference.enabled ? 1 : 0
 }

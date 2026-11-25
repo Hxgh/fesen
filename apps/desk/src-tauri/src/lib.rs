@@ -160,6 +160,10 @@ pub fn run() {
     ]);
     #[cfg(target_os = "macos")]
     let app = app.setup(|app| {
+        macos::close_tray();
+        if macos::menu_bar_setting(None).unwrap_or(true) {
+            macos::tray();
+        }
         if let Some(window) = app.get_webview_window("main") {
             macos::configure_window(&window);
         }

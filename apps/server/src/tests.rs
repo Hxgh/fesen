@@ -630,6 +630,47 @@ async fn admin_entry_loads_page_and_assets() {
         alt_host.headers()[header::LOCATION],
         format!("{base}admin/")
     );
+
+    // HTTP/2 can send multiple Cookie header fields (other site cookies first, fesen_admin later).
+    let admin_hash = store::password_hash(PASSWORD).unwrap();
+    let app2 = App::new(
+        {
+            let db = store::db(&dir.path().join("db2")).unwrap();
+            store::create(&db, "admin", &admin_hash, true).unwrap();
+            db
+        },
+        origin(&base).unwrap(),
+        0,
+        None,
+    )
+    .unwrap();
+    let http2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base2 = format!("http://{}/", http2.local_addr().unwrap());
+    let web2 = tokio::spawn(async move { axum::serve(http2, router(app2)).await.unwrap() });
+    let login = client
+        .post(format!("{base2}admin/login"))
+        .header("X-Fesen-Admin", "1")
+        .json(&json!({"username": "admin", "password": PASSWORD}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::NO_CONTENT);
+    let set_cookie = login.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let multi = client
+        .get(format!("{base2}admin/session"))
+        .header(header::COOKIE, "other_app_cookie=abc; fesen_admin=0000000000000000000000000000000000000000000000000000000000000000")
+        .header(header::COOKIE, &set_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(multi.status(), StatusCode::OK);
+    web2.abort();
     for path in [
         "admin/style.css",
         "admin/app.js",
@@ -1625,5 +1666,136 @@ async fn same_account_supports_multiple_concurrent_devices() {
         core.stop();
         core.wait_stopped().await;
     }
+    web.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn startup_preferences_auto_restore_only_on_same_network() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = store::db(&dir.path().join("db")).unwrap();
+    let hash = store::password_hash(PASSWORD).unwrap();
+    store::create(&db, "alice", &hash, false).unwrap();
+
+    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = http.local_addr().unwrap();
+    let base = origin(&format!("http://{server}")).unwrap();
+    let app = App::new(db, base.clone(), 0, None).unwrap();
+    let web = tokio::spawn(axum::serve(http, router(app)).into_future());
+
+    let net = Adapter::new("home-lan", Ipv4Addr::new(192, 0, 2, 10), None);
+    let core1 = Core::new(dir.path().join("alice"), net.clone(), false).unwrap();
+    assert!(core1.status().auto_connect && core1.status().auto_share);
+    core1
+        .execute(Command::Join {
+            address: base.to_string(),
+        })
+        .await
+        .unwrap();
+    core1
+        .execute(Command::Login {
+            username: "alice".into(),
+            password: PASSWORD.into(),
+            label: "AliceMac".into(),
+        })
+        .await
+        .unwrap();
+    eventually(|| core1.status().online).await;
+
+    let s1 = core1
+        .execute(Command::Save {
+            id: None,
+            name: "Web".into(),
+            ips: "192.0.2.35".into(),
+            ports: "80".into(),
+            http: true,
+            kind: Some(fesen_proto::ServiceKind::Http),
+            host_os: None,
+        })
+        .await
+        .unwrap();
+    let keep_on = s1.shares[0].id.clone();
+    let s2 = core1
+        .execute(Command::Save {
+            id: None,
+            name: "SSH".into(),
+            ips: "192.0.2.35".into(),
+            ports: "22".into(),
+            http: false,
+            kind: Some(fesen_proto::ServiceKind::Ssh),
+            host_os: None,
+        })
+        .await
+        .unwrap();
+    let keep_off = s2
+        .shares
+        .iter()
+        .find(|s| s.id != keep_on)
+        .unwrap()
+        .id
+        .clone();
+
+    core1
+        .execute(Command::Share {
+            id: keep_on.clone(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    core1
+        .execute(Command::Share {
+            id: keep_off.clone(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    core1
+        .execute(Command::Share {
+            id: keep_off.clone(),
+            enabled: false,
+        })
+        .await
+        .unwrap();
+
+    core1.execute(Command::Quit).await.unwrap();
+    core1.wait_stopped().await;
+
+    // Restarting on the SAME network automatically restores only `keep_on`!
+    let core2 = Core::new(dir.path().join("alice"), net.clone(), false).unwrap();
+    core2.execute(Command::Start).await.unwrap();
+    eventually(|| core2.status().active.contains(&keep_on)).await;
+    assert!(!core2.status().active.contains(&keep_off));
+    assert!(!core2.status().auto_share_blocked);
+    core2.execute(Command::Quit).await.unwrap();
+    core2.wait_stopped().await;
+
+    // Restarting on a DIFFERENT network refuses to auto-publish shares and flags auto_share_blocked.
+    net.network.lock().unwrap().marker = "coffee-wifi".into();
+    let core3 = Core::new(dir.path().join("alice"), net.clone(), false).unwrap();
+    core3.execute(Command::Start).await.unwrap();
+    eventually(|| core3.status().online && core3.status().auto_share_blocked).await;
+    assert!(core3.status().active.is_empty());
+
+    // Disabling preferences persists across restarts.
+    let updated = core3
+        .execute(Command::SetPreferences {
+            auto_connect: Some(false),
+            auto_share: Some(false),
+        })
+        .await
+        .unwrap();
+    assert!(!updated.auto_connect && !updated.auto_share && !updated.auto_share_blocked);
+    core3.execute(Command::Quit).await.unwrap();
+    core3.wait_stopped().await;
+
+    net.network.lock().unwrap().marker = "home-lan".into();
+    let core4 = Core::new(dir.path().join("alice"), net, false).unwrap();
+    assert!(!core4.status().auto_connect && !core4.status().auto_share);
+    core4.execute(Command::Start).await.unwrap();
+    eventually(|| core4.status().online).await;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(core4.status().active.is_empty());
+
+    core4.stop();
+    core4.wait_stopped().await;
     web.abort();
 }

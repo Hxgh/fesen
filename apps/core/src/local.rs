@@ -11,25 +11,52 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Default, Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct AccountConfig {
     pub shares: Vec<Publication>,
     pub labels: Vec<Label>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_shares: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub share_network: String,
 }
 
-#[derive(Default, Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct Local {
     pub server: String,
     pub identities: BTreeMap<String, Identity>,
     pub session: Option<Login>,
+    #[serde(default = "default_true")]
+    pub auto_connect: bool,
+    #[serde(default = "default_true")]
+    pub auto_share: bool,
     pub accounts: BTreeMap<String, AccountConfig>,
     // Legacy flat fields retained solely for automatic one-time migration from older device.json.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shares: Vec<Publication>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<Label>,
+}
+
+impl Default for Local {
+    fn default() -> Self {
+        Self {
+            server: String::new(),
+            identities: BTreeMap::new(),
+            session: None,
+            auto_connect: true,
+            auto_share: true,
+            accounts: BTreeMap::new(),
+            shares: Vec::new(),
+            labels: Vec::new(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -212,6 +239,43 @@ impl Local {
         self.accounts.clear();
         self.shares.clear();
         self.labels.clear();
+    }
+
+    pub fn active_shares(&self) -> (&[String], &str) {
+        self.active_member()
+            .and_then(|m| self.accounts.get(m))
+            .map_or((&[], ""), |a| {
+                (a.active_shares.as_slice(), a.share_network.as_str())
+            })
+    }
+
+    pub fn record_share_active(&mut self, id: &str, enabled: bool, marker: &str) {
+        let Some(member) = self.active_member().map(str::to_owned) else {
+            return;
+        };
+        let entry = self.accounts.entry(member).or_default();
+        if enabled {
+            if !entry.active_shares.iter().any(|s| s == id) && entry.active_shares.len() < 32 {
+                entry.active_shares.push(id.to_owned());
+            }
+            if !marker.is_empty() {
+                entry.share_network = marker.to_owned();
+            }
+        } else {
+            entry.active_shares.retain(|s| s != id);
+            if entry.active_shares.is_empty() {
+                entry.share_network.clear();
+            }
+        }
+    }
+
+    pub fn clear_active_shares(&mut self) {
+        if let Some(member) = self.active_member().map(str::to_owned)
+            && let Some(entry) = self.accounts.get_mut(&member)
+        {
+            entry.active_shares.clear();
+            entry.share_network.clear();
+        }
     }
 
     pub fn save(&self, dir: &Path) -> Result<(), Code> {

@@ -127,21 +127,20 @@ fn check(headers: &HeaderMap, app: &App) -> Result<(), Code> {
     Ok(())
 }
 
-fn get_token(headers: &HeaderMap) -> Result<&str, Code> {
+fn get_tokens(headers: &HeaderMap) -> impl Iterator<Item = &str> {
     headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|cookies| {
-            cookies
-                .split(';')
-                .find_map(|c| c.trim().strip_prefix("fesen_admin="))
-        })
-        .filter(|t| t.len() == 64)
-        .ok_or(Code::Unauthorized)
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|cookies| cookies.split(';'))
+        .filter_map(|c| c.trim().strip_prefix("fesen_admin="))
+        .filter(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 fn gate(group: &Group, headers: &HeaderMap) -> Result<String, Code> {
-    store::admin(&group.db, get_token(headers)?).ok_or(Code::Unauthorized)
+    get_tokens(headers)
+        .find_map(|tok| store::admin(&group.db, tok))
+        .ok_or(Code::Unauthorized)
 }
 
 fn cookie(app: &App, token: &str, max_age: u32) -> HeaderValue {
@@ -271,11 +270,13 @@ async fn action(
         Action::Logout => {
             let g = app.inner.lock().unwrap();
             gate(&g, &headers)?;
-            g.db.execute(
-                "DELETE FROM admin_sessions WHERE token=?1",
-                [store::hash_secret(get_token(&headers)?)],
-            )
-            .map_err(|_| Code::Internal)?;
+            for tok in get_tokens(&headers) {
+                g.db.execute(
+                    "DELETE FROM admin_sessions WHERE token=?1",
+                    [store::hash_secret(tok)],
+                )
+                .map_err(|_| Code::Internal)?;
+            }
             return Ok((
                 [(header::SET_COOKIE, cookie(&app, "", 0))],
                 StatusCode::NO_CONTENT,

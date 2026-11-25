@@ -118,6 +118,16 @@ pub enum Command {
     AdminAction {
         action: serde_json::Value,
     },
+    SetPreferences {
+        #[serde(default)]
+        auto_connect: Option<bool>,
+        #[serde(default)]
+        auto_share: Option<bool>,
+    },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -143,6 +153,12 @@ pub struct Status {
     pub virtual_ips: Vec<Mapping>,
     pub aliases: HashMap<String, Ipv4Addr>,
     pub error: Option<Code>,
+    #[serde(default = "default_true")]
+    pub auto_connect: bool,
+    #[serde(default = "default_true")]
+    pub auto_share: bool,
+    #[serde(default)]
+    pub auto_share_blocked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -166,6 +182,8 @@ struct State {
     latest: HashSet<String>,
     sharing: HashMap<String, Sharing>,
     wanted: bool,
+    restore_pending: bool,
+    auto_share_blocked: bool,
     ui_until: Option<Instant>,
     error: Option<Code>,
     is_admin: bool,
@@ -211,6 +229,8 @@ impl Core {
                 latest: HashSet::new(),
                 sharing: HashMap::new(),
                 wanted: false,
+                restore_pending: false,
+                auto_share_blocked: false,
                 ui_until: Some(Instant::now() + Duration::from_secs(20)),
                 error: None,
                 is_admin: false,
@@ -278,6 +298,9 @@ impl Core {
             virtual_ips: routes.mappings.clone(),
             aliases: routes.aliases.clone(),
             error: state.error,
+            auto_connect: state.local.auto_connect,
+            auto_share: state.local.auto_share,
+            auto_share_blocked: state.auto_share_blocked,
             http_status: None,
             probe: None,
             host_probe: None,
@@ -421,6 +444,24 @@ impl Core {
                     }
                 }
             }
+            Command::SetPreferences {
+                auto_connect,
+                auto_share,
+            } => {
+                self.edit(|local| {
+                    if let Some(v) = auto_connect {
+                        local.auto_connect = v;
+                    }
+                    if let Some(v) = auto_share {
+                        local.auto_share = v;
+                    }
+                    Ok(())
+                })?;
+                if auto_share == Some(false) {
+                    self.state.lock().unwrap().auto_share_blocked = false;
+                }
+                return Ok(self.status());
+            }
             _ => {}
         }
         let _lock = self.operations.lock().await;
@@ -445,7 +486,8 @@ impl Core {
             | Command::TestLocalSite { .. }
             | Command::ProbeHost { .. }
             | Command::AdminSession
-            | Command::AdminAction { .. } => unreachable!(),
+            | Command::AdminAction { .. }
+            | Command::SetPreferences { .. } => unreachable!(),
             Command::Join { address } => {
                 let address = origin(&address)?.to_string();
                 let res = self.edit(|local| {
@@ -487,16 +529,35 @@ impl Core {
                 )
                 .await
             }
-            Command::Start => self.resume().await,
+            Command::Start => {
+                {
+                    let mut state = self.state.lock().unwrap();
+                    state.auto_share_blocked = false;
+                    if state.link.is_none() && state.local.auto_share {
+                        let (active, _) = state.local.active_shares();
+                        state.restore_pending = !active.is_empty();
+                    }
+                }
+                let res = self.resume().await;
+                if res.is_err() {
+                    self.state.lock().unwrap().restore_pending = false;
+                }
+                res
+            }
             Command::Stop => {
                 self.disconnect(false);
-                self.state.lock().unwrap().error = None;
+                let mut state = self.state.lock().unwrap();
+                state.restore_pending = false;
+                state.auto_share_blocked = false;
+                state.error = None;
                 Ok(())
             }
             Command::Logout => {
                 let (live, server, admin_token) = {
                     let mut s = self.state.lock().unwrap();
                     s.is_admin = false;
+                    s.restore_pending = false;
+                    s.auto_share_blocked = false;
                     (
                         s.link.clone(),
                         s.local.server.clone(),
@@ -519,6 +580,7 @@ impl Core {
                 }
                 self.disconnect(false);
                 self.edit(|l| {
+                    l.clear_active_shares();
                     l.session = None;
                     Ok(())
                 })?;
@@ -575,6 +637,7 @@ impl Core {
             Command::Remove { id } => {
                 self.share(id.clone(), false).await?;
                 self.edit(|l| {
+                    l.record_share_active(&id, false, "");
                     let shares = l.shares_mut()?;
                     let removed_ip = shares
                         .iter()
@@ -736,11 +799,15 @@ impl Core {
                 state.link.clone()
             };
             if let Some(link) = link
-                && link.call(Call::Unpublish { id }).await.is_err()
+                && link.call(Call::Unpublish { id: id.clone() }).await.is_err()
             {
                 self.disconnect(true);
                 return Err(Code::NotConnected);
             }
+            let _ = self.edit(|local| {
+                local.record_share_active(&id, false, "");
+                Ok(())
+            });
             return Ok(());
         }
         if self.refresh_network().await {
@@ -787,6 +854,11 @@ impl Core {
             link.direct.close();
             return Err(Code::NetworkChanged);
         }
+        let mut next = state.local.clone();
+        next.record_share_active(&id, true, &net.marker);
+        let _ = next.save(&self.dir);
+        state.local = next;
+        state.auto_share_blocked = false;
         state.sharing.insert(
             id,
             Sharing {
@@ -984,22 +1056,68 @@ impl Core {
         self.changed();
     }
 
-    pub(crate) fn update_view(&self, link: &Arc<Link>, view: View) {
-        let mut state = self.state.lock().unwrap();
-        if !Self::is_link(&state, link) {
-            return;
-        }
-        link.direct.renew(view.peers);
-        let services = view
-            .services
-            .into_iter()
-            .filter(|o| o.owner != link.id)
-            .collect::<Vec<_>>();
-        state.latest = services.iter().map(|o| o.service.id.clone()).collect();
-        if services != state.view {
-            state.view = services;
-            drop(state);
+    pub(crate) fn update_view(self: &Arc<Self>, link: &Arc<Link>, view: View) {
+        let mut restore_ids: Option<Vec<String>> = None;
+        let changed = {
+            let mut state = self.state.lock().unwrap();
+            if !Self::is_link(&state, link) {
+                return;
+            }
+            link.direct.renew(view.peers);
+            let services = view
+                .services
+                .into_iter()
+                .filter(|o| o.owner != link.id)
+                .collect::<Vec<_>>();
+            state.latest = services.iter().map(|o| o.service.id.clone()).collect();
+            let changed = services != state.view;
+            if changed {
+                state.view = services;
+            }
+            if state.restore_pending {
+                state.restore_pending = false;
+                if state.local.auto_share {
+                    let net_known = state.network.known();
+                    let net_marker = state.network.marker.clone();
+                    let (active, share_net) = state.local.active_shares();
+                    if !active.is_empty() {
+                        if net_known && !share_net.is_empty() && net_marker == share_net {
+                            restore_ids = Some(active.to_vec());
+                            state.auto_share_blocked = false;
+                        } else {
+                            state.auto_share_blocked = true;
+                        }
+                    }
+                }
+            }
+            changed
+        };
+        if changed {
             self.changed();
+        }
+        if let Some(ids) = restore_ids {
+            let core = self.clone();
+            let link = link.clone();
+            tokio::spawn(async move {
+                let _lock = core.operations.lock().await;
+                let valid_ids: Vec<String> = {
+                    let state = core.state.lock().unwrap();
+                    if !Self::is_link(&state, &link) || core.quit.is_cancelled() {
+                        return;
+                    }
+                    state
+                        .local
+                        .shares()
+                        .iter()
+                        .filter(|s| ids.contains(&s.id))
+                        .map(|s| s.id.clone())
+                        .collect()
+                };
+                if !valid_ids.is_empty() {
+                    let _ = core.share_many(valid_ids, true).await;
+                    core.changed();
+                }
+            });
         }
     }
 
@@ -1022,6 +1140,9 @@ impl Core {
             }
             state.network = network;
             let was_sharing = !state.sharing.is_empty();
+            if was_sharing {
+                state.restore_pending = false;
+            }
             for (_, s) in state.sharing.drain() {
                 s.cancel.cancel();
             }

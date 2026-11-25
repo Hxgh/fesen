@@ -45,7 +45,7 @@ export const SHARED_COPY = {
   join: ["接入链接", "Join link"],
   copy_link: ["复制链接", "Copy link"],
   copied: ["已复制", "Copied"],
-  open_join: ["打开接入页", "Open join page"],
+  open_join: ["打开飞弦", "Open Fesen"],
   close: ["关闭", "Close"],
   cancel: ["取消", "Cancel"],
   save: ["保存", "Save"],

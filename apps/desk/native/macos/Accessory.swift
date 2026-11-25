@@ -22,10 +22,15 @@ import AppKit
     }
 
     @objc func openApp() {
-        if instance(.regular)?.activate() == true { return }
+        if instance(.regular)?.activate() == true {
+            NSApp.terminate(nil)
+            return
+        }
         let config = NSWorkspace.OpenConfiguration()
         config.createsNewApplicationInstance = true
-        NSWorkspace.shared.openApplication(at: bundle, configuration: config) { _, _ in }
+        NSWorkspace.shared.openApplication(at: bundle, configuration: config) { _, _ in
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -47,6 +52,8 @@ import AppKit
         let config = NSWorkspace.OpenConfiguration()
         config.createsNewApplicationInstance = true
         config.arguments = ["--fesen-join", url.absoluteString]
-        NSWorkspace.shared.open([url], withApplicationAt: bundle, configuration: config) { _, _ in }
+        NSWorkspace.shared.open([url], withApplicationAt: bundle, configuration: config) { _, _ in
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+        }
     }
 }

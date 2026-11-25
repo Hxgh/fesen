@@ -79,6 +79,9 @@ type Status = {
   virtual_ips: Mapping[];
   aliases: Record<string, string>;
   error: string | null;
+  auto_connect?: boolean;
+  auto_share?: boolean;
+  auto_share_blocked?: boolean;
   http_status?: number;
   probe?: ProbeOutcome;
   host_probe?: HostProbe;
@@ -229,6 +232,7 @@ let applied = "";
 let lastViewKey = "";
 let pendingJoin: string | undefined;
 let appVersion = "";
+let lastAutoShareBlocked = false;
 
 type Probe = {
   ip: string;
@@ -817,7 +821,7 @@ function serviceRow(address: string, metaNodes: (HTMLElement | string)[], tags: 
   );
 }
 
-function groupSingleRow(service: Offering, data: Status, routing: boolean) {
+function groupSingleRow(service: Offering, data: Status, routing: boolean, showSource = false) {
   const kind = effectiveKind(service);
   const label = data.labels.find((l) => l.service === service.id);
   const { ips, overlapped, badge, httpTag, note, result } = probeVisual(service, data, routing);
@@ -827,14 +831,16 @@ function groupSingleRow(service: Offering, data: Status, routing: boolean) {
   const os = resolveHostOs([service], [result?.hostOs]) as HostOs | null;
   const displayName = ip ? meaningfulHostName(rawName, ip, os) : rawName;
   const alias = label?.alias && data.aliases[label.alias] ? label.alias : null;
-  const src = sourceText(service, data.member);
 
   const metaParts: (HTMLElement | string)[] = [];
   if (displayName) metaParts.push(el("span", "service-name", displayName));
-  if (metaParts.length) metaParts.push(el("span", "meta-sep", "·"));
-  metaParts.push(el("span", src.self ? "source-tag self" : "source-tag", src.text));
+  if (showSource) {
+    const src = sourceText(service, data.member);
+    if (metaParts.length) metaParts.push(el("span", "meta-sep", "·"));
+    metaParts.push(el("span", src.self ? "source-tag self" : "source-tag", src.text));
+  }
   if (alias) {
-    metaParts.push(el("span", "meta-sep", "·"));
+    if (metaParts.length) metaParts.push(el("span", "meta-sep", "·"));
     metaParts.push(el("span", "mono", alias));
   }
 
@@ -856,7 +862,7 @@ function groupSingleRow(service: Offering, data: Status, routing: boolean) {
   return row;
 }
 
-function groupHostCard(ip: string, items: Offering[], data: Status, routing: boolean) {
+function groupHostCard(ip: string, items: Offering[], data: Status, routing: boolean, showSource = false) {
   const access = accessIp(ip, data.virtual_ips);
   const overlapped = access !== ip;
   const labels = items.map(s => data.labels.find(l => l.service === s.id));
@@ -866,7 +872,6 @@ function groupHostCard(ip: string, items: Offering[], data: Status, routing: boo
   const anyPending = probed.some(p => p && !p.result);
   const hostOs = resolveHostOs(items, probed.map(p => p?.result?.hostOs)) as HostOs | null;
   const cleanName = meaningfulHostName(rawHostName, ip, hostOs);
-  const src = sourceText(items[0]!, data.member);
 
   const testAll = tool("refresh", t("test_host"), () => testHostServices(items));
   testAll.disabled = anyPending || !data.online || busy;
@@ -882,14 +887,17 @@ function groupHostCard(ip: string, items: Offering[], data: Status, routing: boo
 
   const metaParts: (HTMLElement | string)[] = [];
   if (cleanName) metaParts.push(el("span", "service-name", cleanName));
-  if (metaParts.length) metaParts.push(el("span", "meta-sep", "·"));
-  metaParts.push(el("span", src.self ? "source-tag self" : "source-tag", src.text));
+  if (showSource) {
+    const src = sourceText(items[0]!, data.member);
+    if (metaParts.length) metaParts.push(el("span", "meta-sep", "·"));
+    metaParts.push(el("span", src.self ? "source-tag self" : "source-tag", src.text));
+  }
   if (alias) {
-    metaParts.push(el("span", "meta-sep", "·"));
+    if (metaParts.length) metaParts.push(el("span", "meta-sep", "·"));
     metaParts.push(el("span", "mono", alias));
   }
   if (overlapped) {
-    metaParts.push(el("span", "meta-sep", "·"));
+    if (metaParts.length) metaParts.push(el("span", "meta-sep", "·"));
     metaParts.push(el("span", "mono", `${t("original_ip")} ${ip}`));
   }
 
@@ -927,16 +935,66 @@ function groupHostCard(ip: string, items: Offering[], data: Status, routing: boo
   return el("article", "host-card", head, portsWrap);
 }
 
-function groupList(data: Status) {
-  const routing = data.system_routing !== false;
-  const entries = groupByHost(data.services, (s: Offering) => `${s.owner}:${singleIp(s)}`);
+function groupDeviceCards(items: Offering[], data: Status, routing: boolean) {
+  const entries = groupByHost(items, (s: Offering) => `${s.owner}:${singleIp(s)}`);
   return el("div", "service-list", ...entries.map((entry) => {
     if (!entry.grouped || entry.items.length === 1) {
       const item = (entry.grouped ? entry.items[0] : entry.item) as Offering;
-      return groupSingleRow(item, data, routing);
+      return groupSingleRow(item, data, routing, false);
     }
-    return groupHostCard(entry.ip, entry.items as Offering[], data, routing);
+    return groupHostCard(entry.ip, entry.items as Offering[], data, routing, false);
   }));
+}
+
+type DeviceBucket = {
+  owner: string;
+  src: { text: string; self: boolean };
+  items: Offering[];
+};
+
+function groupRemoteBuckets(data: Status): DeviceBucket[] {
+  const map = new Map<string, Offering[]>();
+  for (const s of data.services) {
+    const arr = map.get(s.owner);
+    if (arr) arr.push(s);
+    else map.set(s.owner, [s]);
+  }
+  const buckets: DeviceBucket[] = [];
+  for (const [owner, items] of map) {
+    buckets.push({
+      owner,
+      src: sourceText(items[0]!, data.member),
+      items,
+    });
+  }
+  buckets.sort((a, b) => {
+    if (a.src.self !== b.src.self) return a.src.self ? -1 : 1;
+    return a.src.text.localeCompare(b.src.text);
+  });
+  return buckets;
+}
+
+function groupBlocks(data: Status): HTMLElement[] {
+  const routing = data.system_routing !== false;
+  const buckets = groupRemoteBuckets(data);
+  if (buckets.length <= 1) {
+    return [groupDeviceCards(data.services, data, routing)];
+  }
+  return buckets.map((bucket) => {
+    const anyPending = bucket.items.some((s) => {
+      const p = probes.get(serviceKey(s));
+      return !!p && !p.result;
+    });
+    const testDevice = tool("refresh", t("test_host"), () => testHostServices(bucket.items));
+    testDevice.disabled = anyPending || !data.online || busy;
+    if (anyPending) testDevice.classList.add("spinning");
+
+    const title = el("span", bucket.src.self ? "device-group-title self" : "device-group-title", bucket.src.text);
+    return el("div", "device-group",
+      el("div", "device-group-head", title, testDevice),
+      groupDeviceCards(bucket.items, data, routing)
+    );
+  });
 }
 
 function protocolSelect(selected: ServiceKind, cls = "kind-select", onChange?: (k: ServiceKind) => void) {
@@ -1606,9 +1664,18 @@ function servicesView(data: Status) {
   }
 
   const routing = data.system_routing !== false;
+  const remoteBuckets = groupRemoteBuckets(data);
+  const singleSource = remoteBuckets.length === 1 ? remoteBuckets[0]!.src : null;
   const makeRemoteBlock = () => el("div", "flow-section",
-    el("div", "flow-head", el("span", "", t("section_group")), el("span", "count", String(data.services.length))),
-    groupList(data),
+    el("div", "flow-head",
+      el("span", "", t("section_group")),
+      el("span", "count", String(data.services.length)),
+      ...(singleSource ? [
+        el("span", "meta-sep", "·"),
+        el("span", singleSource.self ? "source-tag self" : "source-tag", singleSource.text),
+      ] : [])
+    ),
+    ...groupBlocks(data),
     ...(routing ? [] : [el("p", "routing-note", t("routing_unavailable"))])
   );
   const makeLocalBlock = () => el("div", "flow-section",
@@ -1637,6 +1704,8 @@ function addShare(emptyState = false) {
 function openSettings() {
   let currentBehavior = getCloseBehavior();
   let saveError = false;
+  let prefAutoConnect = status?.auto_connect ?? true;
+  let prefAutoShare = status?.auto_share ?? true;
 
   openSettingsModal(settingsDialog, {
     t: (k) => t(k as Parameters<typeof t>[0]),
@@ -1685,6 +1754,48 @@ function openSettings() {
         ));
       }
 
+      if (status) {
+        nodes.push(el("div", "settings-divider"));
+
+        const connSeg = el("div", "segmented");
+        for (const [val, key] of [[true, "connect_auto"], [false, "connect_manual"]] as const) {
+          const btn = button(t(key), () => {
+            if (prefAutoConnect === val) return;
+            const prev = prefAutoConnect;
+            prefAutoConnect = val;
+            redraw();
+            void request({ op: "set_preferences", auto_connect: val }, false)
+              .then((next) => { status = next; render(); })
+              .catch(() => {
+                prefAutoConnect = prev;
+                if (settingsDialog.open) redraw();
+              });
+          }, val === prefAutoConnect ? "active" : "");
+          btn.setAttribute("aria-pressed", String(val === prefAutoConnect));
+          connSeg.append(btn);
+        }
+        nodes.push(el("div", "settings-row", el("span", "settings-label", t("on_launch_connect")), connSeg));
+
+        const shareSeg = el("div", "segmented");
+        for (const [val, key] of [[true, "restore_same_net"], [false, "restore_off"]] as const) {
+          const btn = button(t(key), () => {
+            if (prefAutoShare === val) return;
+            const prev = prefAutoShare;
+            prefAutoShare = val;
+            redraw();
+            void request({ op: "set_preferences", auto_share: val }, false)
+              .then((next) => { status = next; render(); })
+              .catch(() => {
+                prefAutoShare = prev;
+                if (settingsDialog.open) redraw();
+              });
+          }, val === prefAutoShare ? "active" : "");
+          btn.setAttribute("aria-pressed", String(val === prefAutoShare));
+          shareSeg.append(btn);
+        }
+        nodes.push(el("div", "settings-row", el("span", "settings-label", t("restore_shares")), shareSeg));
+      }
+
       if (status?.member && status.server) {
         nodes.push(el("div", "settings-divider"));
 
@@ -1730,6 +1841,11 @@ function render(force = false) {
   checkSiteDialog();
   showError();
   const data = status;
+  const blocked = !!data?.auto_share_blocked;
+  if (blocked && !lastAutoShareBlocked) {
+    notify(t("auto_share_network_changed"));
+  }
+  lastAutoShareBlocked = blocked;
   if (!data?.admin_ready && tab === "admin") tab = "services";
   syncBrand(!brandBooted);
   const owner = data?.member ? JSON.stringify([data.server, data.member]) : "";
@@ -1893,6 +2009,9 @@ async function boot() {
   render(true);
   void getCurrent().then(deepLink).catch(() => {});
   void onOpenUrl(deepLink).catch(() => {});
+  if (status?.member && status.auto_connect !== false && !status.running && !status.online && !pendingJoin) {
+    void act({ op: "start" });
+  }
   const pollOnce = async () => {
     if (busy || polling || (mac && !status) || (!desktop && document.visibilityState === "hidden")) return;
     polling = true;

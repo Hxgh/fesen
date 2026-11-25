@@ -16,7 +16,15 @@ import NetworkExtension
         let fd = open(cache.appendingPathComponent("menu.lock").path, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
         guard fd >= 0 else { return }
         defer { close(fd) }
-        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { return }
+        var locked = false
+        for _ in 0..<10 {
+            if flock(fd, LOCK_EX | LOCK_NB) == 0 {
+                locked = true
+                break
+            }
+            usleep(50_000)
+        }
+        guard locked else { return }
         Menu(bundle: bundle, usesExtension: args[1] == "--extension").run()
     }
 }

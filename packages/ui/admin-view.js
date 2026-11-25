@@ -127,7 +127,7 @@ export function createAdminWorkspace(opts) {
     const footerNodes = [];
     if (location.protocol.startsWith("http") && location.pathname.startsWith("/admin")) {
       const openLink = el("a", "button", t("open_join"));
-      openLink.href = "/join";
+      openLink.href = data.link;
       footerNodes.push(openLink);
     }
     footerNodes.push(copyBtn);

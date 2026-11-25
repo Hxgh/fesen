@@ -228,7 +228,14 @@ impl Group {
             }));
         }
         peers.sort_unstable_by(|a, b| a.id.cmp(&b.id));
-        services.sort_unstable_by(|a, b| a.service.id.cmp(&b.service.id));
+        services.sort_unstable_by(|a, b| {
+            (&a.member, &a.device, &a.service.name, &a.service.id).cmp(&(
+                &b.member,
+                &b.device,
+                &b.service.name,
+                &b.service.id,
+            ))
+        });
         View { peers, services }
     }
 
