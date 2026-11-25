@@ -1,0 +1,5 @@
+<resources>
+    <string name="fesen_tile_label">飞弦</string>
+    <string name="fesen_disconnect">断开</string>
+    <string name="fesen_connect_failed">无法接入，请打开飞弦查看</string>
+</resources>

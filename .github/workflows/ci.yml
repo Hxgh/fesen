@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Safety & Syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Public safety check
+        run: bash scripts/check-public.sh
+      - name: Shell syntax check
+        run: bash -n scripts/*.sh
+      - name: Compose config check
+        env:
+          FESEN_DOMAIN: group.example.com
+        run: docker compose -f deploy/compose.yaml -f deploy/compose.udp.yaml config -q
+
+  rust:
+    name: Rust Workspace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Test workspace
+        run: cargo test --locked --workspace
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  desk-frontend:
+    name: Client Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desk/pnpm-lock.yaml
+      - name: Install & build frontend
+        run: |
+          pnpm -C apps/desk install --frozen-lockfile
+          pnpm -C apps/desk build
+
+  desk-macos-unit:
+    name: Client Native Unit Tests
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desk/src-tauri -> target
+      - name: Test Tauri crate
+        run: cargo test --locked --manifest-path apps/desk/src-tauri/Cargo.toml --lib

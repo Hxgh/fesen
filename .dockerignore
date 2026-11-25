@@ -1,0 +1,9 @@
+.git
+**/target
+**/node_modules
+**/dist
+**/gen
+**/.gradle
+*.sqlite*
+.env*
+.local

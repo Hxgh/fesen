@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="color-scheme" content="light dark">
+  <title>Fesen</title>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <div class="identity">
+        <span id="brand-badge" class="brand-badge"><span id="brand-mark"></span></span>
+        <span id="brand-name" class="brand-word">Fesen</span>
+        <nav id="nav-tabs" class="tabs topbar-tabs" hidden></nav>
+      </div>
+      <div id="actions" class="toolbar"></div>
+    </div>
+  </header>
+  <main class="wrap workspace">
+    <p id="error" class="feedback error" role="alert" hidden></p>
+    <div id="content"></div>
+  </main>
+  <dialog id="editor" aria-labelledby="editor-title"></dialog>
+  <dialog id="settings-dialog" aria-labelledby="settings-heading"></dialog>
+  <dialog id="site-dialog" aria-labelledby="site-url">
+    <header class="site-bar">
+      <div class="site-meta">
+        <span id="site-dot" class="site-dot" aria-hidden="true"></span>
+        <span id="site-url" class="site-url mono"></span>
+        <span id="site-result" class="site-status" role="status"></span>
+      </div>
+      <div class="site-tools">
+        <button id="site-retry" class="tool-btn icon-only" type="button"></button>
+        <button id="site-expand" class="tool-btn icon-only site-expand-btn" type="button"></button>
+        <button id="site-close" class="tool-btn icon-only" type="button"></button>
+      </div>
+    </header>
+    <div id="site-stage"></div>
+  </dialog>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

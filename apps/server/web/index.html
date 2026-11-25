@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Fesen · Admin</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <div class="identity">
+        <a id="brand-badge" class="brand-badge" href="/admin/"><span id="brand-mark"></span></a>
+        <span id="brand-word" class="brand-word"><span data-copy="brand">Fesen</span><span class="brand-sub" data-copy="admin_badge">Admin</span></span>
+        <nav id="admin-tabs" class="tabs topbar-tabs" role="tablist" aria-label="Management" data-label="workspace" hidden>
+          <button id="tab-members" type="button" role="tab" aria-selected="true" aria-controls="members-panel"><span data-copy="members"></span><span class="count" id="member-count">0</span></button>
+          <button id="tab-devices" type="button" role="tab" aria-selected="false" aria-controls="devices-panel" tabindex="-1"><span data-copy="devices"></span><span class="count" id="device-count">0</span></button>
+          <button id="tab-services" type="button" role="tab" aria-selected="false" aria-controls="services-panel" tabindex="-1"><span data-copy="services"></span><span class="count" id="services-count">0</span></button>
+          <button id="tab-conflicts" type="button" role="tab" aria-selected="false" aria-controls="conflicts-panel" tabindex="-1"><span data-copy="conflicts"></span><span class="count count-bad" id="conflict-count" hidden>0</span></button>
+        </nav>
+      </div>
+      <div class="toolbar">
+        <div id="admin-actions" class="toolbar" hidden>
+          <button id="new-member" class="tool-btn icon-only" type="button" data-label="create"><span data-icon="plus"></span></button>
+          <button id="refresh" class="tool-btn icon-only" type="button" data-label="refresh"><span data-icon="refresh"></span></button>
+          <button id="show-join" class="tool-btn icon-only" type="button" data-label="join"><span data-icon="link"></span></button>
+        </div>
+        <button id="open-settings" class="tool-btn icon-only" type="button" aria-haspopup="dialog" data-label="settings"><span data-icon="settings"></span></button>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap workspace">
+    <p id="loading" class="loading" role="status" data-copy="loading"></p>
+
+    <section id="signin" class="signin" aria-labelledby="login-title" hidden>
+      <form id="login" class="stack">
+        <h1 id="login-title" class="form-title" data-copy="login_title"></h1>
+        <label><span data-copy="account"></span><input name="username" autocomplete="username" required maxlength="64"></label>
+        <label><span data-copy="password"></span><input name="password" type="password" autocomplete="current-password" required maxlength="256"></label>
+        <p id="login-error" class="feedback error" role="alert" hidden></p>
+        <button class="button primary" type="submit" data-copy="login"></button>
+      </form>
+    </section>
+
+    <div id="admin" hidden>
+      <p id="workspace-error" class="feedback error panel-feedback" role="alert" hidden></p>
+
+      <section id="members-panel" class="tab-panel" role="tabpanel" aria-labelledby="tab-members">
+        <div id="users" class="list-card"></div>
+      </section>
+
+      <section id="devices-panel" class="tab-panel" role="tabpanel" aria-labelledby="tab-devices" hidden>
+        <div id="devices" class="list-card"></div>
+        <p id="devices-empty" class="empty" data-copy="devices_empty" hidden></p>
+      </section>
+
+      <section id="services-panel" class="tab-panel" role="tabpanel" aria-labelledby="tab-services" hidden>
+        <div id="services-list" class="service-list"></div>
+        <p id="services-empty" class="empty" data-copy="services_empty" hidden></p>
+      </section>
+
+      <section id="conflicts-panel" class="tab-panel" role="tabpanel" aria-labelledby="tab-conflicts" hidden>
+        <div class="stack conflicts-stack">
+          <div id="audit-result-card" class="audit-card"></div>
+          <div class="precheck-card">
+            <h3 class="precheck-title" data-copy="precheck_title"></h3>
+            <form id="precheck-form" class="precheck-form">
+              <div class="precheck-inputs">
+                <label><span data-copy="ipv4"></span><input id="check-ip" placeholder="198.51.100.10, 203.0.113.0/24" required></label>
+                <label><span data-copy="port"></span><input id="check-port" placeholder="80, 8000-8080" required></label>
+              </div>
+              <div><button class="button primary" type="submit" data-copy="precheck_run"></button></div>
+            </form>
+            <div id="precheck-result" class="precheck-result" hidden></div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <dialog id="settings-dialog" tabindex="-1" aria-labelledby="settings-title"></dialog>
+
+  <dialog id="join-dialog" tabindex="-1" aria-labelledby="link-title">
+    <div class="dialog-header">
+      <h2 id="link-title" data-copy="join"></h2>
+      <button id="close-join" class="button icon-button" type="button" data-label="close"><span data-icon="close"></span></button>
+    </div>
+    <div class="dialog-body">
+      <p id="group-host" class="muted mono"></p>
+      <textarea id="link" class="join-address" aria-labelledby="link-title" readonly rows="2" spellcheck="false"></textarea>
+    </div>
+    <div class="dialog-footer">
+      <a class="button" href="/join" data-copy="open_join"></a>
+      <button id="copy-link" class="button primary" type="button" data-copy="copy_link"></button>
+    </div>
+  </dialog>
+
+  <dialog id="action-dialog" tabindex="-1" aria-labelledby="action-title">
+    <form id="action-form">
+      <div class="dialog-header">
+        <h2 id="action-title"></h2>
+        <button id="close-action" class="button icon-button" type="button" data-label="close"><span data-icon="close"></span></button>
+      </div>
+      <div class="dialog-body">
+        <p id="action-subject" class="subject" hidden></p>
+        <p id="action-warning" class="muted" hidden></p>
+        <label id="action-username"><span data-copy="account"></span><input name="username" autocomplete="off" required maxlength="64" pattern="[A-Za-z0-9._\-]+"></label>
+        <label id="action-password"><span data-copy="new_password"></span><input name="password" type="password" autocomplete="new-password" required minlength="8" maxlength="256"></label>
+        <p id="action-error" class="feedback error" role="alert" hidden></p>
+      </div>
+      <div class="dialog-footer">
+        <button id="cancel-action" class="button" type="button" data-copy="cancel"></button>
+        <button id="submit-action" class="button primary" type="submit"></button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

@@ -1,0 +1,3 @@
+-keep class io.fesen.bridge.FesenPlugin { *; }
+-keep class io.fesen.bridge.FesenVpn { *; }
+-keep class io.fesen.bridge.FesenTile { *; }

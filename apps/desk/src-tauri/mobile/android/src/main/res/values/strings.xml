@@ -1,0 +1,5 @@
+<resources>
+    <string name="fesen_tile_label">Fesen</string>
+    <string name="fesen_disconnect">Disconnect</string>
+    <string name="fesen_connect_failed">Could not connect. Open Fesen to check.</string>
+</resources>

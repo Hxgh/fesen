@@ -1,0 +1,27 @@
+services:
+  server:
+    image: ${FESEN_IMAGE:-fesen-server:local}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      FESEN_ORIGIN: https://${FESEN_DOMAIN:?set FESEN_DOMAIN}
+      FESEN_STUN: ${FESEN_STUN:-}
+    volumes:
+      - state:/state
+    restart: unless-stopped
+    read_only: true
+  https:
+    image: caddy:2-alpine
+    environment:
+      FESEN_DOMAIN: ${FESEN_DOMAIN:?set FESEN_DOMAIN}
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - certificates:/data
+    restart: unless-stopped
+volumes:
+  state:
+  certificates:

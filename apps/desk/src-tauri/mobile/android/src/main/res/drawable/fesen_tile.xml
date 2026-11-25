@@ -1,0 +1,10 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="64"
+    android:viewportHeight="64">
+    <!-- Pure Gen trigram (☶), locked 5-bar monochrome geometry -->
+    <path android:fillColor="#ffffff" android:pathData="M4,6h56v12h-56z" />
+    <path android:fillColor="#ffffff" android:pathData="M4,26h24v12h-24z M36,26h24v12h-24z" />
+    <path android:fillColor="#ffffff" android:pathData="M4,46h24v12h-24z M36,46h24v12h-24z" />
+</vector>

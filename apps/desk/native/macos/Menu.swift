@@ -1,0 +1,342 @@
+import AppKit
+import CoreGraphics
+import Darwin
+import Foundation
+import NetworkExtension
+
+@main private struct Tray {
+    @MainActor static func main() {
+        let args = CommandLine.arguments
+        guard args.count == 2, ["--local", "--extension"].contains(args[1]) else { return }
+        let bundle = URL(fileURLWithPath: args[0]).resolvingSymlinksInPath()
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        guard Bundle(url: bundle)?.bundleIdentifier == "io.fesen.client" else { return }
+        let cache = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/io.fesen.client")
+        try? FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
+        let fd = open(cache.appendingPathComponent("menu.lock").path, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
+        guard fd >= 0 else { return }
+        defer { close(fd) }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { return }
+        Menu(bundle: bundle, usesExtension: args[1] == "--extension").run()
+    }
+}
+
+private enum MarkState: Equatable {
+    case idle
+    case connecting
+    case connected
+}
+
+private struct IpcAddress: Decodable {
+    let port: UInt16
+    let token: [UInt8]
+}
+
+private enum LocalCoreIPC {
+    private static var ipcURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/io.fesen.client/publisher/ipc.json")
+    }
+
+    static func queryState() -> MarkState {
+        guard let reply = send(json: "{\"op\":\"status\",\"ui\":false}"),
+              let data = reply["data"] as? [String: Any]
+        else { return .idle }
+        if (data["online"] as? Bool) == true { return .connected }
+        if (data["running"] as? Bool) == true { return .connecting }
+        return .idle
+    }
+
+    @discardableResult
+    static func sendStop() -> Bool {
+        send(json: "{\"op\":\"stop\"}") != nil
+    }
+
+    private static func send(json: String) -> [String: Any]? {
+        guard let raw = try? Data(contentsOf: ipcURL),
+              let addr = try? JSONDecoder().decode(IpcAddress.self, from: raw),
+              addr.token.count == 32, addr.port > 0
+        else { return nil }
+
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+
+        var tv = timeval(tv_sec: 0, tv_usec: 300_000)
+        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        var noSigPipe: Int32 = 1
+        _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+
+        var sin = sockaddr_in()
+        sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        sin.sin_family = sa_family_t(AF_INET)
+        sin.sin_port = addr.port.bigEndian
+        sin.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+
+        let ok = withUnsafePointer(to: &sin) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+            }
+        }
+        guard ok else { return nil }
+
+        let payload = Data(json.utf8)
+        var packet = Data(capacity: 32 + 4 + payload.count)
+        packet.append(contentsOf: addr.token)
+        var lenBE = UInt32(payload.count).bigEndian
+        withUnsafeBytes(of: &lenBE) { packet.append(contentsOf: $0) }
+        packet.append(payload)
+
+        guard writeAll(fd, packet) else { return nil }
+        guard let header = readExact(fd, count: 4) else { return nil }
+        let replyLen = header.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+        guard replyLen > 0, replyLen <= 1_048_576,
+              let body = readExact(fd, count: Int(replyLen)),
+              let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
+        else { return nil }
+        return obj
+    }
+
+    private static func writeAll(_ fd: Int32, _ data: Data) -> Bool {
+        data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return false }
+            var offset = 0
+            while offset < data.count {
+                let n = Darwin.write(fd, base.advanced(by: offset), data.count - offset)
+                if n <= 0 { return false }
+                offset += n
+            }
+            return true
+        }
+    }
+
+    private static func readExact(_ fd: Int32, count: Int) -> Data? {
+        var out = Data(count: count)
+        let ok = out.withUnsafeMutableBytes { raw -> Bool in
+            guard let base = raw.baseAddress else { return false }
+            var offset = 0
+            while offset < count {
+                let n = Darwin.read(fd, base.advanced(by: offset), count - offset)
+                if n <= 0 { return false }
+                offset += n
+            }
+            return true
+        }
+        return ok ? out : nil
+    }
+}
+
+private let trigramPaths: [[UInt8]] = [
+    [0b001, 0b101],
+    [0b010, 0b110],
+    [0b001, 0b011, 0b111, 0b110],
+    [0b010, 0b011, 0b111, 0b101],
+]
+
+@MainActor private final class Menu: Accessory, NSMenuDelegate {
+    private let usesExtension: Bool
+    private var item: NSStatusItem?
+    private var stop: NSMenuItem?
+    private var tunnel: NETunnelProviderManager?
+    private var markState: MarkState = .idle
+    private var currentMask: UInt8 = 0b000
+    private var prevMask: UInt8 = 0xff
+    private var queue: [UInt8] = []
+    private var animTimer: Timer?
+    private var pollTicks = 0
+
+    init(bundle: URL, usesExtension: Bool) {
+        self.usesExtension = usesExtension
+        super.init(bundle: bundle)
+    }
+
+    // Bitmask-driven Bagua @2x CGImage template (36x36px -> 18x18pt).
+    // Bit 2 = top yao, Bit 1 = mid yao, Bit 0 = bot yao.
+    // 0b000 = Kun ☷ (Death Gate / disconnected), 0b100 = Gen ☶ (Life Gate / connected).
+    private func trigramImage(_ mask: UInt8, alpha: CGFloat) -> NSImage {
+        let px = 36
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        guard let ctx = CGContext(
+            data: nil,
+            width: px,
+            height: px,
+            bitsPerComponent: 8,
+            bytesPerRow: px * 4,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo.rawValue
+        ) else {
+            return NSImage(size: NSSize(width: 18, height: 18))
+        }
+        ctx.setFillColor(red: 0, green: 0, blue: 0, alpha: alpha)
+        // CoreGraphics origin is bottom-left: y=5 bot, y=15 mid, y=25 top.
+        let rows: [(bit: UInt8, y: CGFloat)] = [(1, 5), (2, 15), (4, 25)]
+        for row in rows {
+            if (mask & row.bit) != 0 {
+                ctx.fill(CGRect(x: 4, y: row.y, width: 28, height: 6))
+            } else {
+                ctx.fill(CGRect(x: 4, y: row.y, width: 12, height: 6))
+                ctx.fill(CGRect(x: 20, y: row.y, width: 12, height: 6))
+            }
+        }
+        guard let cg = ctx.makeImage() else {
+            return NSImage(size: NSSize(width: 18, height: 18))
+        }
+        let image = NSImage(cgImage: cg, size: NSSize(width: 18, height: 18))
+        image.isTemplate = true
+        image.accessibilityDescription = "Fesen"
+        return image
+    }
+
+    private func renderMask(_ mask: UInt8, alpha: CGFloat) {
+        prevMask = currentMask
+        currentMask = mask
+        item?.button?.image = trigramImage(mask, alpha: alpha)
+    }
+
+    private func nextWalkMask() -> UInt8 {
+        let candidates = [UInt8(1), 2, 4]
+            .map { currentMask ^ $0 }
+            .filter { $0 != 0b100 && $0 != 0b000 && $0 != prevMask }
+        return candidates.randomElement() ?? 0b010
+    }
+
+    private func setMark(_ state: MarkState) {
+        let changed = state != markState
+        markState = state
+        stop?.isEnabled = state != .idle
+        if state == .connecting {
+            if animTimer == nil {
+                queue = trigramPaths.randomElement() ?? [0b001, 0b101]
+                pollTicks = 0
+                let first = queue.isEmpty ? nextWalkMask() : queue.removeFirst()
+                renderMask(first, alpha: 0.88)
+                let timer = Timer(timeInterval: 0.34, repeats: true) { [weak self] _ in
+                    Task { @MainActor in
+                        guard let self, self.markState == .connecting else { return }
+                        let next = self.queue.isEmpty ? self.nextWalkMask() : self.queue.removeFirst()
+                        self.renderMask(next, alpha: 0.88)
+                        self.pollTicks += 1
+                        if !self.usesExtension && self.pollTicks % 3 == 0 {
+                            self.syncStatus()
+                        }
+                    }
+                }
+                RunLoop.main.add(timer, forMode: .common)
+                animTimer = timer
+            }
+        } else {
+            animTimer?.invalidate()
+            animTimer = nil
+            queue.removeAll()
+            if changed || item?.button?.image == nil {
+                if state == .connected {
+                    // Life Gate ☶ (Gen): solid top, full ink.
+                    renderMask(0b100, alpha: 1.0)
+                } else {
+                    // Death Gate ☷ (Kun): all broken, soft ink.
+                    renderMask(0b000, alpha: 0.50)
+                }
+            }
+        }
+    }
+
+    private func syncStatus() {
+        if usesExtension {
+            let status = tunnel?.connection.status ?? .invalid
+            switch status {
+            case .connected:
+                setMark(.connected)
+            case .connecting, .reasserting:
+                setMark(.connecting)
+            default:
+                setMark(.idle)
+            }
+        } else {
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let state = LocalCoreIPC.queryState()
+                DispatchQueue.main.async {
+                    self?.setMark(state)
+                }
+            }
+        }
+    }
+
+    @objc func applicationDidFinishLaunching(_ notification: Notification) {
+        DistributedNotificationCenter.default().addObserver(self, selector: #selector(preferenceChanged),
+            name: MenuBarPreference.changed, object: bundle.path, suspensionBehavior: .deliverImmediately)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(workspaceChanged),
+            name: NSWorkspace.didLaunchApplicationNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(workspaceChanged),
+            name: NSWorkspace.didTerminateApplicationNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(vpnStatusChanged),
+            name: .NEVPNStatusDidChange, object: nil)
+        guard MenuBarPreference.local.refresh() else { quitMenu(); return }
+        let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        item = status
+        renderMask(0b000, alpha: 0.50)
+        let menu = NSMenu()
+        menu.delegate = self
+        menu.autoenablesItems = false
+        let zh = Locale.preferredLanguages.first?.hasPrefix("zh") == true
+        menu.addItem(withTitle: zh ? "打开飞弦" : "Open Fesen", action: #selector(openApp), keyEquivalent: "").target = self
+        stop = menu.addItem(withTitle: zh ? "断开连接" : "Disconnect", action: #selector(disconnect), keyEquivalent: "")
+        stop?.target = self
+        stop?.isEnabled = false
+        menu.addItem(.separator())
+        menu.addItem(withTitle: zh ? "退出菜单栏" : "Quit menu bar", action: #selector(quitMenu), keyEquivalent: "").target = self
+        status.menu = menu
+        if usesExtension { Task { await refreshTunnel() } }
+        else { syncStatus() }
+    }
+
+    // Zero steady-state polling: refreshes on OS notifications, menu open, and briefly while connecting.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        if usesExtension && tunnel == nil { Task { await refreshTunnel() } }
+        syncStatus()
+    }
+
+    private func refreshTunnel() async {
+        tunnel = (try? await NETunnelProviderManager.loadAllFromPreferences())?.first {
+            ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier == "io.fesen.client.tunnel"
+        }
+        syncStatus()
+    }
+
+    @objc private func workspaceChanged(_ notification: Notification) {
+        guard !usesExtension else { return }
+        syncStatus()
+    }
+
+    @objc private func vpnStatusChanged(_ notification: Notification) {
+        guard usesExtension else { return }
+        syncStatus()
+    }
+
+    @objc private func disconnect() {
+        if usesExtension {
+            tunnel?.connection.stopVPNTunnel()
+        } else {
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let stopped = LocalCoreIPC.sendStop()
+                DispatchQueue.main.async {
+                    if !stopped {
+                        _ = self?.instance(.accessory)?.terminate()
+                    }
+                    self?.setMark(.idle)
+                }
+            }
+        }
+    }
+
+    @objc private func quitMenu() {
+        animTimer?.invalidate()
+        animTimer = nil
+        NSApp.terminate(nil)
+    }
+
+    @objc private func preferenceChanged(_ notification: Notification) {
+        if !MenuBarPreference.local.refresh() { quitMenu() }
+    }
+}

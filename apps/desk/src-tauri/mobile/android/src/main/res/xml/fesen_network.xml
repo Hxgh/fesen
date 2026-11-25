@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Published HTTP sites use arbitrary IPv4 addresses. SiteView accepts only the selected origin. -->
+<network-security-config><base-config cleartextTrafficPermitted="true" /></network-security-config>

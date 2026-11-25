@@ -1,0 +1,401 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0; empty uses v<Cargo version>-build.<run>)"
+        required: false
+        type: string
+      publish_release:
+        description: "Create/update GitHub Release"
+        required: false
+        default: true
+        type: boolean
+      push_docker:
+        description: "Push multi-arch Server image to GHCR"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  meta:
+    name: Prepare Metadata
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.info.outputs.tag }}
+      version: ${{ steps.info.outputs.version }}
+      bundle_version: ${{ steps.info.outputs.bundle_version }}
+      prerelease: ${{ steps.info.outputs.prerelease }}
+      repo: ${{ steps.info.outputs.repo }}
+      image: ${{ steps.info.outputs.image }}
+      docker_tags: ${{ steps.info.outputs.docker_tags }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Safety gate
+        run: bash scripts/check-public.sh
+      - name: Compute release metadata
+        id: info
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          repo_lower="${REPO_NAME,,}"
+          owner_lower="${REPO_OWNER,,}"
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            tag="$REF_NAME"
+          elif [[ -n "$INPUT_TAG" ]]; then
+            tag="$INPUT_TAG"
+          else
+            pkg_ver="$(awk -F'"' '/^version =/{print $2; exit}' Cargo.toml)"
+            tag="v${pkg_ver}-build.${RUN_NUMBER}"
+          fi
+          version="${tag#v}"
+          bundle_version=""
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            bundle_version="$version"
+          fi
+          prerelease="false"
+          image="ghcr.io/${owner_lower}/${repo_lower}-server"
+          docker_tags="${image}:${tag}"
+          if [[ "$tag" == *-* ]]; then
+            prerelease="true"
+          else
+            docker_tags="${docker_tags},${image}:latest"
+          fi
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "bundle_version=$bundle_version"
+            echo "prerelease=$prerelease"
+            echo "repo=$repo_lower"
+            echo "image=$image"
+            echo "docker_tags=$docker_tags"
+          } >> "$GITHUB_OUTPUT"
+
+  desktop-windows:
+    name: Windows Client (x64)
+    needs: meta
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desk/pnpm-lock.yaml
+      - name: Sync app version
+        if: needs.meta.outputs.bundle_version != ''
+        shell: pwsh
+        env:
+          BUNDLE_VERSION: ${{ needs.meta.outputs.bundle_version }}
+        run: node -e "const fs=require('fs'),p='apps/desk/src-tauri/tauri.conf.json',c=JSON.parse(fs.readFileSync(p,'utf8'));c.version=process.env.BUNDLE_VERSION;fs.writeFileSync(p,JSON.stringify(c,null,2)+'\n');"
+      - name: Build Windows installer
+        shell: pwsh
+        run: ./scripts/build-windows.ps1
+      - name: Stage Windows artifact
+        shell: pwsh
+        env:
+          REPO: ${{ needs.meta.outputs.repo }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          $out = "dist-release"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $installer = Get-ChildItem "apps/desk/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe" | Select-Object -First 1
+          if (-not $installer) { throw "NSIS installer not found" }
+          Copy-Item $installer.FullName (Join-Path $out "${env:REPO}_${env:VERSION}_windows-x64-setup.exe")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: dist-release/*
+
+  desktop-macos:
+    name: macOS Client (Apple Silicon)
+    needs: meta
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desk/pnpm-lock.yaml
+      - name: Sync app version
+        if: needs.meta.outputs.bundle_version != ''
+        env:
+          BUNDLE_VERSION: ${{ needs.meta.outputs.bundle_version }}
+        run: node -e "const fs=require('fs'),p='apps/desk/src-tauri/tauri.conf.json',c=JSON.parse(fs.readFileSync(p,'utf8'));c.version=process.env.BUNDLE_VERSION;fs.writeFileSync(p,JSON.stringify(c,null,2)+'\n');"
+      - name: Build macOS client
+        env:
+          REPO: ${{ needs.meta.outputs.repo }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_SIGN_ID: ${{ secrets.APPLE_SIGN_ID }}
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_HOST_PROFILE_BASE64: ${{ secrets.APPLE_HOST_PROFILE_BASE64 }}
+          APPLE_TUNNEL_PROFILE_BASE64: ${{ secrets.APPLE_TUNNEL_PROFILE_BASE64 }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist-release
+          app_path="target/release/bundle/macos/Fesen.app"
+          if [[ -n "$APPLE_TEAM_ID" && -n "$APPLE_SIGN_ID" && -n "$APPLE_CERT_P12_BASE64" && -n "$APPLE_CERT_PASSWORD" && -n "$APPLE_HOST_PROFILE_BASE64" && -n "$APPLE_TUNNEL_PROFILE_BASE64" ]]; then
+            keychain="$RUNNER_TEMP/signing.keychain-db"
+            kc_pass="$(openssl rand -base64 24)"
+            p12="$RUNNER_TEMP/cert.p12"
+            host_profile="$RUNNER_TEMP/host.provisionprofile"
+            tunnel_profile="$RUNNER_TEMP/tunnel.provisionprofile"
+            printf '%s' "$APPLE_CERT_P12_BASE64" | base64 --decode > "$p12"
+            printf '%s' "$APPLE_HOST_PROFILE_BASE64" | base64 --decode > "$host_profile"
+            printf '%s' "$APPLE_TUNNEL_PROFILE_BASE64" | base64 --decode > "$tunnel_profile"
+            security create-keychain -p "$kc_pass" "$keychain"
+            security set-keychain-settings -lut 21600 "$keychain"
+            security unlock-keychain -p "$kc_pass" "$keychain"
+            security import "$p12" -P "$APPLE_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pass" "$keychain"
+            security list-keychains -d user -s "$keychain" login.keychain-db
+            export FESEN_TEAM_ID="$APPLE_TEAM_ID"
+            export FESEN_SIGN_ID="$APPLE_SIGN_ID"
+            export FESEN_HOST_PROFILE="$host_profile"
+            export FESEN_TUNNEL_PROFILE="$tunnel_profile"
+            bash scripts/build-macos.sh
+            out_zip="dist-release/${REPO}_${VERSION}_macos-arm64.zip"
+            ditto -c -k --sequesterRsrc --keepParent "$app_path" "$out_zip"
+            if [[ -n "$APPLE_ID" && -n "$APPLE_APP_PASSWORD" ]]; then
+              xcrun notarytool submit "$out_zip" --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+              xcrun stapler staple "$app_path"
+              rm -f "$out_zip"
+              ditto -c -k --sequesterRsrc --keepParent "$app_path" "$out_zip"
+            fi
+          else
+            bash scripts/build-macos.sh --unsigned
+            ditto -c -k --sequesterRsrc --keepParent "$app_path" "dist-release/${REPO}_${VERSION}_macos-arm64-unsigned.zip"
+          fi
+      - name: Cleanup temporary keychain
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/host.provisionprofile" "$RUNNER_TEMP/tunnel.provisionprofile"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-arm64
+          path: dist-release/*
+
+  mobile-android:
+    name: Android Client (ARM64)
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK & NDK
+        run: |
+          sdkmanager --install "platforms;android-36" "platforms;android-37.0" "build-tools;36.1.0" "ndk;29.0.14206865"
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          echo "NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desk/pnpm-lock.yaml
+      - name: Sync app version
+        if: needs.meta.outputs.bundle_version != ''
+        env:
+          BUNDLE_VERSION: ${{ needs.meta.outputs.bundle_version }}
+        run: node -e "const fs=require('fs'),p='apps/desk/src-tauri/tauri.conf.json',c=JSON.parse(fs.readFileSync(p,'utf8'));c.version=process.env.BUNDLE_VERSION;fs.writeFileSync(p,JSON.stringify(c,null,2)+'\n');"
+      - name: Build Android APK
+        env:
+          REPO: ${{ needs.meta.outputs.repo }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASS: ${{ secrets.ANDROID_KEY_PASS }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist-release
+          apk_dir="apps/desk/src-tauri/gen/android/app/build/outputs/apk"
+          if [[ -n "$ANDROID_KEYSTORE_BASE64" && -n "$ANDROID_KEYSTORE_PASS" && -n "$ANDROID_KEY_ALIAS" ]]; then
+            ks="$RUNNER_TEMP/release.jks"
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$ks"
+            export FESEN_ANDROID_KEYSTORE="$ks"
+            export FESEN_ANDROID_KEYSTORE_PASS="$ANDROID_KEYSTORE_PASS"
+            export FESEN_ANDROID_KEY_ALIAS="$ANDROID_KEY_ALIAS"
+            export FESEN_ANDROID_KEY_PASS="${ANDROID_KEY_PASS:-$ANDROID_KEYSTORE_PASS}"
+            bash scripts/build-android.sh --target aarch64
+            apk_path="$(find "$apk_dir" -type f -name '*-release.apk' | sort | head -n 1)"
+            [[ -n "$apk_path" ]] || { echo "Signed release APK not found" >&2; exit 1; }
+            cp "$apk_path" "dist-release/${REPO}_${VERSION}_android-arm64.apk"
+          else
+            bash scripts/build-android.sh --debug --target aarch64
+            apk_path="$(find "$apk_dir" -type f -name '*-debug.apk' | sort | head -n 1)"
+            [[ -n "$apk_path" ]] || { echo "Debug APK not found" >&2; exit 1; }
+            cp "$apk_path" "dist-release/${REPO}_${VERSION}_android-arm64-debug.apk"
+          fi
+      - name: Cleanup keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.jks"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-android
+          path: dist-release/*
+
+  server-linux:
+    name: Linux Server (x64 & arm64)
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ARM64 cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+      - uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Linux server binaries
+        env:
+          REPO: ${{ needs.meta.outputs.repo }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+        run: |
+          set -euo pipefail
+          mkdir -p dist-release
+          for pair in "x86_64-unknown-linux-gnu:x64" "aarch64-unknown-linux-gnu:arm64"; do
+            target="${pair%%:*}"
+            label="${pair##*:}"
+            cargo build --locked --release -p fesen-server --target "$target"
+            stage="$RUNNER_TEMP/server-linux-$label"
+            mkdir -p "$stage"
+            cp "target/$target/release/fesen-server" LICENSE README.md "$stage/"
+            tar -czf "dist-release/${REPO}-server_${VERSION}_linux-${label}.tar.gz" -C "$stage" .
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-server-linux
+          path: dist-release/*
+
+  server-docker:
+    name: Server Docker Image (GHCR)
+    needs: meta
+    if: github.event_name == 'push' || inputs.push_docker
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build & push multi-arch server image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ needs.meta.outputs.docker_tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  publish:
+    name: Publish GitHub Release
+    needs: [meta, desktop-windows, desktop-macos, mobile-android, server-linux, server-docker]
+    if: >-
+      always() &&
+      needs.meta.result == 'success' &&
+      needs.desktop-windows.result == 'success' &&
+      needs.desktop-macos.result == 'success' &&
+      needs.mobile-android.result == 'success' &&
+      needs.server-linux.result == 'success' &&
+      (needs.server-docker.result == 'success' || needs.server-docker.result == 'skipped') &&
+      (github.event_name == 'push' || inputs.publish_release)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Generate checksums & release body
+        env:
+          TAG: ${{ needs.meta.outputs.tag }}
+          IMAGE: ${{ needs.meta.outputs.image }}
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          printf '%s\n' \
+            "### Server (Docker, recommended on Linux)" \
+            "" \
+            "\`\`\`sh" \
+            "export FESEN_IMAGE=${IMAGE}:${TAG}" \
+            "export FESEN_DOMAIN=group.example.com" \
+            "docker compose -f deploy/compose.yaml pull" \
+            "docker compose -f deploy/compose.yaml up -d" \
+            "\`\`\`" \
+            "" \
+            "### Downloads" \
+            "" \
+            "- **Windows 10/11 (x64)**: \`*-windows-x64-setup.exe\`" \
+            "- **macOS 14+ (Apple Silicon)**: \`*-macos-arm64*.zip\`" \
+            "- **Android 13+ (ARM64)**: \`*-android-arm64*.apk\`" \
+            "- **Linux Server (x64 / arm64)**: \`*-server_*-linux-*.tar.gz\`" \
+            "" \
+            "Verify checksums against \`SHA256SUMS.txt\`." \
+            > ../release-notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: ${{ needs.meta.outputs.tag }}
+          prerelease: ${{ needs.meta.outputs.prerelease }}
+          body_path: release-notes.md
+          generate_release_notes: true
+          files: release-assets/*

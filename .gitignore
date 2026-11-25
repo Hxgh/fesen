@@ -3,12 +3,22 @@
 Thumbs.db
 *.swp
 
-# Env / secrets
+# Env / secrets / local-only lab data
 .env
 .env.*
 !.env.example
+.local/
+*.local.*
 *.pem
 *.key
+*.p12
+*.cer
+*.mobileprovision
+*.provisionprofile
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
 
 # Rust
 target/
@@ -26,6 +36,17 @@ dist/
 # Tauri
 **/src-tauri/gen/
 **/src-tauri/target/
+**/src-tauri/binaries/
+**/src-tauri/icons/ios/
+**/src-tauri/icons/android/
+**/src-tauri/icons/64x64.png
+**/src-tauri/icons/128x128@2x.png
+**/src-tauri/icons/icon.png
+**/src-tauri/icons/Square*Logo.png
+**/src-tauri/icons/StoreLogo.png
+**/mobile/android/.gradle/
+**/mobile/android/.tauri/
+**/mobile/android/build/
 
 # Android
 **/gen/android/.gradle/

@@ -1,0 +1,6 @@
+services:
+  server:
+    environment:
+      FESEN_UDP: 0.0.0.0:4455
+    ports:
+      - "4455:4455/udp"

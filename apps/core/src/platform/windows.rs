@@ -1,0 +1,775 @@
+use super::{Network, Platform, Tun, Underlay};
+use crate::Core;
+use fesen_acl::{Cidr, VIRTUAL};
+use socket2::Socket;
+use std::{
+    cell::Cell,
+    ffi::{OsStr, OsString},
+    fs, io,
+    net::Ipv4Addr,
+    os::windows::{
+        ffi::{OsStrExt, OsStringExt},
+        fs::{MetadataExt, OpenOptionsExt},
+        io::AsRawSocket,
+        process::CommandExt,
+    },
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{Arc, Mutex, RwLock},
+    time::Duration,
+};
+use tokio::sync::mpsc;
+use windows_sys::Win32::{
+    Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
+    Globalization::GetUserDefaultUILanguage,
+    Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS,
+        DeleteObject, GetDC, ReleaseDC,
+    },
+    NetworkManagement::IpHelper::*,
+    Networking::WinSock::*,
+    Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    },
+    System::{
+        Com::CoTaskMemFree,
+        LibraryLoader::GetModuleHandleW,
+        Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
+        SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW},
+        Threading::GetCurrentThreadId,
+    },
+    UI::{
+        Shell::{
+            FOLDERID_LocalAppData, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, NIF_ICON,
+            NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+            SHGetKnownFolderPath, Shell_NotifyIconW, ShellExecuteW,
+        },
+        WindowsAndMessaging::*,
+    },
+};
+
+const NRPT: &str = "fesen .fesen resolver";
+const NO_WINDOW: u32 = 0x0800_0000;
+const TRAY_MESSAGE: u32 = WM_APP + 1;
+const TRAY_STATE_MESSAGE: u32 = WM_APP + 2;
+
+pub fn data_dir() -> io::Result<PathBuf> {
+    known_folder(&FOLDERID_LocalAppData).map(|p| p.join("fesen"))
+}
+
+fn known_folder(id: &windows_sys::core::GUID) -> io::Result<PathBuf> {
+    let mut raw = std::ptr::null_mut::<u16>();
+    let result = unsafe {
+        let result = SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut raw);
+        let path = if result >= 0 && !raw.is_null() {
+            let len = (0..).find(|i| *raw.add(*i) == 0).unwrap();
+            Ok(PathBuf::from(OsString::from_wide(
+                std::slice::from_raw_parts(raw, len),
+            )))
+        } else {
+            Err(io::Error::from_raw_os_error(result))
+        };
+        CoTaskMemFree(raw.cast());
+        path
+    };
+    result
+}
+
+pub fn pin_profile(dir: &Path) -> io::Result<Vec<fs::File>> {
+    let mut paths: Vec<_> = dir.ancestors().collect();
+    paths.reverse();
+    let mut handles = Vec::new();
+    for path in paths {
+        if path.as_os_str().is_empty() {
+            continue;
+        }
+        if path == dir {
+            match fs::create_dir(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let meta = handle.metadata()?;
+        if !meta.is_dir() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::other("unexpected profile location"));
+        }
+        handles.push(handle);
+    }
+    Ok(handles)
+}
+
+fn os_dir(read: unsafe extern "system" fn(*mut u16, u32) -> u32) -> io::Result<PathBuf> {
+    let mut out = [0u16; 1024];
+    let size = unsafe { read(out.as_mut_ptr(), out.len() as u32) } as usize;
+    if (1..out.len()).contains(&size) {
+        Ok(OsString::from_wide(&out[..size]).into())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+pub fn installed(path: &Path) -> bool {
+    let Ok(path) = path.canonicalize() else {
+        return false;
+    };
+    [&FOLDERID_ProgramFiles, &FOLDERID_ProgramFilesX86]
+        .iter()
+        .any(|id| {
+            known_folder(id)
+                .and_then(|p| p.canonicalize())
+                .is_ok_and(|root| path.starts_with(root))
+        })
+}
+
+fn check(code: u32) -> io::Result<()> {
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(code as i32))
+    }
+}
+
+fn address(ip: Ipv4Addr) -> SOCKADDR_INET {
+    SOCKADDR_INET {
+        Ipv4: SOCKADDR_IN {
+            sin_family: AF_INET,
+            sin_addr: IN_ADDR {
+                S_un: IN_ADDR_0 {
+                    S_addr: u32::from_ne_bytes(ip.octets()),
+                },
+            },
+            ..SOCKADDR_IN::default()
+        },
+    }
+}
+
+fn ipv4(address: SOCKADDR_INET) -> Ipv4Addr {
+    Ipv4Addr::from(unsafe { address.Ipv4.sin_addr.S_un.S_addr }.to_ne_bytes())
+}
+
+fn route_row(index: u32, cidr: Cidr) -> MIB_IPFORWARD_ROW2 {
+    let mut route = MIB_IPFORWARD_ROW2::default();
+    unsafe {
+        InitializeIpForwardEntry(&mut route);
+    }
+    route.InterfaceIndex = index;
+    route.DestinationPrefix = IP_ADDRESS_PREFIX {
+        Prefix: address(cidr.ip),
+        PrefixLength: cidr.prefix,
+    };
+    route.NextHop = address(Ipv4Addr::UNSPECIFIED);
+    route.Metric = 0;
+    route.Protocol = MIB_IPPROTO_NETMGMT;
+    route
+}
+
+fn nrpt(dns: Option<Ipv4Addr>) -> io::Result<()> {
+    let power = os_dir(GetSystemDirectoryW)?.join("WindowsPowerShell/v1.0/powershell.exe");
+    let mut script = format!(
+        "$ErrorActionPreference='Stop'; Get-DnsClientNrptRule | Where-Object {{ $_.Comment -eq '{NRPT}' }} | Remove-DnsClientNrptRule -Force;"
+    );
+    if let Some(dns) = dns {
+        script.push_str(&format!("Add-DnsClientNrptRule -Namespace '.fesen' -NameServers '{dns}' -DisplayName 'Fesen' -Comment '{NRPT}' | Out-Null;"));
+    }
+    let status = Command::new(power)
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .creation_flags(NO_WINDOW)
+        .output()?
+        .status;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("split DNS rule failed"))
+    }
+}
+
+struct Adapter {
+    session: Arc<wintun::Session>,
+    reader: Option<std::thread::JoinHandle<()>>,
+    index: u32,
+    config: Tun,
+}
+
+impl Drop for Adapter {
+    fn drop(&mut self) {
+        for route in &self.config.routes {
+            unsafe {
+                DeleteIpForwardEntry2(&route_row(self.index, *route));
+            }
+        }
+        if self.config.dns.is_some() {
+            let _ = nrpt(None);
+        }
+        let _ = self.session.shutdown();
+        if let Some(t) = self.reader.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+pub struct Windows {
+    adapter: Mutex<Option<Adapter>>,
+    input: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    dll: PathBuf,
+    network: RwLock<Network>,
+}
+
+impl Windows {
+    pub fn new(dll: PathBuf) -> Self {
+        let _ = nrpt(None);
+        Self {
+            adapter: Mutex::new(None),
+            input: Mutex::new(None),
+            dll,
+            network: RwLock::new(Network::default()),
+        }
+    }
+
+    fn adapter(&self, ip: Ipv4Addr) -> io::Result<Adapter> {
+        let network = unsafe { wintun::load_from_path(&self.dll) }.map_err(io::Error::other)?;
+        let adapter = wintun::Adapter::create(&network, "Fesen", "Fesen", None)
+            .map_err(io::Error::other)?;
+        let index = adapter.get_adapter_index().map_err(io::Error::other)?;
+        adapter.set_mtu(super::MTU).map_err(io::Error::other)?;
+        let mut row = MIB_UNICASTIPADDRESS_ROW::default();
+        unsafe {
+            InitializeUnicastIpAddressEntry(&mut row);
+        }
+        row.InterfaceIndex = index;
+        row.Address = address(ip);
+        row.OnLinkPrefixLength = 32;
+        check(unsafe { CreateUnicastIpAddressEntry(&row) })?;
+        let session = Arc::new(
+            adapter
+                .start_session(4 * 1024 * 1024)
+                .map_err(io::Error::other)?,
+        );
+        let source = session.clone();
+        let input = self
+            .input
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| io::Error::other("packet input closed"))?;
+        let reader = std::thread::Builder::new()
+            .name("fesen-wintun".into())
+            .spawn(move || {
+                while let Ok(packet) = source.receive_blocking() {
+                    let _ = input.try_send(packet.bytes().to_vec());
+                }
+            })?;
+        Ok(Adapter {
+            session,
+            reader: Some(reader),
+            index,
+            config: Tun {
+                address: Some(ip),
+                ..Tun::default()
+            },
+        })
+    }
+}
+
+impl Platform for Windows {
+    fn network(&self) -> io::Result<Network> {
+        let adapter = self.adapter.lock().unwrap();
+        let own = adapter.as_ref().map(|a| a.index);
+        let mut routes = Vec::new();
+        let mut gateways = Vec::new();
+        let mut ips = Vec::new();
+        unsafe {
+            let mut table = std::ptr::null_mut::<MIB_IPFORWARD_TABLE2>();
+            check(GetIpForwardTable2(AF_INET, &mut table))?;
+            for r in
+                std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
+            {
+                if Some(r.InterfaceIndex) == own {
+                    continue;
+                }
+                let prefix = r.DestinationPrefix;
+                let Ok(cidr) = Cidr::new(ipv4(prefix.Prefix), prefix.PrefixLength) else {
+                    continue;
+                };
+                routes.push(Underlay {
+                    cidr,
+                    index: r.InterfaceIndex,
+                    metric: r.Metric,
+                });
+                if cidr.prefix == 0 {
+                    gateways.push((r.InterfaceIndex, ipv4(r.NextHop)));
+                }
+            }
+            FreeMibTable(table.cast());
+            let mut table = std::ptr::null_mut::<MIB_UNICASTIPADDRESS_TABLE>();
+            check(GetUnicastIpAddressTable(AF_INET, &mut table))?;
+            for row in
+                std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
+            {
+                let ip = ipv4(row.Address);
+                if Some(row.InterfaceIndex) != own
+                    && !ip.is_loopback()
+                    && !ip.is_link_local()
+                    && !VIRTUAL.contains(ip)
+                {
+                    ips.push(ip);
+                }
+            }
+            FreeMibTable(table.cast());
+            let mut table = std::ptr::null_mut::<MIB_IPNET_TABLE2>();
+            let mut macs = Vec::new();
+            if GetIpNetTable2(AF_INET, &mut table) == 0 {
+                for row in std::slice::from_raw_parts(
+                    (*table).Table.as_ptr(),
+                    (*table).NumEntries as usize,
+                ) {
+                    let ip = ipv4(row.Address);
+                    if gateways.contains(&(row.InterfaceIndex, ip))
+                        && (1..=32).contains(&row.PhysicalAddressLength)
+                    {
+                        macs.push((
+                            row.InterfaceIndex,
+                            ip,
+                            hex::encode(&row.PhysicalAddress[..row.PhysicalAddressLength as usize]),
+                        ));
+                    }
+                }
+                FreeMibTable(table.cast());
+            }
+            gateways.sort_unstable();
+            macs.sort_unstable();
+            ips.sort_unstable();
+            ips.dedup();
+            routes.sort_unstable_by_key(|r| (r.cidr.ip, r.cidr.prefix, r.metric, r.index));
+            routes.dedup();
+            let marker = if gateways.is_empty() {
+                String::new()
+            } else {
+                format!("{gateways:?}/{macs:?}")
+            };
+            let info = Network {
+                routes,
+                marker,
+                addresses: ips,
+                dns: vec![],
+            };
+            *self.network.write().unwrap() = info.clone();
+            Ok(info)
+        }
+    }
+
+    fn protect(&self, socket: &Socket, target: Option<Ipv4Addr>) -> io::Result<()> {
+        let index = self.network.read().unwrap().bind_index(target);
+        if index == 0 {
+            return Err(io::Error::other("no underlay"));
+        }
+        let index = index.to_be();
+        if unsafe {
+            setsockopt(
+                socket.as_raw_socket() as usize,
+                IPPROTO_IP,
+                IP_UNICAST_IF,
+                (&index as *const u32).cast(),
+                std::mem::size_of_val(&index) as i32,
+            )
+        } == 0
+        {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+        }
+    }
+
+    fn apply(&self, tun: &Tun) -> io::Result<()> {
+        let mut active = self.adapter.lock().unwrap();
+        if active
+            .as_ref()
+            .is_some_and(|a| a.config.address != tun.address)
+        {
+            active.take();
+        }
+        let Some(ip) = tun.address else { return Ok(()) };
+        if active.is_none() {
+            *active = Some(self.adapter(ip)?);
+        }
+        let adapter = active.as_mut().unwrap();
+        let result = (|| {
+            for route in &adapter.config.routes {
+                if !tun.routes.contains(route) {
+                    unsafe {
+                        DeleteIpForwardEntry2(&route_row(adapter.index, *route));
+                    }
+                }
+            }
+            adapter.config.routes.retain(|r| tun.routes.contains(r));
+            for route in &tun.routes {
+                if !adapter.config.routes.contains(route) {
+                    check(unsafe { CreateIpForwardEntry2(&route_row(adapter.index, *route)) })?;
+                    adapter.config.routes.push(*route);
+                }
+            }
+            if adapter.config.dns != tun.dns {
+                nrpt(tun.dns)?;
+                adapter.config.dns = tun.dns;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            active.take();
+        }
+        result
+    }
+
+    fn write_packet(&self, bytes: &[u8]) {
+        if let Some(adapter) = self.adapter.lock().unwrap().as_ref()
+            && let Ok(mut packet) = adapter.session.allocate_send_packet(bytes.len() as u16)
+        {
+            packet.bytes_mut().copy_from_slice(bytes);
+            adapter.session.send_packet(packet);
+        }
+    }
+
+    fn set_input(&self, input: mpsc::Sender<Vec<u8>>) {
+        *self.input.lock().unwrap() = Some(input);
+    }
+}
+
+fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
+    s.as_ref().encode_wide().chain(Some(0)).collect()
+}
+
+pub fn elevate(path: &Path) -> io::Result<()> {
+    if !installed(path) {
+        return Err(io::Error::other(
+            "Fesen must be installed in Program Files",
+        ));
+    }
+    let verb = wide("runas");
+    let path = wide(path);
+    let code = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            path.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_HIDE,
+        )
+    };
+    if code as isize > 32 {
+        Ok(())
+    } else {
+        Err(io::Error::other("could not start Fesen core"))
+    }
+}
+
+unsafe fn light_taskbar() -> bool {
+    let key = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
+    let value = wide("SystemUsesLightTheme");
+    let mut data = 0u32;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let err = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            (&mut data as *mut u32).cast(),
+            &mut size,
+        )
+    };
+    err == 0 && data != 0
+}
+
+// Bagua 32x32 monochrome tray icon:
+// 2 = Gen ☶ (0b100, Life Gate / connected), 1 = Kan ☵ (0b010, connecting), 0 = Kun ☷ (0b000, Death Gate / idle).
+unsafe fn gen_tray_icon(visual: u8, light: bool) -> (HICON, bool) {
+    let (mask, alpha): (u8, u8) = match visual {
+        2 => (0b100, 255),
+        1 => (0b010, 215),
+        _ => (0b000, if light { 140 } else { 132 }),
+    };
+    let (r, g, b) = if light {
+        (17u8, 21u8, 19u8)
+    } else {
+        (248u8, 250u8, 252u8)
+    };
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: 32,
+            biHeight: -32,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            ..BITMAPINFOHEADER::default()
+        },
+        ..BITMAPINFO::default()
+    };
+    let mut bits = std::ptr::null_mut();
+    let dc = unsafe { GetDC(std::ptr::null_mut()) };
+    let color = unsafe {
+        CreateDIBSection(
+            dc,
+            &info,
+            DIB_RGB_COLORS,
+            &mut bits,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if !dc.is_null() {
+        unsafe { ReleaseDC(std::ptr::null_mut(), dc) };
+    }
+    if color.is_null() || bits.is_null() {
+        if !color.is_null() {
+            unsafe { DeleteObject(color) };
+        }
+        return (unsafe { LoadIconW(std::ptr::null_mut(), IDI_APPLICATION) }, false);
+    }
+    let pixels = unsafe { std::slice::from_raw_parts_mut(bits.cast::<u8>(), 32 * 32 * 4) };
+    pixels.fill(0);
+    let mut fill_rect = |x0: usize, y0: usize, x1: usize, y1: usize, a: u8| {
+        let pm = |c: u8| ((u16::from(c) * u16::from(a) + 127) / 255) as u8;
+        let bgra = [pm(b), pm(g), pm(r), a];
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = (y * 32 + x) * 4;
+                pixels[i..i + 4].copy_from_slice(&bgra);
+            }
+        }
+    };
+    for (bit, y0, y1) in [(4u8, 3usize, 9usize), (2, 13, 19), (1, 23, 29)] {
+        if (mask & bit) != 0 {
+            fill_rect(2, y0, 30, y1, alpha);
+        } else {
+            fill_rect(2, y0, 14, y1, alpha);
+            fill_rect(18, y0, 30, y1, alpha);
+        }
+    }
+    let mask_bits = [0u8; 32 * 4];
+    let hbm_mask = unsafe { CreateBitmap(32, 32, 1, 1, mask_bits.as_ptr().cast()) };
+    let icon = if hbm_mask.is_null() {
+        std::ptr::null_mut()
+    } else {
+        let ii = ICONINFO {
+            fIcon: 1,
+            xHotspot: 0,
+            yHotspot: 0,
+            hbmMask: hbm_mask,
+            hbmColor: color,
+        };
+        unsafe { CreateIconIndirect(&ii) }
+    };
+    if !hbm_mask.is_null() {
+        unsafe { DeleteObject(hbm_mask) };
+    }
+    unsafe { DeleteObject(color) };
+    if icon.is_null() {
+        (unsafe { LoadIconW(std::ptr::null_mut(), IDI_APPLICATION) }, false)
+    } else {
+        (icon, true)
+    }
+}
+
+fn core_visual_state(core: &Core) -> u8 {
+    let status = core.status();
+    if status.online {
+        2
+    } else if status.running {
+        1
+    } else {
+        0
+    }
+}
+
+struct TrayState {
+    core: Arc<Core>,
+    gui: PathBuf,
+    visual: Cell<u8>,
+    icon: Cell<HICON>,
+    custom_icon: Cell<bool>,
+}
+
+unsafe fn refresh_tray_icon(window: HWND, state: &TrayState, visual: u8) {
+    state.visual.set(visual);
+    let (next, owned) = unsafe { gen_tray_icon(visual, light_taskbar()) };
+    let data = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: window,
+        uID: 1,
+        uFlags: NIF_ICON,
+        hIcon: next,
+        ..NOTIFYICONDATAW::default()
+    };
+    unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
+    let old = state.icon.replace(next);
+    if state.custom_icon.replace(owned) && !old.is_null() {
+        unsafe { DestroyIcon(old) };
+    }
+}
+
+unsafe extern "system" fn tray_window(window: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe {
+        if message == WM_NCCREATE {
+            let creator = &*(l as *const CREATESTRUCTW);
+            SetWindowLongPtrW(window, GWLP_USERDATA, creator.lpCreateParams as isize);
+        }
+        if let Some(state) =
+            (GetWindowLongPtrW(window, GWLP_USERDATA) as *const TrayState).as_ref()
+        {
+            if message == TRAY_STATE_MESSAGE {
+                refresh_tray_icon(window, state, (w & 0xff) as u8);
+                return 0;
+            }
+            if message == WM_SETTINGCHANGE {
+                refresh_tray_icon(window, state, state.visual.get());
+                return 0;
+            }
+            if message == TRAY_MESSAGE {
+                let open = || {
+                    if let Ok(root) = os_dir(GetWindowsDirectoryW) {
+                        let _ = Command::new(root.join("explorer.exe"))
+                            .arg(&state.gui)
+                            .spawn();
+                    }
+                };
+                match l as u32 {
+                    WM_LBUTTONUP => open(),
+                    WM_RBUTTONUP => {
+                        let menu = CreatePopupMenu();
+                        let chinese = GetUserDefaultUILanguage() & 0x03ff == 0x04;
+                        let (show, stop) = if chinese {
+                            ("打开飞弦", "停止接入")
+                        } else {
+                            ("Open Fesen", "Disconnect")
+                        };
+                        AppendMenuW(menu, MF_STRING, 1, wide(show).as_ptr());
+                        AppendMenuW(menu, MF_STRING, 2, wide(stop).as_ptr());
+                        let mut at = POINT::default();
+                        GetCursorPos(&mut at);
+                        SetForegroundWindow(window);
+                        match TrackPopupMenu(
+                            menu,
+                            TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+                            at.x,
+                            at.y,
+                            0,
+                            window,
+                            std::ptr::null(),
+                        ) {
+                            1 => open(),
+                            2 => state.core.stop(),
+                            _ => {}
+                        }
+                        DestroyMenu(menu);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        DefWindowProcW(window, message, w, l)
+    }
+}
+
+pub async fn tray(core: Arc<Core>, gui: PathBuf) {
+    let (ready, rx) = tokio::sync::oneshot::channel::<(u32, usize)>();
+    let initial = core_visual_state(&core);
+    let tray_core = core.clone();
+    let thread = std::thread::spawn(move || unsafe {
+        let state = TrayState {
+            core: tray_core,
+            gui,
+            visual: Cell::new(initial),
+            icon: Cell::new(std::ptr::null_mut()),
+            custom_icon: Cell::new(false),
+        };
+        let instance = GetModuleHandleW(std::ptr::null());
+        let name = wide("fesen-core-menu");
+        let class = WNDCLASSW {
+            hInstance: instance,
+            lpszClassName: name.as_ptr(),
+            lpfnWndProc: Some(tray_window),
+            ..WNDCLASSW::default()
+        };
+        if RegisterClassW(&class) == 0 {
+            return;
+        }
+        let window = CreateWindowExW(
+            0,
+            name.as_ptr(),
+            name.as_ptr(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            instance,
+            (&state as *const TrayState).cast(),
+        );
+        if window.is_null() {
+            return;
+        }
+        let mut msg = MSG::default();
+        PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
+        let (hicon, owned) = gen_tray_icon(initial, light_taskbar());
+        state.icon.set(hicon);
+        state.custom_icon.set(owned);
+        let mut icon = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: window,
+            uID: 1,
+            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+            uCallbackMessage: TRAY_MESSAGE,
+            hIcon: hicon,
+            ..NOTIFYICONDATAW::default()
+        };
+        let chinese = GetUserDefaultUILanguage() & 0x03ff == 0x04;
+        let tip = wide(if chinese { "飞弦" } else { "Fesen" });
+        icon.szTip[..tip.len()].copy_from_slice(&tip);
+        Shell_NotifyIconW(NIM_ADD, &icon);
+        let _ = ready.send((GetCurrentThreadId(), window as usize));
+        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        Shell_NotifyIconW(NIM_DELETE, &icon);
+        let old = state.icon.replace(std::ptr::null_mut());
+        if state.custom_icon.replace(false) && !old.is_null() {
+            DestroyIcon(old);
+        }
+        DestroyWindow(window);
+    });
+    if let Ok((id, hwnd)) = rx.await {
+        let mut last = initial;
+        let mut tick = tokio::time::interval(Duration::from_secs(2));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let stopped = core.wait_stopped();
+        tokio::pin!(stopped);
+        loop {
+            tokio::select! {
+                () = &mut stopped => break,
+                _ = tick.tick() => {
+                    let current = core_visual_state(&core);
+                    if current != last {
+                        last = current;
+                        unsafe { PostMessageW(hwnd as HWND, TRAY_STATE_MESSAGE, usize::from(current), 0) };
+                    }
+                }
+            }
+        }
+        unsafe {
+            PostThreadMessageW(id, WM_QUIT, 0, 0);
+        }
+    }
+    let _ = tokio::task::spawn_blocking(move || thread.join().is_ok()).await;
+}
