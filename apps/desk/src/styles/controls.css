@@ -1,0 +1,147 @@
+.toast {
+  position: fixed;
+  z-index: 50;
+  left: 50%;
+  bottom: calc(18px + env(safe-area-inset-bottom, 0px));
+  transform: translate(-50%, 0);
+  width: max-content;
+  max-width: calc(100% - 32px);
+  padding: 8px 14px;
+  border-radius: 8px;
+  color: var(--on-action);
+  background: var(--action);
+  box-shadow: var(--shadow-toast);
+  font-size: 12.5px;
+  font-weight: 520;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+  opacity: 1;
+  transition: opacity 180ms var(--ease), transform 180ms var(--ease);
+}
+.toast.problem { color: var(--bad); background: var(--bad-bg); border: 1px solid color-mix(in srgb, var(--bad) 28%, transparent); }
+.toast:empty { opacity: 0; transform: translate(-50%, 6px); }
+
+.service-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex: none;
+}
+.service-actions .icon-btn,
+.port-actions .icon-btn,
+.host-controls .icon-btn {
+  --btn-sz: var(--btn-md);
+}
+
+/* Status & RTT indicator button (pure status + tabular RTT, right-aligned column) */
+.probe-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 58px;
+  height: var(--btn-md);
+  padding: 0 8px;
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  border: 0;
+  background: transparent;
+  color: var(--faint);
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+.probe-badge:hover:not(:disabled) { background: var(--soft); color: var(--ink); }
+.probe-badge.good { background: transparent; color: var(--muted); }
+.probe-badge.good::before { background: var(--good); }
+.probe-badge.warn { background: var(--warn-bg); color: var(--warn); }
+.probe-badge.bad { background: var(--bad-bg); color: var(--bad); }
+.probe-badge[data-pending="true"]::before { animation: fesen-dot-pulse 1s var(--ease) infinite; }
+
+.http-code {
+  display: inline-flex;
+  align-items: center;
+  height: calc(var(--count-h) - 1px);
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--soft);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  line-height: 1;
+  flex: none;
+}
+.http-code.bad {
+  background: var(--bad-bg);
+  color: var(--bad);
+}
+
+.probe-note {
+  width: 100%;
+  margin-top: 0;
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.probe-note.problem { color: var(--bad); }
+.port-row-wrap .probe-note { padding: 0 var(--pad-card-x) 6px; margin-top: 0; }
+.host-card.collapsible > .host-ports .port-row-wrap .probe-note,
+.host-sub-ports .port-row-wrap .probe-note { padding-left: var(--sub-indent); }
+
+/* Crisp 2-layer toggle switch */
+.switch {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  height: var(--btn-md);
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+.switch[data-offline="true"] { opacity: 0.48; }
+.switch[data-offline="true"]:hover { opacity: 0.72; }
+.switch-fraction {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-xs);
+  color: var(--faint);
+}
+.switch-track {
+  position: relative;
+  width: var(--sw-w);
+  height: var(--sw-h);
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: var(--track);
+  flex: none;
+  transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
+}
+.switch-track::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: var(--sw-thumb);
+  height: var(--sw-thumb);
+  border-radius: 50%;
+  background: var(--thumb-off);
+  box-shadow: var(--shadow-xs);
+  transition: transform var(--dur-mid) var(--ease), background var(--dur-fast) var(--ease);
+}
+.switch[aria-checked="true"] .switch-track { background: var(--good); border-color: var(--good); }
+.switch[aria-checked="true"] .switch-track::after { background: var(--thumb-on); transform: translateX(calc(var(--sw-w) - var(--sw-thumb) - 6px)); }
+.switch[data-partial="true"] .switch-track {
+  background: color-mix(in srgb, var(--good) 46%, var(--track));
+  border-color: color-mix(in srgb, var(--good) 60%, var(--line-strong));
+}
+.switch[data-partial="true"] .switch-track::after { background: var(--thumb-on); transform: translateX(calc((var(--sw-w) - var(--sw-thumb) - 6px) / 2)); }

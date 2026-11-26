@@ -1,0 +1,78 @@
+:root { --wrap: 960px; }
+@media (min-width: 1280px) { :root { --wrap: 1180px; } }
+@media (min-width: 1600px) { :root { --wrap: 1480px; } }
+@media (min-width: 1920px) { :root { --wrap: 1680px; } }
+@media (min-width: 2200px) { :root { --wrap: 2080px; } }
+.os-macos .topbar { position: sticky; }
+.os-macos .topbar::before {
+  content: "";
+  position: absolute;
+  left: 88px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 1px;
+  height: 16px;
+  background: var(--line-strong);
+  pointer-events: none;
+}
+.os-macos .topbar-inner {
+  width: 100%;
+  max-width: none;
+  min-height: 52px;
+  padding-inline: 100px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.os-macos .identity { gap: 9px; }
+.os-desktop:not(.os-macos) #brand-name { display: none; }
+.os-macos .brand-mark { pointer-events: none; }
+@media (max-width: 640px) {
+  .os-macos .topbar-inner { padding-inline: 100px 12px; }
+}
+@media (min-width: 1008px) {
+  .os-macos .topbar-inner {
+    width: min(calc(100% - 48px), var(--wrap));
+    max-width: var(--wrap);
+    padding-inline: max(0px, calc(100px - (100vw - var(--wrap)) / 2)) 0;
+  }
+}
+body {
+  padding-block: env(safe-area-inset-top, 0px) env(safe-area-inset-bottom, 0px);
+  padding-inline: env(safe-area-inset-left, 0px) env(safe-area-inset-right, 0px);
+}
+.workspace { padding-block: 12px 32px; }
+
+#editor {
+  width: min(calc(100% - 32px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px)), 420px);
+  max-height: calc(100dvh - 32px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+}
+@media (min-width: 720px) {
+  #editor.dialog-wide {
+    width: min(calc(100% - 48px), 720px);
+  }
+}
+@media (min-width: 1040px) {
+  #editor.dialog-wide {
+    width: min(calc(100% - 48px), 840px);
+  }
+}
+#editor[open] {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+#editor > form {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+#settings-dialog {
+  width: min(calc(100% - 32px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px)), 404px);
+  max-height: calc(100dvh - 32px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+}
+
+#error { margin-bottom: 14px; }
+.routing-note { margin-top: 12px; color: var(--muted); font-size: 12px; }

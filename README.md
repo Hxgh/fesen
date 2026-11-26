@@ -1,56 +1,43 @@
 # 飞弦（Fesen）
 
-一个自托管服务器就是一个组。成员用管理员分发的接入链接和账号登录，在「我的共享」发布 IPv4/TCP 服务，在「组内服务」访问其他成员的服务。不用两两配对，不用为应用配置代理。
+一个自托管服务器就是一个组。成员用接入链接和账号登录，即可在组内发布和访问 IPv4/TCP 服务——无需两两配对，无需为应用配置代理。
 
-支持现代主流平台：**Windows 10/11 (x64)**、**macOS 14+ (Apple Silicon)**、**Android 13+ (ARM64)**，服务端推荐在 **Linux** 上通过 Docker 运行。
+支持 **Windows 10/11 (x64)**、**macOS 14+ (Apple Silicon)**、**Android 13+ (ARM64)**；服务端推荐在 **Linux** 上通过 Docker 运行。
 
-无地址重叠时使用原 `IP:端口`；与本地网络重叠时，原地址继续走本地，用客户端显示的虚拟 IPv4 访问远端。可为指定 IPv4 设置 `名称.fesen`，端口保持不变。备注只改显示名。
+## 工作方式
 
-控制面是 Rust、SQLite 和 HTTPS/WSS；业务数据在两个设备间走双向认证的 QUIC，不经过服务端。共享局域网中的网站时，访问端直连发布端，发布端校验权限后，再向网站的真实 IP 和端口建立 TCP。NAT 或防火墙不允许直连时，客户端会报错，不改走中继。
+- **控制面（`apps/server`）**：Rust + SQLite，走 HTTPS/WSS。只负责身份认证、成员与设备管理、在线服务目录、候选地址交换（打洞信令）与账号配置同步，**不监听、不转发任何业务流量**。
+- **数据面（`apps/core`）**：两端直接建立双向 TLS 1.3 认证的 QUIC（UDP）直连。无地址重叠时直访原 `IP:端口`；本地网段重叠或同组多端同名碰撞时，原地址仍走本地，自动分配虚拟 IPv4（`198.18.x.y`）或 `.fesen` 别名，也可手动映射为本机 `127.0.0.1:<端口>`。无法直连时直接报错，不降级中转。
 
 ## 服务端部署
 
-Linux 推荐使用 Docker Compose；也可从 GitHub Releases 下载 Linux x64/arm64 独立二进制，或在其他平台执行 `cargo build --release -p fesen-server` 原生编译。
+Linux 推荐使用 Docker Compose（也支持 GitHub Releases 二进制或 `cargo build --release -p fesen-server`）：
 
-1. 把域名的 A 记录指向服务器，开放 TCP 80、443。默认不监听 UDP。
-2. 在仓库根目录运行（按需替换域名与镜像地址；省略 `FESEN_IMAGE` 时改用 `docker compose -f deploy/compose.yaml build` 本地源码构建）：
+```sh
+export FESEN_DOMAIN=group.example.com
+export FESEN_IMAGE=ghcr.io/<owner>/<repo>-server:latest
+docker compose -f deploy/compose.yaml pull
+docker compose -f deploy/compose.yaml run --rm server admin admin
+docker compose -f deploy/compose.yaml up -d
+```
 
-   ```sh
-   export FESEN_DOMAIN=group.example.com
-   export FESEN_IMAGE=ghcr.io/<owner>/<repo>-server:latest
-   docker compose -f deploy/compose.yaml pull
-   docker compose -f deploy/compose.yaml run --rm server admin admin
-   docker compose -f deploy/compose.yaml up -d
-   ```
+打开 `https://你的域名/admin/` 创建成员并分发接入链接（无注册入口）；保留 `state` 卷持久化数据。已有证书时可直接设置 `FESEN_TLS_CERT`、`FESEN_TLS_KEY`、`FESEN_ORIGIN`、`FESEN_LISTEN` 启动（支持证书热轮换，证书无效不退回明文），完整变量见 [`.env.example`](.env.example)。
 
-3. 打开 `https://你的域名/admin/`，创建成员账号，分发页面中的接入链接。没有注册接口。保留 `state` 卷以持久化账号、设备和会话。
+跨 IPv4 NAT 辅助探测默认关闭（macOS / Android 自动优先尝试公网 IPv6 直连），按需二选一：
+- **外部 STUN**：设 `FESEN_STUN=域名:端口`（中心仍仅开 HTTPS）。
+- **内置 UDP 探测**：Compose 加 `-f deploy/compose.udp.yaml` 并放行 `4455/UDP`（或单容器设 `FESEN_UDP` / `FESEN_PUBLIC_UDP_PORT`）。
 
-已有证书时也可用单容器或独立二进制：设置 `FESEN_TLS_CERT`、`FESEN_TLS_KEY`，将 `FESEN_ORIGIN` 设为对外 HTTPS 地址，`FESEN_LISTEN` 设为 HTTPS 监听地址。程序会检查证书文件轮换；证书无效时不会退回明文。完整变量示例见 [`.env.example`](.env.example)。
+## 客户端使用
 
-默认只交换设备自身的地址。macOS 和 Android 可经公网 IPv6 建立 QUIC 直连，共享目标仍是 IPv4/TCP。需要协助跨 IPv4 NAT 建连时，可二选一：
+从 GitHub Releases 下载安装包，或按 [构建与验收](docs/build.md) 源码构建。
 
-- 设置 `FESEN_STUN=域名:端口`，让客户端向指定 STUN 服务发现公网 IPv4/UDP 地址。中心仍只开 HTTPS；STUN 不接收账号、令牌或业务流量。
-- 自托管探测：Compose 命令加 `-f deploy/compose.udp.yaml`，并放行 `4455/UDP`。单容器可显式设置 `FESEN_UDP`；外部与监听端口不同时再设 `FESEN_PUBLIC_UDP_PORT`。
-
-## 客户端
-
-从 GitHub Releases 下载对应平台的安装包，或按 [构建、发布与验收](docs/build.md) 从源码构建。
-
-打开接入链接（也可粘贴到客户端）后登录。共享地址支持单个 IPv4、逗号清单、连字符范围及 CIDR；端口支持清单和范围。实际发布的是地址集合与端口集合的组合，只有地址和端口同时重叠才冲突。预设默认关闭，登录不会自动发布；控制连接失效或切换物理网络后需重新确认共享。
-
-「组内服务」中，点状态进行轻量探测：网站请求 `GET /`（正文最多读 64 KiB），普通 TCP 只检查建连。HTTP 302 只表示跳转，不等于页面已显示。点「网页测试」在应用内看真实页面；「我的共享」中的本机测试不代替另一台设备的验证。
-
-服务行的「⋯」可复制地址；HTTP 网站也可用系统浏览器打开。无重叠时用原地址，有重叠时用当前虚拟地址，范围共享先选择一对 IP 和端口。
-
-Android（13+）点「接入」建立系统 VPN，点「停止接入」释放 VPN；只打开界面不会接入。不申请通知权限，可从应用或系统快捷磁贴断开，且不接管默认流量。
-
-桌面关窗后图形界面与 WebView 进程退出，传输和发布由独立核心继续工作；macOS 使用原生菜单栏，Windows 使用系统托盘。macOS 未签名本地构建仅可发布，不安装本机访问路由。客户端诊断日志仅存本机，上限 10 MiB、最多保留 7 天，不记录密码、令牌或业务内容。
-
-仅支持 IPv4/TCP 业务，不改默认路由；同一原 IP 上的非共享端口仍走原网络，不转发 UDP/ICMP。Android 严格私人 DNS 或应用自带 DNS 可能绕过系统别名，此时可用虚拟 IPv4。单组并集上限 65,536 个 IPv4；本机虚拟池 `198.18.0.0/15` 不参与发布。
+- **统一目录与发布**：打开接入链接登录即可访问与发布（支持单 IP、范围、CIDR、端口清单，及单机只读端口发现）。管理员登录客户端可在顶栏直接切换至组管理台，无需二次登录。
+- **连通与预览**：点击服务状态徽章执行端到端协议探测（HTTP 校验 `GET /` 响应头与前 `8 KiB` 正文，SSH 读 Banner，RDP 走 X.224，HTTPS 验 TLS ServerHello，TCP/SMB 验建连）；行菜单 `⋯` 支持应用内网页预览、浏览器打开、复制命令/地址与 `127.0.0.1` 端口转换。
+- **生命周期与安全**：支持启动自动连接、同网安全恢复上次共享（换网自动拦截）与按设备 `machine_id` 云备份；桌面关窗后 GUI 退出而核心常驻（macOS 菜单栏 / Windows 托盘）；Android 按需启停系统 VPN 且不申请通知权限。日志仅存本机（上限 10 MiB / 7 天，不记录密码、令牌与业务内容）。
 
 ## 文档
 
-- [交付目标与验收](docs/plan.md)
+- [产品边界与验收](docs/plan.md)
 - [视觉与交互规范](docs/design.md)
 - [构建、发布与验收](docs/build.md)
 - [MIT License](LICENSE)

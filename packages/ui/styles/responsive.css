@@ -1,0 +1,63 @@
+@keyframes fesen-menu-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to { opacity: 1; transform: scale(1); }
+}
+@keyframes fesen-enter {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes fesen-dialog-in {
+  from { opacity: 0; transform: translateY(5px) scale(0.988); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes fesen-spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes fesen-dot-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
+@media (max-width: 640px) {
+  :root { --pad-card-x: 12px; }
+  :root[data-scale="sm"] { --pad-card-x: 10px; }
+  :root[data-scale="lg"] { --pad-card-x: 14px; }
+  .wrap { width: calc(100% - 24px); }
+  .topbar-inner { min-height: 50px; }
+  .topbar .button { height: var(--btn-lg); }
+  .host { display: none; }
+  .workspace { padding-top: 14px; }
+  .panel-bar { gap: 8px; }
+  .tabs { gap: 12px; }
+  .tabs button { min-height: calc(var(--ctl-input) - 2px); font-size: var(--fs-md); }
+  .signin { padding: 20px 16px; }
+  .field-pair { grid-template-columns: 1fr; }
+  .settings-row, .settings-account-top, .settings-account-btns { grid-template-columns: 1fr; gap: 6px; }
+  .settings-account-top .settings-account-info { text-align: start; }
+  .settings-btn-pair { grid-column: 1; }
+  .entity-row { padding: var(--pad-card-y) var(--pad-card-x); }
+  .service-row, .host-head { padding: var(--pad-card-y) var(--pad-card-x); gap: 6px 8px; }
+  .port-row { padding: 3px var(--pad-card-x); gap: 6px; }
+  .host-card.collapsible > .host-ports .port-row { padding-left: var(--sub-indent); }
+  .port-num { min-width: 44px; }
+}
+@media (pointer: coarse) {
+  .port-row { min-height: max(var(--row-port), 40px); padding-block: 5px; }
+  .service-row { min-height: max(var(--row-srv), 48px); }
+  .icon-btn.sm { --btn-sz: max(var(--btn-sm), 28px); }
+  .icon-btn.md { --btn-sz: max(var(--btn-md), 30px); }
+}
+@media (max-width: 440px) {
+  .toolbar { gap: 6px; }
+}
+@media (max-height: 520px) { .signin { margin-top: 12px; } }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .brand-mark[data-state="connecting"] .yao-top { opacity: var(--yao-idle); }
+  .brand-mark[data-state="connecting"] .yao-mid,
+  .brand-mark[data-state="connecting"] .yao-bot { opacity: 0.85; }
+}

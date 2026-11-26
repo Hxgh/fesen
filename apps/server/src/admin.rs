@@ -116,7 +116,15 @@ pub fn router() -> Router<App> {
                 static_asset(
                     "text/css; charset=utf-8",
                     concat!(
-                        include_str!("../../../packages/ui/base.css"),
+                        include_str!("../../../packages/ui/styles/tokens.css"),
+                        "\n",
+                        include_str!("../../../packages/ui/styles/layout.css"),
+                        "\n",
+                        include_str!("../../../packages/ui/styles/controls.css"),
+                        "\n",
+                        include_str!("../../../packages/ui/styles/surfaces.css"),
+                        "\n",
+                        include_str!("../../../packages/ui/styles/responsive.css"),
                         "\n",
                         include_str!("../web/style.css")
                     ),

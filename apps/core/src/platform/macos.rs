@@ -1,5 +1,10 @@
+mod ffi;
+#[cfg(test)]
+mod tests;
+
+pub use ffi::*;
+
 use super::{DeviceInfo, Network, Platform, Tun, Underlay, datagram6, hash_machine_id, unix_hostname};
-use crate::{Core, ipc};
 use fesen_acl::{Cidr, VIRTUAL};
 use fesen_proto::DeviceOs;
 use socket2::Socket;
@@ -9,13 +14,11 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket},
     os::fd::AsRawFd,
-    path::PathBuf,
     process::Command,
     sync::{
-        Arc, Mutex, OnceLock, RwLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Mutex, OnceLock, RwLock,
+        atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
 };
 use tokio::sync::mpsc;
 
@@ -510,257 +513,5 @@ impl Platform for Apple {
         if let Some(tunnel) = &self.tunnel {
             let _ = tunnel.input.set(input);
         }
-    }
-}
-
-fn runtime() -> io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-}
-
-pub fn publisher_dir() -> io::Result<PathBuf> {
-    std::env::home_dir()
-        .filter(|p| p.is_absolute())
-        .map(|p| p.join("Library/Application Support/io.fesen.client/publisher"))
-        .ok_or_else(|| io::Error::other("home directory unavailable"))
-}
-
-struct Publisher {
-    host: Arc<Apple>,
-    core: Arc<Core>,
-}
-
-static PUBLISHER: OnceLock<Publisher> = OnceLock::new();
-static STOP_PUBLISHER: AtomicBool = AtomicBool::new(false);
-
-fn serve_publisher() -> io::Result<()> {
-    let dir = publisher_dir()?;
-    let runtime = runtime()?;
-    let result = runtime.block_on(async {
-        let endpoint = ipc::Endpoint::bind(&dir).await?;
-        let host = Arc::new(Apple::new(None));
-        let core = Core::new(dir, host.clone(), false)?;
-        PUBLISHER
-            .set(Publisher {
-                host,
-                core: core.clone(),
-            })
-            .map_err(|_| io::Error::other("publisher already started"))?;
-        if STOP_PUBLISHER.load(Ordering::Acquire) {
-            core.stop();
-        }
-        endpoint.serve(core).await;
-        Ok(())
-    });
-    runtime.shutdown_timeout(Duration::from_secs(4));
-    result
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn ph_publisher_run() {
-    let _ = serve_publisher();
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn ph_publisher_changed() {
-    if let Some(p) = PUBLISHER.get() {
-        p.host.physical_event.fetch_add(1, Ordering::Release);
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn ph_publisher_stop() {
-    STOP_PUBLISHER.store(true, Ordering::Release);
-    if let Some(p) = PUBLISHER.get() {
-        p.core.stop();
-    }
-}
-
-pub struct Engine {
-    core: Arc<Core>,
-    host: Arc<Apple>,
-    runtime: tokio::runtime::Runtime,
-}
-
-/// # Safety
-/// The path is a NUL-terminated string. Callbacks and their context must remain valid until stop returns.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ph_core_start(
-    path: *const c_char,
-    context: usize,
-    adjust: Apply,
-    output: Callback,
-    expired: Expired,
-) -> *mut Engine {
-    if path.is_null() {
-        return std::ptr::null_mut();
-    }
-    let Ok(path) = (unsafe { CStr::from_ptr(path) }).to_str() else {
-        return std::ptr::null_mut();
-    };
-    let host = Arc::new(Apple::new(Some(TunnelIo {
-        context,
-        adjust,
-        output,
-        input: OnceLock::new(),
-    })));
-    let Ok(runtime) = runtime() else {
-        return std::ptr::null_mut();
-    };
-    let core = {
-        let _enter = runtime.enter();
-        match Core::new(PathBuf::from(path), host.clone(), false) {
-            Ok(core) => core,
-            Err(_) => return std::ptr::null_mut(),
-        }
-    };
-    let watched = core.clone();
-    runtime.spawn(async move {
-        watched.wait_stopped().await;
-        unsafe { expired(context) };
-    });
-    Box::into_raw(Box::new(Engine {
-        core,
-        host,
-        runtime,
-    }))
-}
-
-/// # Safety
-/// Engine must be live. Bytes must be readable for len bytes; reply must retain its context until called.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ph_core_call(
-    engine: *mut Engine,
-    bytes: *const u8,
-    len: usize,
-    context: usize,
-    reply: Callback,
-) {
-    if engine.is_null() || bytes.is_null() || len > 65536 {
-        unsafe { reply(context, b"{}".as_ptr(), 2) };
-        return;
-    }
-    let engine = unsafe { &*engine };
-    let data = unsafe { std::slice::from_raw_parts(bytes, len) }.to_vec();
-    let core = engine.core.clone();
-    engine.runtime.spawn(async move {
-        let bytes = ipc::dispatch_bytes(&core, &data).await;
-        unsafe { reply(context, bytes.as_ptr(), bytes.len()) };
-    });
-}
-
-/// # Safety
-/// Engine must be live and bytes readable for len bytes.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ph_core_packet(engine: *mut Engine, bytes: *const u8, len: usize) {
-    if engine.is_null() || bytes.is_null() || !(20..=super::MTU).contains(&len) {
-        return;
-    }
-    let e = unsafe { &*engine };
-    if let Some(tunnel) = &e.host.tunnel
-        && let Some(tx) = tunnel.input.get()
-    {
-        let _ = tx.try_send(unsafe { std::slice::from_raw_parts(bytes, len) }.to_vec());
-    }
-}
-
-/// # Safety
-/// Engine must be live.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ph_core_changed(engine: *mut Engine) {
-    if let Some(e) = unsafe { engine.as_ref() } {
-        e.host.physical_event.fetch_add(1, Ordering::Release);
-    }
-}
-
-/// # Safety
-/// Stop once after all foreign calls into this engine have returned.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ph_core_stop(engine: *mut Engine) {
-    if engine.is_null() {
-        return;
-    }
-    let e = unsafe { Box::from_raw(engine) };
-    e.core.stop();
-    e.runtime.block_on(e.core.wait_stopped());
-    e.runtime.shutdown_timeout(Duration::from_secs(4));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parse_netstat_cidr(destination: &str) -> Option<Cidr> {
-        if destination == "default" {
-            return Cidr::new(Ipv4Addr::UNSPECIFIED, 0).ok();
-        }
-        let (ip, prefix) = if let Some((ip, prefix)) = destination.split_once('/') {
-            (ip, Some(prefix.parse().ok()?))
-        } else {
-            (destination, None)
-        };
-        let mut octets = [0u8; 4];
-        let mut length = 0;
-        for (i, v) in ip.split('.').enumerate() {
-            *octets.get_mut(i)? = v.parse().ok()?;
-            length += 1;
-        }
-        Cidr::new(octets.into(), prefix.unwrap_or(8 * length)).ok()
-    }
-
-    #[test]
-    fn sysctl_route_snapshot_matches_live_macos_network() {
-        let apple = Apple::new(None);
-        let t0 = std::time::Instant::now();
-        let net = apple.network().unwrap();
-        let elapsed = t0.elapsed();
-
-        let table = command("/usr/sbin/netstat", &["-rn", "-f", "inet"]).unwrap();
-        let mut expected_routes = Vec::new();
-        let mut expected_identity = Vec::new();
-        for line in table.lines() {
-            let row: Vec<_> = line.split_whitespace().collect();
-            if row.len() < 4 || row[2].contains('W') || !row[2].contains('U') {
-                continue;
-            }
-            let Some(cidr) = parse_netstat_cidr(row[0]) else {
-                continue;
-            };
-            let name = std::ffi::CString::new(row[3]).unwrap();
-            let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
-            if index == 0 {
-                continue;
-            }
-            if cidr.prefix == 0 && !row[3].starts_with("utun") {
-                expected_identity.push(format!("{}:{}", row[3], row[1]));
-            }
-            expected_routes.push(Underlay {
-                cidr,
-                index,
-                metric: if row[2].contains('I') { 1 } else { 0 },
-            });
-        }
-        expected_routes.sort_unstable_by_key(|r| (r.cidr.ip, r.cidr.prefix, r.metric, r.index));
-        expected_routes.dedup();
-        expected_identity.sort_unstable();
-
-        let expected_marker = if !expected_identity.is_empty() && !net.addresses.is_empty() {
-            format!("{expected_identity:?}/0")
-        } else {
-            String::new()
-        };
-        eprintln!(
-            "sysctl_route_snapshot elapsed={elapsed:?}, routes={} (netstat={})",
-            net.routes.len(),
-            expected_routes.len()
-        );
-        assert_eq!(net.marker, expected_marker);
-        assert_eq!(net.routes, expected_routes);
-        assert!(
-            elapsed < Duration::from_millis(50),
-            "sysctl network snapshot took too long: {elapsed:?}"
-        );
     }
 }

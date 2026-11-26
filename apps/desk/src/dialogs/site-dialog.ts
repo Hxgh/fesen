@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { onBackButtonPress } from "@tauri-apps/api/app";
-import { failure, t } from "./i18n";
-import { icon, setIconButton } from "../../../packages/ui/icons.js";
+import { failure, t } from "../i18n";
+import { icon, setIconButton } from "../../../../packages/ui/icons.js";
 
 const dialog = document.querySelector<HTMLDialogElement>("#site-dialog")!;
 const stage = dialog.querySelector<HTMLElement>("#site-stage")!;
@@ -13,7 +13,8 @@ const retry = dialog.querySelector<HTMLButtonElement>("#site-retry")!;
 const expand = dialog.querySelector<HTMLButtonElement>("#site-expand")!;
 
 let expanded = false;
-let attempt = 0, sequence = Date.now();
+let attempt = 0;
+let sequence = Date.now();
 let invalidate: (() => boolean) | undefined;
 
 function setBtn(btn: HTMLButtonElement, name: Parameters<typeof icon>[0], label: string) {
@@ -42,13 +43,15 @@ dialog.addEventListener("click", (event) => {
 });
 
 const bounds = () => {
-  const r = stage.getBoundingClientRect(), s = devicePixelRatio;
-  return [r.x, r.y, r.width, r.height].map(n => Math.max(0, Math.round(n * s)));
+  const r = stage.getBoundingClientRect();
+  const s = devicePixelRatio;
+  return [r.x, r.y, r.width, r.height].map((n) => Math.max(0, Math.round(n * s)));
 };
 const action = (op: string, id: number, extra = {}) =>
   invoke<string>("site_view", { op, attempt: id, ...extra });
 const stop = () => {
-  const id = attempt; attempt = 0;
+  const id = attempt;
+  attempt = 0;
   if (id) void action("close", id).catch(() => {});
 };
 const move = () => { if (attempt) void action("move", attempt, { bounds: bounds() }).catch(() => {}); };
@@ -79,8 +82,13 @@ export function checkSiteDialog() {
 }
 
 type Target = { id: string; owner: string | null; ip: string; port: number };
-export function showSiteDialog(target: Target, access: string, valid: () => boolean,
-  report: (result: "visible" | { error: string }) => void, accessPort?: number) {
+export function showSiteDialog(
+  target: Target,
+  access: string,
+  valid: () => boolean,
+  report: (result: "visible" | { error: string }) => void,
+  accessPort?: number,
+) {
   stop();
   invalidate = valid;
   retry.disabled = false;
@@ -93,12 +101,13 @@ export function showSiteDialog(target: Target, access: string, valid: () => bool
   dialog.focus();
   if (/Android/i.test(navigator.userAgent)) {
     const handler = onBackButtonPress(() => { if (dialog.open) dialog.close(); });
-    dialog.addEventListener("close", () => { void handler.then(h => h.unregister()).catch(() => {}); }, { once: true });
+    dialog.addEventListener("close", () => { void handler.then((h) => h.unregister()).catch(() => {}); }, { once: true });
     void handler.catch(() => {});
   }
   async function load() {
     stop();
-    const id = ++sequence; attempt = id;
+    const id = ++sequence;
+    attempt = id;
     const current = () => dialog.open && attempt === id && valid();
     setState("loading", t("page_loading"));
     stage.textContent = "";
@@ -119,7 +128,7 @@ export function showSiteDialog(target: Target, access: string, valid: () => bool
           return;
         }
         if (outcome !== "loading") throw outcome;
-        await new Promise(resolve => setTimeout(resolve, 300));
+        await new Promise((resolve) => setTimeout(resolve, 300));
       }
       if (current()) throw "page_not_rendered";
     } catch (e) {

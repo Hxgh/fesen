@@ -1,0 +1,80 @@
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body {
+  min-height: 100dvh;
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+h1, h2, h3, p, dl, dd { margin: 0; }
+a { color: var(--ink); text-underline-offset: 3px; }
+:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 62%, transparent); outline-offset: 2px; }
+dialog:focus { outline: none; }
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+.wrap { width: min(calc(100% - 48px), var(--wrap, 900px)); margin-inline: auto; }
+.topbar {
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface) 90%, transparent);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+.topbar-inner, .toolbar { display: flex; align-items: center; gap: 8px; }
+.topbar-inner { min-height: 52px; justify-content: space-between; }
+.toolbar-sep {
+  width: 1px;
+  height: 16px;
+  flex: none;
+  margin-inline: 2px;
+  background: var(--line-strong);
+}
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--ink);
+  text-decoration: none;
+  font-size: var(--fs-lg);
+  line-height: 1;
+  font-weight: 660;
+  letter-spacing: -0.02em;
+}
+
+/* Reusable Bagua brand mark: organic 2-stroke fusion + active-yao ink breath (Kun ☷ -> evolution -> Gen ☶) */
+.brand-mark { display: block; width: 20px; height: 20px; flex: none; color: var(--ink); transition: opacity 280ms var(--ease); }
+.brand-mark[data-state="idle"] { opacity: var(--yao-idle); }
+.brand-mark[data-state="connecting"] { opacity: 1; }
+.brand-mark[data-state="ready"],
+.brand-mark[data-state="active"] { opacity: 1; }
+.brand-mark g { transition: opacity 260ms var(--ease); }
+.brand-mark[data-state="connecting"] g { opacity: var(--yao-dim); }
+.brand-mark[data-state="connecting"] g[data-hot="1"] { opacity: 1; }
+.brand-mark .yao-l,
+.brand-mark .yao-r {
+  transform-box: fill-box;
+  transition: transform 280ms var(--ease);
+}
+.brand-mark .yao-l { transform-origin: left center; transform: scaleX(0.8571429); }
+.brand-mark .yao-r { transform-origin: right center; transform: scaleX(0.8571429); }
+.brand-mark g[data-yang="1"] .yao-l,
+.brand-mark g[data-yang="1"] .yao-r {
+  transform: scaleX(1);
+}
+
+.identity { min-width: 0; display: flex; align-items: center; gap: 10px; }
+.host {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--faint);
+  font-size: var(--fs-sm);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.icon { flex: none; width: var(--ico-md); height: var(--ico-md); }
+.spin { animation: fesen-spin 700ms linear infinite; }

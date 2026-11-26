@@ -1,0 +1,226 @@
+/* ==========================================================================
+   Fesen Design System — Single Source of Truth Tokens
+   Architecture:
+     1. Brand & palette primitives (--fesen-*)
+     2. Elevation, motion, radius & typography/control scales (sm / md / lg)
+     3. Semantic surface, text & status roles (Warm Xuan Paper / Pine-Soot Ink)
+   All components across Client & Web /admin/ must consume semantic tokens only.
+   ========================================================================== */
+
+:root {
+  color-scheme: light dark;
+
+  /* 1. Brand identity & palette primitives */
+  --fesen-gold: #c7a96b;
+  --fesen-gold-deep: #8a6e35;
+  --fesen-gold-hover-light: #b89858;
+  --fesen-gold-hover-dark: #d4b97e;
+  --fesen-gold-ink-light: #1a160f;
+  --fesen-gold-ink-dark: #14110b;
+  --fesen-amber-light: #b7791f;
+  --fesen-amber-dark: #e0a952;
+  --fesen-vermilion-light: #c03939;
+  --fesen-vermilion-dark: #e06c6c;
+  --fesen-white: #ffffff;
+
+  /* 2. Typography & proportional element scale (default: md / 标准) */
+  --fs-xs: 11.5px;
+  --fs-sm: 12.5px;
+  --fs-md: 13.5px;
+  --fs-base: 14.5px;
+  --fs-lg: 16px;
+  --fs-xl: 18px;
+  --ctl-sm: 30px;
+  --ctl-md: 32px;
+  --ctl-input: 38px;
+  --btn-sm: 26px;
+  --btn-md: 28px;
+  --btn-lg: 32px;
+  --ico-sm: 14.5px;
+  --ico-md: 15px;
+  --ico-lg: 16px;
+  --os-w: 22px;
+  --os-h: 20px;
+  --os-ico: 13.5px;
+  --chev-sz: 14px;
+  --count-h: 19px;
+  --sw-w: 36px;
+  --sw-h: 20px;
+  --sw-thumb: 14px;
+  --pad-card-x: 14px;
+  --pad-card-y: 9px;
+  --sub-indent: calc(var(--pad-card-x) + var(--chev-sz) + 6px);
+  --row-port: 38px;
+  --row-flat: 40px;
+  --row-sub: 44px;
+  --row-srv: 50px;
+  --settings-w: 424px;
+  --settings-ctl: 224px;
+
+  font: var(--fs-md)/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  -webkit-text-size-adjust: 100%;
+  --mono: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+
+  /* 3. Shape, motion, Bagua ink & elevation tokens */
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 12px;
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --dur-fast: 140ms;
+  --dur-mid: 200ms;
+  --yao-idle: 0.42;
+  --yao-dim: 0.38;
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.14);
+  --shadow-sm: 0 8px 28px rgba(0, 0, 0, 0.06);
+  --shadow-md: 0 12px 32px rgba(0, 0, 0, 0.22);
+  --shadow-lg: 0 20px 60px rgba(0, 0, 0, 0.32);
+  --shadow-toast: 0 8px 24px rgba(0, 0, 0, 0.24);
+  --scrim: rgba(0, 0, 0, 0.48);
+
+  /* 4. Semantic roles — Light theme (Warm Xuan Paper) */
+  --bg: #f7f5f0;
+  --surface: var(--fesen-white);
+  --soft: #efece5;
+  --track: #eae6dd;
+  --elevated: var(--fesen-white);
+  --thumb-off: var(--fesen-white);
+  --thumb-on: var(--fesen-white);
+  --line: #e3dfd5;
+  --line-strong: #cec8ba;
+  --ink: #1a1815;
+  --muted: #635f56;
+  --faint: #8e897e;
+
+  --accent: var(--fesen-gold);
+  --accent-ink: var(--fesen-gold-deep);
+  --tint: rgba(199, 169, 107, 0.14);
+  --action: var(--accent);
+  --action-hover: var(--fesen-gold-hover-light);
+  --on-action: var(--fesen-gold-ink-light);
+
+  --good: var(--accent);
+  --good-ink: var(--accent-ink);
+  --good-bg: var(--tint);
+  --warn: var(--fesen-amber-light);
+  --warn-bg: #fdf5e6;
+  --bad: var(--fesen-vermilion-light);
+  --bad-bg: #fdf0f0;
+}
+
+:root[data-scale="sm"] {
+  --fs-xs: 10.5px;
+  --fs-sm: 11.5px;
+  --fs-md: 12.5px;
+  --fs-base: 13.5px;
+  --fs-lg: 15px;
+  --fs-xl: 17px;
+  --ctl-sm: 28px;
+  --ctl-md: 30px;
+  --ctl-input: 34px;
+  --btn-sm: 24px;
+  --btn-md: 26px;
+  --btn-lg: 28px;
+  --ico-sm: 13px;
+  --ico-md: 14px;
+  --ico-lg: 15px;
+  --os-w: 20px;
+  --os-h: 18px;
+  --os-ico: 12px;
+  --chev-sz: 13px;
+  --count-h: 17px;
+  --sw-w: 32px;
+  --sw-h: 18px;
+  --sw-thumb: 12px;
+  --pad-card-x: 12px;
+  --pad-card-y: 7px;
+  --row-port: 34px;
+  --row-flat: 36px;
+  --row-sub: 40px;
+  --row-srv: 46px;
+  --settings-w: 404px;
+  --settings-ctl: 208px;
+}
+
+:root[data-scale="lg"] {
+  --fs-xs: 12.5px;
+  --fs-sm: 13.5px;
+  --fs-md: 15px;
+  --fs-base: 16px;
+  --fs-lg: 17.5px;
+  --fs-xl: 20px;
+  --ctl-sm: 34px;
+  --ctl-md: 36px;
+  --ctl-input: 42px;
+  --btn-sm: 30px;
+  --btn-md: 32px;
+  --btn-lg: 36px;
+  --ico-sm: 16px;
+  --ico-md: 17px;
+  --ico-lg: 18px;
+  --os-w: 25px;
+  --os-h: 23px;
+  --os-ico: 15.5px;
+  --chev-sz: 16px;
+  --count-h: 21px;
+  --sw-w: 40px;
+  --sw-h: 22px;
+  --sw-thumb: 16px;
+  --pad-card-x: 16px;
+  --pad-card-y: 11px;
+  --row-port: 44px;
+  --row-flat: 46px;
+  --row-sub: 50px;
+  --row-srv: 56px;
+  --settings-w: 464px;
+  --settings-ctl: 248px;
+}
+
+/* Dark theme (Pine-Soot Ink): automatic via OS preference (including JS-free /join) */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #0c0d0c;
+    --surface: #141514;
+    --soft: #1c1e1c;
+    --track: #0e0f0e;
+    --elevated: #242623;
+    --thumb-off: #9e9a90;
+    --line: #252724;
+    --line-strong: #373934;
+    --ink: #f2efe9;
+    --muted: #969289;
+    --faint: #67645c;
+    --accent-ink: var(--accent);
+    --tint: rgba(199, 169, 107, 0.13);
+    --action-hover: var(--fesen-gold-hover-dark);
+    --on-action: var(--fesen-gold-ink-dark);
+    --warn: var(--fesen-amber-dark);
+    --warn-bg: rgba(224, 169, 82, 0.14);
+    --bad: var(--fesen-vermilion-dark);
+    --bad-bg: rgba(224, 108, 108, 0.14);
+  }
+}
+
+/* Explicit dark override when user selects Dark on a Light OS */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0c0d0c;
+  --surface: #141514;
+  --soft: #1c1e1c;
+  --track: #0e0f0e;
+  --elevated: #242623;
+  --thumb-off: #9e9a90;
+  --line: #252724;
+  --line-strong: #373934;
+  --ink: #f2efe9;
+  --muted: #969289;
+  --faint: #67645c;
+  --accent-ink: var(--accent);
+  --tint: rgba(199, 169, 107, 0.13);
+  --action-hover: var(--fesen-gold-hover-dark);
+  --on-action: var(--fesen-gold-ink-dark);
+  --warn: var(--fesen-amber-dark);
+  --warn-bg: rgba(224, 169, 82, 0.14);
+  --bad: var(--fesen-vermilion-dark);
+  --bad-bg: rgba(224, 108, 108, 0.14);
+}

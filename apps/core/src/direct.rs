@@ -1,188 +1,39 @@
+mod membership;
+#[cfg(test)]
+mod tests;
+
+pub(crate) use membership::crypto_provider;
+pub use membership::{Allowed, Membership};
+
 use crate::{
     local::Identity,
     platform::{self, Platform},
     stun,
 };
-use futures_util::{StreamExt, stream::FuturesUnordered};
 use fesen_proto::{
     ALPN, CERT_NAME, Code, MAX_CANDIDATES, MAX_IPV6_CANDIDATES, Open, Peer, candidate, candidate6,
     stun_endpoint,
 };
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use quinn::{
     Connection, Endpoint, RecvStream, Runtime, SendStream,
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
 };
-use rustls::{
-    DigitallySignedStruct, DistinguishedName, RootCertStore, SignatureScheme,
-    client::danger::HandshakeSignatureValid,
-    crypto::{ring, verify_tls12_signature, verify_tls13_signature},
-    pki_types::{CertificateDer, UnixTime},
-    server::danger::{ClientCertVerified, ClientCertVerifier},
-};
+use rustls::{RootCertStore, pki_types::CertificateDer};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
     collections::HashMap,
     io,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket},
-    sync::{Arc, Mutex, OnceLock, RwLock},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::Semaphore,
-    time::{Instant, timeout},
+    time::timeout,
 };
 use tokio_util::sync::CancellationToken;
-
-pub(crate) fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
-    static PROVIDER: OnceLock<Arc<rustls::crypto::CryptoProvider>> = OnceLock::new();
-    PROVIDER
-        .get_or_init(|| Arc::new(ring::default_provider()))
-        .clone()
-}
-
-#[derive(Debug, Clone)]
-pub struct Allowed {
-    pub certificate: Arc<[u8]>,
-    pub cancel: CancellationToken,
-}
-
-#[derive(Debug, Default)]
-struct Lease {
-    peers: HashMap<String, Allowed>,
-    by_cert: HashMap<Arc<[u8]>, String>,
-    expires: Option<Instant>,
-}
-
-#[derive(Debug, Default)]
-pub struct Membership(RwLock<Lease>);
-
-impl Membership {
-    pub fn renew(&self, peers: Vec<Peer>) {
-        let mut lease = self.0.write().unwrap();
-        let mut old = std::mem::take(&mut lease.peers);
-        lease.by_cert.clear();
-        lease.peers.reserve(peers.len());
-        lease.by_cert.reserve(peers.len());
-        for p in peers {
-            let prior = old.remove(&p.id);
-            let valid = match prior {
-                Some(v)
-                    if v.certificate.as_ref() == p.certificate.as_slice()
-                        && !v.cancel.is_cancelled() =>
-                {
-                    v
-                }
-                stale => {
-                    if let Some(v) = stale {
-                        v.cancel.cancel();
-                    }
-                    Allowed {
-                        certificate: Arc::from(p.certificate),
-                        cancel: CancellationToken::new(),
-                    }
-                }
-            };
-            lease.by_cert.insert(valid.certificate.clone(), p.id.clone());
-            lease.peers.insert(p.id, valid);
-        }
-        lease.expires = Some(Instant::now() + fesen_proto::LEASE);
-        drop(lease);
-        for p in old.into_values() {
-            p.cancel.cancel();
-        }
-    }
-
-    pub fn invalidate(&self) {
-        let mut lease = self.0.write().unwrap();
-        lease.expires = None;
-        lease.by_cert.clear();
-        for p in lease.peers.drain().map(|(_, p)| p) {
-            p.cancel.cancel();
-        }
-    }
-
-    pub fn is_fresh(&self) -> bool {
-        self.0
-            .read()
-            .unwrap()
-            .expires
-            .is_some_and(|expires| Instant::now() < expires)
-    }
-
-    pub fn peer(&self, peer: &str) -> Option<Allowed> {
-        let lease = self.0.read().unwrap();
-        lease.expires.filter(|until| Instant::now() < *until)?;
-        lease.peers.get(peer).cloned()
-    }
-
-    pub fn certificate(&self, cert: &[u8]) -> Option<Allowed> {
-        let lease = self.0.read().unwrap();
-        lease.expires.filter(|until| Instant::now() < *until)?;
-        let id = lease.by_cert.get(cert)?;
-        lease.peers.get(id).cloned()
-    }
-}
-
-impl ClientCertVerifier for Membership {
-    fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        &[]
-    }
-
-    fn verify_client_cert(
-        &self,
-        leaf: &CertificateDer<'_>,
-        chain: &[CertificateDer<'_>],
-        _: UnixTime,
-    ) -> Result<ClientCertVerified, rustls::Error> {
-        if chain.is_empty() && self.certificate(leaf.as_ref()).is_some() {
-            Ok(ClientCertVerified::assertion())
-        } else {
-            Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::UnknownIssuer,
-            ))
-        }
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        msg: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls12_signature(
-            msg,
-            cert,
-            dss,
-            &crypto_provider().signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        msg: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls13_signature(
-            msg,
-            cert,
-            dss,
-            &crypto_provider().signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        static SCHEMES: OnceLock<Vec<SignatureScheme>> = OnceLock::new();
-        SCHEMES
-            .get_or_init(|| {
-                crypto_provider()
-                    .signature_verification_algorithms
-                    .supported_schemes()
-            })
-            .clone()
-    }
-}
 
 type ConnectionSlot = Arc<tokio::sync::Mutex<Option<Connection>>>;
 
@@ -616,231 +467,4 @@ pub async fn open(conn: &Connection, req: Open) -> Result<(SendStream, RecvStrea
     })
     .await
     .map_err(|_| Code::DirectFailed)?
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct DualPath;
-
-    impl Platform for DualPath {
-        fn network(&self) -> io::Result<platform::Network> {
-            Ok(platform::Network::default())
-        }
-        fn protect(&self, _: &socket2::Socket, _: Option<Ipv4Addr>) -> io::Result<()> {
-            Ok(())
-        }
-        fn alternate_udp(&self) -> Option<(UdpSocket, Vec<Ipv4Addr>)> {
-            Some((
-                platform::datagram(|_| Ok(())).ok()?,
-                vec![Ipv4Addr::new(192, 168, 3, 9)],
-            ))
-        }
-        fn ipv6_udp(&self) -> Option<(UdpSocket, Vec<std::net::Ipv6Addr>)> {
-            Some((
-                platform::datagram6(|_| Ok(())).ok()?,
-                vec!["2001:db8::1".parse().unwrap()],
-            ))
-        }
-        fn apply(&self, _: &platform::Tun) -> io::Result<()> {
-            Ok(())
-        }
-        fn write_packet(&self, _: &[u8]) {}
-        fn set_input(&self, _: tokio::sync::mpsc::Sender<Vec<u8>>) {}
-    }
-
-    #[tokio::test]
-    async fn alternate_candidates_advertise_and_accept_on_their_own_socket() {
-        let origin = Identity::new().unwrap();
-        let target = Identity::new().unwrap();
-        let sender =
-            Direct::new(origin.clone(), &DualPath, CancellationToken::new(), false).unwrap();
-        let receiver =
-            Direct::new(target.clone(), &DualPath, CancellationToken::new(), false).unwrap();
-        receiver.renew(vec![Peer {
-            id: "sender".into(),
-            certificate: origin.cert,
-        }]);
-        sender.renew(vec![Peer {
-            id: "receiver".into(),
-            certificate: target.cert,
-        }]);
-        let candidates = receiver.candidates(vec![Ipv4Addr::new(10, 1, 0, 1)]);
-        assert_eq!(candidates.len(), 2);
-        assert_ne!(candidates[0].port(), candidates[1].port());
-        assert_eq!(*candidates[1].ip(), Ipv4Addr::new(192, 168, 3, 9));
-        let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, candidates[1].port());
-        let accepting = async {
-            let connection = receiver.accept().await.unwrap().await.unwrap();
-            assert!(receiver.identify(&connection).is_some());
-            connection
-        };
-        let dialing = sender.connect("receiver", || async { Ok(vec![address.into()]) });
-        let (outgoing, _) = timeout(Duration::from_secs(5), async {
-            tokio::join!(dialing, accepting)
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            outgoing.unwrap().0.remote_address(),
-            SocketAddr::V4(address)
-        );
-        sender.close();
-        receiver.close();
-    }
-
-    #[tokio::test]
-    async fn ipv6_transport_authenticates_and_carries_an_ipv4_target() {
-        let caller = Identity::new().unwrap();
-        let publisher = Identity::new().unwrap();
-        let sender =
-            Direct::new(caller.clone(), &DualPath, CancellationToken::new(), false).unwrap();
-        let receiver = Direct::new(
-            publisher.clone(),
-            &DualPath,
-            CancellationToken::new(),
-            false,
-        )
-        .unwrap();
-        sender.renew(vec![Peer {
-            id: "publisher".into(),
-            certificate: publisher.cert,
-        }]);
-        receiver.renew(vec![Peer {
-            id: "caller".into(),
-            certificate: caller.cert,
-        }]);
-        let advertised = receiver.candidates6();
-        assert_eq!(advertised.len(), 1);
-        assert_eq!(advertised[0].ip().to_string(), "2001:db8::1");
-        let loopback = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, advertised[0].port()));
-        let target = "198.51.100.10:8080".parse().unwrap();
-        let publisher = async {
-            let conn = receiver.accept().await.unwrap().await.unwrap();
-            assert!(receiver.identify(&conn).is_some());
-            let (mut tx, mut rx) = conn.accept_bi().await.unwrap();
-            assert_eq!(frame_in::<Open>(&mut rx).await.unwrap().target, target);
-            frame_out(&mut tx, &Option::<Code>::None).await.unwrap();
-            tx.finish().unwrap();
-            tx.stopped().await.unwrap();
-        };
-        let caller = async {
-            let (conn, _) = sender
-                .connect("publisher", || async { Ok(vec![loopback]) })
-                .await
-                .unwrap();
-            assert_eq!(conn.remote_address(), loopback);
-            let (_, mut rx) = open(
-                &conn,
-                Open {
-                    service: "test".into(),
-                    target,
-                },
-            )
-            .await
-            .unwrap();
-            assert_eq!(rx.read(&mut [0]).await.unwrap(), None);
-        };
-        timeout(Duration::from_secs(5), async {
-            tokio::join!(publisher, caller)
-        })
-        .await
-        .unwrap();
-        sender.close();
-        receiver.close();
-    }
-
-    #[test]
-    fn expired_roster_cannot_authorize_new_traffic() {
-        let membership = Membership::default();
-        let cert = vec![1, 2, 3];
-        membership.renew(vec![Peer {
-            id: "member".into(),
-            certificate: cert.clone(),
-        }]);
-        let allowed = membership.certificate(&cert).unwrap();
-        membership.0.write().unwrap().expires = Some(Instant::now());
-        assert!(membership.certificate(&cert).is_none());
-        assert!(membership.peer("member").is_none());
-        membership.invalidate();
-        assert!(allowed.cancel.is_cancelled());
-    }
-
-    #[tokio::test]
-    async fn quic_bulk_stream_throughput_and_o1_membership_lookup() {
-        let sender_id = Identity::new().unwrap();
-        let receiver_id = Identity::new().unwrap();
-        let sender = Direct::new(sender_id.clone(), &DualPath, CancellationToken::new(), false).unwrap();
-        let receiver = Direct::new(receiver_id.clone(), &DualPath, CancellationToken::new(), false).unwrap();
-
-        let mut peers = Vec::with_capacity(128);
-        peers.push(Peer {
-            id: "sender".into(),
-            certificate: sender_id.cert.clone(),
-        });
-        for i in 1..128u16 {
-            let mut fake = vec![0u8; 128];
-            fake[0..2].copy_from_slice(&i.to_be_bytes());
-            peers.push(Peer {
-                id: format!("peer-{i}"),
-                certificate: fake,
-            });
-        }
-        receiver.renew(peers);
-        sender.renew(vec![Peer {
-            id: "receiver".into(),
-            certificate: receiver_id.cert,
-        }]);
-        assert!(receiver.membership.certificate(&sender_id.cert).is_some());
-
-        let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, receiver.local_port());
-        const TOTAL: usize = 8 * 1024 * 1024;
-        const CHUNK: usize = 64 * 1024;
-
-        let server_task = tokio::spawn({
-            let receiver = receiver.clone();
-            async move {
-                let conn = receiver.accept().await.unwrap().await.unwrap();
-                let (mut tx, mut rx) = conn.accept_bi().await.unwrap();
-                let _open: Open = frame_in(&mut rx).await.unwrap();
-                frame_out(&mut tx, &Option::<Code>::None).await.unwrap();
-                let payload = vec![0x5au8; CHUNK];
-                let mut sent = 0;
-                while sent < TOTAL {
-                    tx.write_all(&payload).await.unwrap();
-                    sent += CHUNK;
-                }
-                tx.finish().unwrap();
-                let _ = tx.stopped().await;
-            }
-        });
-
-        let (conn, _) = sender
-            .connect("receiver", || async { Ok(vec![address.into()]) })
-            .await
-            .unwrap();
-        let started = Instant::now();
-        let (_, mut rx) = open(
-            &conn,
-            Open {
-                service: "bench".into(),
-                target: "198.51.100.10:80".parse().unwrap(),
-            },
-        )
-        .await
-        .unwrap();
-        let mut buf = vec![0u8; CHUNK];
-        let mut received = 0;
-        while let Some(n) = rx.read(&mut buf).await.unwrap() {
-            received += n;
-        }
-        let elapsed = started.elapsed();
-        server_task.await.unwrap();
-        assert_eq!(received, TOTAL);
-        let mbps = (TOTAL as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
-        eprintln!("QUIC loopback 8 MiB transfer: {elapsed:?} ({mbps:.1} MiB/s)");
-        sender.close();
-        receiver.close();
-    }
 }
