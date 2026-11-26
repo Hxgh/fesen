@@ -65,6 +65,8 @@ export const SHARED_COPY = {
   online_state: ["在线", "Online"],
   offline_state: ["离线", "Offline"],
   broadcasting: ["广播中", "Live"],
+  source_self: ["本账号", "My account"],
+  badge_local: ["本机", "Local"],
   revoke: ["撤销设备", "Revoke device"],
   confirm_disable: ["停用后，该账号下所有设备将立即断开。", "All devices on this account will disconnect."],
   confirm_revoke: ["撤销后，该设备将断开且无法继续接入。", "This device will lose access."],

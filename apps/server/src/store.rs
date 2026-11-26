@@ -69,6 +69,9 @@ pub fn db(path: &Path) -> anyhow::Result<Connection> {
     db.execute_batch(
         "PRAGMA foreign_keys=ON;
          PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;
+         PRAGMA temp_store=MEMORY;
+         PRAGMA cache_size=-8000;
          CREATE TABLE IF NOT EXISTS users(
            name TEXT PRIMARY KEY, password TEXT NOT NULL,
            admin INTEGER NOT NULL, disabled INTEGER NOT NULL DEFAULT 0
@@ -80,9 +83,12 @@ pub fn db(path: &Path) -> anyhow::Result<Connection> {
            machine_id TEXT, os TEXT
          );
          CREATE UNIQUE INDEX IF NOT EXISTS device_token ON devices(token);
+         CREATE INDEX IF NOT EXISTS devices_member ON devices(member);
          CREATE TABLE IF NOT EXISTS admin_sessions(
            token BLOB PRIMARY KEY, member TEXT NOT NULL REFERENCES users(name), expires INTEGER NOT NULL
          );
+         CREATE INDEX IF NOT EXISTS admin_sessions_member ON admin_sessions(member);
+         CREATE INDEX IF NOT EXISTS admin_sessions_expires ON admin_sessions(expires);
          CREATE TABLE IF NOT EXISTS member_prefs(
            member TEXT NOT NULL REFERENCES users(name),
            service TEXT NOT NULL,
@@ -135,21 +141,18 @@ pub fn create(db: &Connection, name: &str, hash: &str, admin: bool) -> Result<()
 }
 
 pub fn login_hash(db: &Connection, name: &str, admin: bool) -> Option<String> {
-    db.query_row(
+    db.prepare_cached(
         "SELECT password FROM users WHERE name=?1 AND disabled=0 AND (admin=1 OR ?2=0)",
-        params![name, admin],
-        |r| r.get(0),
     )
+    .ok()?
+    .query_row(params![name, admin], |r| r.get(0))
     .ok()
 }
 
 pub fn is_admin(db: &Connection, name: &str) -> bool {
-    db.query_row(
-        "SELECT 1 FROM users WHERE name=?1 AND admin=1 AND disabled=0",
-        [name],
-        |_| Ok(()),
-    )
-    .is_ok()
+    db.prepare_cached("SELECT 1 FROM users WHERE name=?1 AND admin=1 AND disabled=0")
+        .and_then(|mut stmt| stmt.query_row([name], |_| Ok(())))
+        .is_ok()
 }
 
 pub fn authorize_device(
@@ -272,12 +275,12 @@ pub fn admin_cookie(db: &Connection, member: &str, token: &str) -> Result<(), Co
 }
 
 pub fn admin(db: &Connection, token: &str) -> Option<String> {
-    db.query_row(
+    db.prepare_cached(
         "SELECT member FROM admin_sessions s JOIN users u ON u.name=s.member
          WHERE s.token=?1 AND s.expires>unixepoch() AND u.admin=1 AND u.disabled=0",
-        [hash_secret(token)],
-        |r| r.get(0),
     )
+    .ok()?
+    .query_row([hash_secret(token)], |r| r.get(0))
     .ok()
 }
 
@@ -304,7 +307,7 @@ pub struct Device {
 
 pub fn list(db: &Connection) -> Result<(Vec<User>, Vec<Device>), Code> {
     let users = db
-        .prepare("SELECT name,admin,disabled FROM users ORDER BY name")
+        .prepare_cached("SELECT name,admin,disabled FROM users ORDER BY name")
         .map_err(sql_code)?
         .query_map([], |r| {
             Ok(User {
@@ -317,7 +320,7 @@ pub fn list(db: &Connection) -> Result<(Vec<User>, Vec<Device>), Code> {
         .collect::<Result<_, _>>()
         .map_err(sql_code)?;
     let devices = db
-        .prepare("SELECT id,member,label,machine_id,os,revoked,seen FROM devices ORDER BY seen DESC")
+        .prepare_cached("SELECT id,member,label,machine_id,os,revoked,seen FROM devices ORDER BY seen DESC")
         .map_err(sql_code)?
         .query_map([], |r| {
             let os_raw: Option<String> = r.get(4)?;
@@ -436,7 +439,7 @@ pub fn rename_device(db: &Connection, id: &str, label: &str) -> Result<String, C
 }
 
 pub fn list_prefs(db: &Connection, member: &str) -> Result<Vec<MemberPref>, Code> {
-    db.prepare(
+    db.prepare_cached(
         "SELECT service,remark,alias,ip FROM member_prefs WHERE member=?1 ORDER BY updated_at DESC",
     )
     .map_err(sql_code)?
@@ -512,7 +515,7 @@ pub fn save_pref(db: &Connection, member: &str, pref: &MemberPref) -> Result<(),
 }
 
 pub fn list_profiles(db: &Connection, member: &str) -> Result<Vec<DeviceProfile>, Code> {
-    db.prepare(
+    db.prepare_cached(
         "SELECT machine_id,name,os,shares,forwards,updated_at
          FROM device_profiles WHERE member=?1 ORDER BY updated_at DESC",
     )

@@ -43,11 +43,17 @@ pub struct Routes {
     protected: Vec<(u32, u32)>,
     to_original: HashMap<Ipv4Addr, Ipv4Addr>,
     to_service_original: HashMap<Ipv4Addr, (String, Ipv4Addr)>,
-    remapped_services: HashSet<String>,
+    primary_indices: Vec<usize>,
+    remapped_by_owner: HashMap<String, Vec<usize>>,
     reserved: BTreeMap<u32, u32>,
-    reserved_peers: BTreeMap<(String, u32), u32>,
+    reserved_peers: HashMap<String, BTreeMap<u32, u32>>,
     retired: HashSet<u32>,
     directory: Vec<Offering>,
+}
+
+fn intervals_contain(intervals: &[(u32, u32)], n: u32) -> bool {
+    let i = intervals.partition_point(|&(_, b)| b < n);
+    intervals.get(i).is_some_and(|&(a, _)| a <= n)
 }
 
 pub enum Destination {
@@ -102,16 +108,23 @@ impl Routes {
                         .map(|ip| (ip.into(), ip.into())),
                 ),
         );
-        let mut primary: Vec<&Offering> = Vec::new();
+        let mut primary: Vec<&Offering> = Vec::with_capacity(directory.len());
+        let mut primary_indices: Vec<usize> = Vec::with_capacity(directory.len());
         let mut remapped_services = HashSet::new();
-        for o in &directory {
+        let mut remapped_by_owner: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, o) in directory.iter().enumerate() {
             if primary
                 .iter()
                 .any(|p| p.owner != o.owner && p.service.rules.conflicts(&o.service.rules))
             {
                 remapped_services.insert(o.service.id.clone());
+                remapped_by_owner
+                    .entry(o.owner.clone())
+                    .or_default()
+                    .push(idx);
             } else {
                 primary.push(o);
+                primary_indices.push(idx);
             }
         }
         let targets = union(
@@ -125,7 +138,12 @@ impl Routes {
         // Do not repurpose virtual destinations as the TUN or resolver address.
         let mut used = previous.retired.clone();
         used.extend(previous.reserved.values().copied());
-        used.extend(previous.reserved_peers.values().copied());
+        used.extend(
+            previous
+                .reserved_peers
+                .values()
+                .flat_map(|m| m.values().copied()),
+        );
         let mut free = available.iter().flat_map(|&(a, b)| a..=b);
         let address = free.find(|n| used.insert(*n)).ok_or(Code::Conflict)?;
         let dns_slot = free.find(|n| used.insert(*n)).ok_or(Code::Conflict)?;
@@ -146,10 +164,9 @@ impl Routes {
         let mut reserved = previous.reserved.clone();
         let mut reserved_peers = previous.reserved_peers.clone();
         let mut retired = previous.retired.clone();
-        let in_available = |m: u32| available.iter().any(|&(a, b)| a <= m && m <= b);
         for original in overlap.iter().flat_map(|&(a, b)| a..=b) {
             if let Some(&mapped) = previous.reserved.get(&original)
-                && in_available(mapped)
+                && intervals_contain(&available, mapped)
             {
                 to_virtual.insert(original, mapped);
             }
@@ -167,34 +184,39 @@ impl Routes {
             .iter()
             .map(|(&original, &virt)| (virt.into(), original.into()))
             .collect();
-        let mut peer_virtual: BTreeMap<(String, u32), u32> = BTreeMap::new();
+        let mut peer_virtual: HashMap<&str, BTreeMap<u32, u32>> = HashMap::new();
         for o in &directory {
             if !remapped_services.contains(&o.service.id) {
                 continue;
             }
+            let prev_owner = previous.reserved_peers.get(&o.owner);
+            let owner_virt = peer_virtual.entry(o.owner.as_str()).or_default();
+            let owner_reserved = reserved_peers.entry(o.owner.clone()).or_default();
             for r in &o.service.rules.ips {
                 for original in u32::from(r.start)..=u32::from(r.end) {
-                    let key = (o.owner.clone(), original);
-                    if peer_virtual.contains_key(&key) {
+                    if owner_virt.contains_key(&original) {
                         continue;
                     }
-                    if let Some(&mapped) = previous.reserved_peers.get(&key)
-                        && in_available(mapped)
+                    if let Some(&mapped) = prev_owner.and_then(|m| m.get(&original))
+                        && intervals_contain(&available, mapped)
                     {
-                        peer_virtual.insert(key, mapped);
+                        owner_virt.insert(original, mapped);
                     } else {
                         let mapped = free.find(|n| used.insert(*n)).ok_or(Code::Conflict)?;
-                        if let Some(old) = reserved_peers.insert(key.clone(), mapped) {
+                        if let Some(old) = owner_reserved.insert(original, mapped) {
                             retired.insert(old);
                         }
-                        peer_virtual.insert(key, mapped);
+                        owner_virt.insert(original, mapped);
                     }
                 }
             }
         }
         let mut to_service_original = HashMap::new();
-        for ((owner, original), &virt) in &peer_virtual {
-            to_service_original.insert(Ipv4Addr::from(virt), (owner.clone(), Ipv4Addr::from(*original)));
+        for (&owner, map) in &peer_virtual {
+            for (&original, &virt) in map {
+                to_service_original
+                    .insert(Ipv4Addr::from(virt), (owner.to_owned(), Ipv4Addr::from(original)));
+            }
         }
         let collapse = |pairs: Vec<(u32, u32)>| -> Vec<Mapping> {
             let mut out: Vec<Mapping> = Vec::new();
@@ -226,10 +248,13 @@ impl Routes {
             if !remapped_services.contains(&o.service.id) {
                 continue;
             }
+            let Some(owner_virt) = peer_virtual.get(o.owner.as_str()) else {
+                continue;
+            };
             let mut pairs = Vec::new();
             for r in &o.service.rules.ips {
                 for original in u32::from(r.start)..=u32::from(r.end) {
-                    if let Some(&virt) = peer_virtual.get(&(o.owner.clone(), original)) {
+                    if let Some(&virt) = owner_virt.get(&original) {
                         pairs.push((original, virt));
                     }
                 }
@@ -287,7 +312,8 @@ impl Routes {
             protected,
             to_original,
             to_service_original,
-            remapped_services,
+            primary_indices,
+            remapped_by_owner,
             directory,
             reserved,
             reserved_peers,
@@ -312,11 +338,12 @@ impl Routes {
     pub fn destination(&self, addr: SocketAddrV4) -> Destination {
         let ip = *addr.ip();
         if let Some((owner, original)) = self.to_service_original.get(&ip) {
-            if let Some(o) = self.directory.iter().find(|o| {
-                &o.owner == owner
-                    && self.remapped_services.contains(&o.service.id)
-                    && o.service.rules.allows(*original, addr.port())
-            }) {
+            if let Some(indices) = self.remapped_by_owner.get(owner)
+                && let Some(o) = indices
+                    .iter()
+                    .map(|&idx| &self.directory[idx])
+                    .find(|o| o.service.rules.allows(*original, addr.port()))
+            {
                 return Destination::Peer {
                     owner: o.owner.clone(),
                     service: o.service.id.clone(),
@@ -330,16 +357,17 @@ impl Routes {
         } else if VIRTUAL.contains(ip) {
             return Destination::Reject;
         } else {
-            let n = u32::from(ip);
-            if self.protected.iter().any(|&(a, b)| (a..=b).contains(&n)) {
+            if intervals_contain(&self.protected, u32::from(ip)) {
                 return Destination::Local;
             }
             ip
         };
-        if let Some(o) = self.directory.iter().find(|o| {
-            !self.remapped_services.contains(&o.service.id)
-                && o.service.rules.allows(target, addr.port())
-        }) {
+        if let Some(o) = self
+            .primary_indices
+            .iter()
+            .map(|&idx| &self.directory[idx])
+            .find(|o| o.service.rules.allows(target, addr.port()))
+        {
             return Destination::Peer {
                 owner: o.owner.clone(),
                 service: o.service.id.clone(),

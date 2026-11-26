@@ -13,12 +13,10 @@ const { t, isZh, failure } = i18n;
 const topMark = createTrigram("connecting");
 byId("brand-mark").replaceWith(topMark.el);
 
-const navTabs = byId("nav-tabs");
 const actions = byId("actions");
 const content = byId("content");
 const signin = byId("signin");
 const loadingEl = byId("loading");
-const brandWord = byId("brand-word");
 const brandBadge = byId("brand-badge");
 const editor = byId("editor");
 const settingsDialog = byId("settings-dialog");
@@ -109,10 +107,24 @@ function openSettings() {
   });
 }
 
+const copyNodes = [...document.querySelectorAll("[data-copy]")];
+const settingsBtn = createIconButton({
+  icon: "settings",
+  title: t("settings"),
+  variant: "solid",
+  size: "lg",
+  onClick: openSettings,
+});
+settingsBtn.setAttribute("aria-haspopup", "dialog");
+actions.append(settingsBtn);
+
 function syncCopy() {
   document.title = t("admin_title");
-  document.querySelectorAll("[data-copy]").forEach((el) => { el.textContent = t(el.dataset.copy); });
-  brandBadge.title = [t("brand"), t("admin_badge"), currentHost].filter(Boolean).join(" · ");
+  for (const el of copyNodes) el.textContent = t(el.dataset.copy);
+  const settingsLabel = t("settings");
+  settingsBtn.title = settingsLabel;
+  settingsBtn.setAttribute("aria-label", settingsLabel);
+  brandBadge.title = [t("brand"), currentHost].filter(Boolean).join(" · ");
 }
 
 function render() {
@@ -120,34 +132,24 @@ function render() {
   loadingEl.hidden = booted;
   signin.hidden = !booted || signedIn;
   content.hidden = !signedIn;
-  navTabs.hidden = !signedIn;
-  brandWord.hidden = signedIn;
 
-  actions.replaceChildren();
   if (signedIn) {
-    actions.append(...admin.buildToolbarButtons());
-    admin.renderTabs(navTabs);
+    const activeEl = document.activeElement;
+    const restoreTabFocus = !!activeEl && content.contains(activeEl) && (() => {
+      try { return activeEl.matches('[role="tab"]:focus-visible'); } catch { return false; }
+    })();
     const viewKey = `admin:${admin.getTabIndex()}`;
-    const panel = admin.renderPanel();
-    if (viewKey !== lastViewKey) {
-      panel.classList.add("panel-enter");
-      lastViewKey = viewKey;
+    const enterPanel = !lastViewKey.startsWith("admin:");
+    const enterBody = !enterPanel && viewKey !== lastViewKey;
+    lastViewKey = viewKey;
+    content.replaceChildren(admin.renderPanel({ enterPanel, enterBody }));
+    if (restoreTabFocus) {
+      content.querySelector('[role="tab"][aria-selected="true"]')?.focus({ preventScroll: true });
     }
-    content.replaceChildren(panel);
   } else {
     lastViewKey = "";
-    navTabs.replaceChildren();
     content.replaceChildren();
   }
-  const settingsBtn = createIconButton({
-    icon: "settings",
-    title: t("settings"),
-    variant: "solid",
-    size: "lg",
-    onClick: openSettings,
-  });
-  settingsBtn.setAttribute("aria-haspopup", "dialog");
-  actions.append(settingsBtn);
 }
 
 admin.onUpdate(render);

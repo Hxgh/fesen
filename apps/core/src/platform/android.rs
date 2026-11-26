@@ -9,12 +9,12 @@ use serde::Deserialize;
 use socket2::Socket;
 use std::{
     fs::File,
-    io::{self, Read, Write},
+    io::{self, Read},
     net::{Ipv4Addr, Ipv6Addr, UdpSocket},
-    os::fd::{AsRawFd, FromRawFd},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, OnceLock, RwLock,
+        Arc, OnceLock, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 
 struct Device {
     wire: File,
+    wake_write: OwnedFd,
     done: Arc<AtomicBool>,
     reader: Option<std::thread::JoinHandle<()>>,
 }
@@ -30,17 +31,44 @@ struct Device {
 impl Drop for Device {
     fn drop(&mut self) {
         self.done.store(true, Ordering::Release);
+        let signal: u8 = 1;
+        unsafe {
+            libc::write(
+                self.wake_write.as_raw_fd(),
+                (&signal as *const u8).cast(),
+                1,
+            );
+        }
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
     }
 }
 
+fn wake_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [-1 as libc::c_int; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    for fd in [read_fd.as_raw_fd(), write_fd.as_raw_fd()] {
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+    }
+    Ok((read_fd, write_fd))
+}
+
 struct Phone {
     vm: JavaVM,
     service: GlobalRef,
-    input: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
-    device: Mutex<Option<Device>>,
+    input: OnceLock<mpsc::Sender<Vec<u8>>>,
+    device: RwLock<Option<Device>>,
     underlay: RwLock<Underlay>,
     info: OnceLock<DeviceInfo>,
 }
@@ -100,7 +128,7 @@ impl Platform for Phone {
         true
     }
     fn access_ready(&self) -> bool {
-        self.device.lock().unwrap().is_some()
+        self.device.read().unwrap().is_some()
     }
     fn device_info(&self) -> DeviceInfo {
         self.info
@@ -211,7 +239,7 @@ impl Platform for Phone {
             .and_then(|r| r.i())
             .map_err(Self::error)?;
         if tun.address.is_none() {
-            self.device.lock().unwrap().take();
+            self.device.write().unwrap().take();
             return Ok(());
         }
         if fd < 0 {
@@ -221,44 +249,64 @@ impl Platform for Phone {
         let mut reader = wire.try_clone()?;
         let input = self
             .input
-            .lock()
-            .unwrap()
-            .clone()
+            .get()
+            .cloned()
             .ok_or_else(|| io::Error::other("packet input closed"))?;
+        let (wake_read, wake_write) = wake_pipe()?;
         let done = Arc::new(AtomicBool::new(false));
         let stop = done.clone();
         let handle = std::thread::Builder::new()
             .name("fesen-tun".into())
             .spawn(move || {
                 let mut packet = [0; super::MTU];
-                let mut poll = libc::pollfd {
-                    fd: reader.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
+                let mut fds = [
+                    libc::pollfd {
+                        fd: reader.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: wake_read.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
                 while !stop.load(Ordering::Acquire) {
-                    if unsafe { libc::poll(&mut poll, 1, 100) } <= 0 {
-                        continue;
-                    }
-                    if poll.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                    fds[0].revents = 0;
+                    fds[1].revents = 0;
+                    let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+                    if ready < 0 {
+                        if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
                         break;
                     }
-                    match reader.read(&mut packet) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            let _ = input.try_send(packet[..n].to_vec());
+                    if stop.load(Ordering::Acquire) || fds[1].revents != 0 {
+                        break;
+                    }
+                    if fds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                        break;
+                    }
+                    if fds[0].revents & libc::POLLIN == 0 {
+                        continue;
+                    }
+                    // Drain all queued non-blocking TUN packets before polling again.
+                    loop {
+                        match reader.read(&mut packet) {
+                            Ok(0) => return,
+                            Ok(n) => {
+                                let _ = input.try_send(packet[..n].to_vec());
+                            }
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(_) => return,
                         }
-                        Err(e)
-                            if matches!(
-                                e.kind(),
-                                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                            ) => {}
-                        Err(_) => break,
                     }
                 }
             })?;
-        *self.device.lock().unwrap() = Some(Device {
+        *self.device.write().unwrap() = Some(Device {
             wire,
+            wake_write,
             done,
             reader: Some(handle),
         });
@@ -266,13 +314,19 @@ impl Platform for Phone {
     }
 
     fn write_packet(&self, packet: &[u8]) {
-        if let Some(device) = self.device.lock().unwrap().as_mut() {
-            let _ = device.wire.write(packet);
+        if let Some(device) = self.device.read().unwrap().as_ref() {
+            unsafe {
+                libc::write(
+                    device.wire.as_raw_fd(),
+                    packet.as_ptr().cast(),
+                    packet.len(),
+                );
+            }
         }
     }
 
     fn set_input(&self, input: mpsc::Sender<Vec<u8>>) {
-        *self.input.lock().unwrap() = Some(input);
+        let _ = self.input.set(input);
     }
 }
 
@@ -301,8 +355,8 @@ impl Engine {
         let host = Arc::new(Phone {
             vm,
             service,
-            input: Mutex::new(None),
-            device: Mutex::new(None),
+            input: OnceLock::new(),
+            device: RwLock::new(None),
             underlay: RwLock::new(Underlay::default()),
             info: OnceLock::new(),
         });
@@ -326,10 +380,10 @@ impl Engine {
     }
 
     pub fn request(&self, request: &str) -> String {
-        let result = self
+        let bytes = self
             .runtime
-            .block_on(ipc::dispatch(&self.core, request.as_bytes()));
-        result.to_string()
+            .block_on(ipc::dispatch_bytes(&self.core, request.as_bytes()));
+        String::from_utf8(bytes).unwrap_or_else(|_| "{}".to_owned())
     }
 
     pub fn halt(&self) {

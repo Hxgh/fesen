@@ -19,13 +19,22 @@ use tokio::{
 };
 
 pub fn spawn(core: Arc<Core>) -> io::Result<()> {
+    #[cfg(target_os = "android")]
+    const TCP_WINDOW: u32 = 512 * 1024;
+    #[cfg(not(target_os = "android"))]
+    const TCP_WINDOW: u32 = 1024 * 1024;
+
     let (stack, driver, udp, tcp) = StackBuilder::default()
         .mtu(MTU)
+        .stack_buffer_size(1024)
+        .tcp_buffer_size(1024)
+        .tcp_recv_buffer_size(TCP_WINDOW)
+        .tcp_send_buffer_size(TCP_WINDOW)
         .enable_tcp(true)
         .enable_udp(true)
         .build()?;
     let (mut input, mut output) = stack.split();
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(512);
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
     core.platform.set_input(tx);
     if let Some(driver) = driver {
         let quit = core.quit.clone();
@@ -36,14 +45,27 @@ pub fn spawn(core: Arc<Core>) -> io::Result<()> {
     {
         let quit = core.quit.clone();
         tokio::spawn(async move {
+            let mut batch = Vec::with_capacity(64);
             loop {
-                tokio::select! {
+                batch.clear();
+                let n = tokio::select! {
                     _ = quit.cancelled() => break,
-                    v = rx.recv() => {
-                        let Some(packet) = v else { break; };
-                        if packet.len() >= 20 && packet.len() <= MTU && packet[0] >> 4 == 4
-                            && input.send(packet).await.is_err() { break; }
+                    n = rx.recv_many(&mut batch, 64) => n,
+                };
+                if n == 0 {
+                    break;
+                }
+                let mut fed = false;
+                for packet in batch.drain(..) {
+                    if packet.len() >= 20 && packet.len() <= MTU && packet[0] >> 4 == 4 {
+                        if input.feed(packet).await.is_err() {
+                            return;
+                        }
+                        fed = true;
                     }
+                }
+                if fed && input.flush().await.is_err() {
+                    break;
                 }
             }
         });
@@ -191,7 +213,8 @@ fn question(bytes: &[u8]) -> Option<Question> {
 }
 
 fn response(query: &[u8], q: &Question, rcode: u8, answer: Option<Ipv4Addr>) -> Vec<u8> {
-    let mut bytes = query[..q.end].to_vec();
+    let mut bytes = Vec::with_capacity(q.end + if answer.is_some() { 16 } else { 0 });
+    bytes.extend_from_slice(&query[..q.end]);
     bytes[2] = 0x80 | (query[2] & 1);
     bytes[3] = 0x80 | rcode;
     bytes[6..12].fill(0);
@@ -215,7 +238,7 @@ async fn dns(core: &Core, query: &[u8], tcp: bool) -> Option<Vec<u8>> {
         ));
     }
     // Android may send non-fesen DNS to the VPN; preserve the selected network's resolver.
-    for ip in core.network().dns.into_iter().take(3) {
+    for ip in core.dns_servers().into_iter().take(3) {
         let result = timeout(Duration::from_millis(1800), async {
             let address = SocketAddrV4::new(ip, 53);
             if tcp {

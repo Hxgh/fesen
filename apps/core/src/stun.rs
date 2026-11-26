@@ -7,7 +7,10 @@ use std::{
     io::{self, IoSliceMut},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -73,6 +76,7 @@ struct Pending {
 #[derive(Debug)]
 pub struct Socket {
     inner: Arc<dyn AsyncUdpSocket>,
+    active: AtomicBool,
     pending: Mutex<Option<Pending>>,
 }
 
@@ -80,6 +84,7 @@ impl Socket {
     pub fn new(inner: Arc<dyn AsyncUdpSocket>) -> Arc<Self> {
         Arc::new(Self {
             inner,
+            active: AtomicBool::new(false),
             pending: Mutex::new(None),
         })
     }
@@ -87,7 +92,11 @@ impl Socket {
     pub async fn observe(&self, raw: &UdpSocket, server: SocketAddrV4) -> Option<SocketAddrV4> {
         let id = rand::random();
         let (reply, mut receive) = oneshot::channel();
-        *self.pending.lock().unwrap() = Some(Pending { server, id, reply });
+        {
+            let mut guard = self.pending.lock().unwrap();
+            *guard = Some(Pending { server, id, reply });
+            self.active.store(true, Ordering::Release);
+        }
         for wait in [500, 800] {
             if raw.send_to(&request(id), server).is_err() {
                 break;
@@ -96,7 +105,9 @@ impl Socket {
                 return reply.ok();
             }
         }
-        self.pending.lock().unwrap().take();
+        let mut guard = self.pending.lock().unwrap();
+        guard.take();
+        self.active.store(false, Ordering::Release);
         None
     }
 
@@ -109,6 +120,7 @@ impl Socket {
             && addr == SocketAddr::V4(probe.server)
             && let Some(address) = mapped(packet, probe.id)
         {
+            self.active.store(false, Ordering::Release);
             let _ = pending.take().unwrap().reply.send(address);
             true
         } else {
@@ -131,7 +143,9 @@ impl AsyncUdpSocket for Socket {
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
         let result = self.inner.poll_recv(cx, bufs, meta);
-        if let Poll::Ready(Ok(n)) = result {
+        if let Poll::Ready(Ok(n)) = result
+            && self.active.load(Ordering::Acquire)
+        {
             // Quinn stays the sole reader of the QUIC socket, including on GRO paths.
             for (buf, meta) in bufs.iter().zip(&mut meta[..n]) {
                 if let Some(data) = buf.get(..meta.len)

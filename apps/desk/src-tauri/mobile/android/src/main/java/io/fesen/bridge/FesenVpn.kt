@@ -49,6 +49,8 @@ class FesenVpn : VpnService() {
     private lateinit var worker: HandlerThread
     private lateinit var ipc: Messenger
     private lateinit var background: Handler
+    private val engineLock = Any()
+    private val ipcPool = java.util.concurrent.Executors.newFixedThreadPool(4)
     @Volatile private var engine = 0L
     @Volatile private var stopping = false
     private var starting = false
@@ -61,9 +63,11 @@ class FesenVpn : VpnService() {
     private val callbacks = java.util.concurrent.ConcurrentHashMap<IBinder, Messenger>()
     private val networks by lazy { getSystemService(ConnectivityManager::class.java) }
     @Volatile private var physical: Network? = null
+    @Volatile private var cachedUnderlying: List<Pair<Network, LinkProperties>>? = null
     private val physicalChanges = object : ConnectivityManager.NetworkCallback() {
-        override fun onAvailable(net: Network) { physical = net }
-        override fun onLost(net: Network) { if (physical == net) physical = null }
+        override fun onAvailable(net: Network) { physical = net; cachedUnderlying = null }
+        override fun onLost(net: Network) { if (physical == net) physical = null; cachedUnderlying = null }
+        override fun onLinkPropertiesChanged(net: Network, linkProperties: LinkProperties) { cachedUnderlying = null }
     }
 
     override fun onCreate() {
@@ -77,23 +81,32 @@ class FesenVpn : VpnService() {
         ipc = Messenger(Handler(worker.looper) { request ->
             val body = request.data.getString("request")
             if (body == null) return@Handler true
-            request.replyTo?.let { callbacks[it.binder] = it }
-            val reply = execute(body)
+            val replyTo = request.replyTo
+            val reqId = request.arg1
+            replyTo?.let { callbacks[it.binder] = it }
             runCatching {
-                request.replyTo?.send(Message.obtain(null, 1, request.arg1, 0).apply {
-                    data = Bundle().apply { putString("reply", reply) }
-                })
+                ipcPool.execute {
+                    val reply = execute(body)
+                    runCatching {
+                        replyTo?.send(Message.obtain(null, 1, reqId, 0).apply {
+                            data = Bundle().apply { putString("reply", reply) }
+                        })
+                    }
+                }
             }
             true
         })
     }
 
     private fun execute(body: String): String {
-        if (!stopping && engine == 0L) {
-            engine = nativeStart(filesDir.resolve("core").absolutePath)
-            if (stopping && engine != 0L) nativeHalt(engine)
+        val currentEngine = synchronized(engineLock) {
+            if (!stopping && engine == 0L) {
+                engine = nativeStart(filesDir.resolve("core").absolutePath)
+                if (stopping && engine != 0L) nativeHalt(engine)
+            }
+            engine
         }
-        val reply = if (stopping || engine == 0L) """{"error":"not_connected"}""" else nativeRequest(engine, body)
+        val reply = if (stopping || currentEngine == 0L) """{"error":"not_connected"}""" else nativeRequest(currentEngine, body)
         val op = runCatching { JSONObject(body).optString("op") }.getOrNull()
         updateRunning(op == "login" || op == "start")
         return reply
@@ -186,11 +199,18 @@ class FesenVpn : VpnService() {
     override fun onDestroy() {
         halt()
         networks.unregisterNetworkCallback(physicalChanges)
+        cachedUnderlying = null
         if (current === this) current = null
         FesenTile.refresh()
+        ipcPool.shutdown()
         background.post {
-            if (engine != 0L) nativeDrop(engine)
-            engine = 0L
+            runCatching { ipcPool.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS) }
+            val toDrop = synchronized(engineLock) {
+                val e = engine
+                engine = 0L
+                e
+            }
+            if (toDrop != 0L) nativeDrop(toDrop)
             worker.quitSafely()
         }
         super.onDestroy()
@@ -253,6 +273,7 @@ class FesenVpn : VpnService() {
     @Suppress("unused")
     fun networkJson(): String = runCatching {
         val list = underlying()
+        cachedUnderlying = list
         val active = list.firstOrNull()
         val alternate = list.getOrNull(1)
         val routes = JSONArray()
@@ -278,7 +299,12 @@ class FesenVpn : VpnService() {
 
     @Suppress("unused")
     fun protectSocket(fd: Int, expected: String, target: String, alternate: String): Boolean = runCatching {
-        val list = underlying()
+        val cached = cachedUnderlying
+        val list = if (cached != null && cached.firstOrNull()?.first?.networkHandle?.toString() == expected) {
+            cached
+        } else {
+            underlying().also { cachedUnderlying = it }
+        }
         val primary = list.firstOrNull()?.first ?: return false
         if (primary.networkHandle.toString() != expected) return false
         val network = when {

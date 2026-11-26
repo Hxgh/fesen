@@ -1,5 +1,5 @@
 use crate::{
-    Command, Core,
+    Command, Core, Status,
     local::{private_dir, private_file, save},
 };
 use fesen_proto::{Code, MAX_FRAME};
@@ -9,7 +9,7 @@ use std::{
     fs, io,
     net::Ipv4Addr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{
@@ -20,10 +20,69 @@ use tokio::{
 };
 
 const MAX_COMMAND: usize = 64 * 1024;
+const UNCHANGED_REPLY: &[u8] = br#"{"unchanged":true}"#;
+
+#[derive(Deserialize)]
+struct PollHint<'a> {
+    op: &'a str,
+    #[serde(default)]
+    ui: bool,
+    #[serde(default)]
+    since: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct DataReply<'a> {
+    data: &'a Status,
+}
+
+#[derive(Serialize)]
+struct ErrorReply {
+    error: Code,
+}
+
+pub async fn dispatch_bytes(core: &Arc<Core>, data: &[u8]) -> Vec<u8> {
+    if data.len() > MAX_COMMAND {
+        return serde_json::to_vec(&ErrorReply {
+            error: Code::Invalid,
+        })
+        .unwrap_or_default();
+    }
+    if let Ok(hint) = serde_json::from_slice::<PollHint<'_>>(data)
+        && hint.op == "status"
+        && let Some(since) = hint.since
+    {
+        return match core.poll_status(hint.ui, since) {
+            Ok(None) => UNCHANGED_REPLY.to_vec(),
+            Ok(Some(status)) => serde_json::to_vec(&DataReply { data: &status }).unwrap_or_default(),
+            Err(error) => serde_json::to_vec(&ErrorReply { error }).unwrap_or_default(),
+        };
+    }
+    match serde_json::from_slice::<Command>(data) {
+        Ok(command) => match core.execute(command).await {
+            Ok(status) => serde_json::to_vec(&DataReply { data: &status }).unwrap_or_default(),
+            Err(error) => serde_json::to_vec(&ErrorReply { error }).unwrap_or_default(),
+        },
+        Err(_) => serde_json::to_vec(&ErrorReply {
+            error: Code::Invalid,
+        })
+        .unwrap_or_default(),
+    }
+}
 
 pub async fn dispatch(core: &Arc<Core>, data: &[u8]) -> Value {
     if data.len() > MAX_COMMAND {
         return json!({"error": Code::Invalid});
+    }
+    if let Ok(hint) = serde_json::from_slice::<PollHint<'_>>(data)
+        && hint.op == "status"
+        && let Some(since) = hint.since
+    {
+        return match core.poll_status(hint.ui, since) {
+            Ok(None) => json!({"unchanged": true}),
+            Ok(Some(status)) => json!({"data": status}),
+            Err(error) => json!({"error": error}),
+        };
     }
     match serde_json::from_slice::<Command>(data) {
         Ok(command) => match core.execute(command).await {
@@ -34,11 +93,13 @@ pub async fn dispatch(core: &Arc<Core>, data: &[u8]) -> Value {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Address {
     port: u16,
     token: [u8; 32],
 }
+
+static ADDR_CACHE: Mutex<Option<(PathBuf, Address)>> = Mutex::new(None);
 
 pub struct Endpoint {
     path: PathBuf,
@@ -94,6 +155,7 @@ impl Endpoint {
                 conn = self.listener.accept() => conn,
             };
             let Ok((mut stream, _)) = conn else { break };
+            let _ = stream.set_nodelay(true);
             let Ok(slot) = capacity.clone().try_acquire_owned() else {
                 continue;
             };
@@ -113,8 +175,7 @@ impl Endpoint {
                         return Ok(());
                     }
                     let command = read(&mut stream, MAX_COMMAND).await?;
-                    let reply = dispatch(&core, &command).await;
-                    let reply = serde_json::to_vec(&reply).map_err(io::Error::other)?;
+                    let reply = dispatch_bytes(&core, &command).await;
                     write(&mut stream, &reply).await
                 })
                 .await;
@@ -125,24 +186,54 @@ impl Endpoint {
     }
 }
 
-pub async fn request(dir: &Path, value: &Value) -> io::Result<Value> {
-    let Address { port, token } =
+fn load_address(dir: &Path, fresh: bool) -> io::Result<Address> {
+    if !fresh
+        && let Some((cached_dir, addr)) = ADDR_CACHE.lock().unwrap().as_ref()
+        && cached_dir == dir
+    {
+        return Ok(addr.clone());
+    }
+    let addr: Address =
         serde_json::from_slice(&fs::read(dir.join("ipc.json"))?).map_err(io::Error::other)?;
+    *ADDR_CACHE.lock().unwrap() = Some((dir.to_path_buf(), addr.clone()));
+    Ok(addr)
+}
+
+async fn request_with(addr: &Address, payload: &[u8]) -> io::Result<Value> {
     let mut stream = timeout(
         Duration::from_secs(2),
-        TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
+        TcpStream::connect((Ipv4Addr::LOCALHOST, addr.port)),
     )
     .await??;
+    let _ = stream.set_nodelay(true);
+    let mut frame = Vec::with_capacity(32 + 4 + payload.len());
+    frame.extend_from_slice(&addr.token);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    timeout(Duration::from_secs(29), async {
+        stream.write_all(&frame).await?;
+        serde_json::from_slice(&read(&mut stream, MAX_FRAME).await?).map_err(io::Error::other)
+    })
+    .await?
+}
+
+pub async fn request(dir: &Path, value: &Value) -> io::Result<Value> {
     let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
     if bytes.len() > MAX_COMMAND {
         return Err(io::Error::other("invalid command"));
     }
-    timeout(Duration::from_secs(29), async {
-        stream.write_all(&token).await?;
-        write(&mut stream, &bytes).await?;
-        serde_json::from_slice(&read(&mut stream, MAX_FRAME).await?).map_err(io::Error::other)
-    })
-    .await?
+    let addr = load_address(dir, false)?;
+    match request_with(&addr, &bytes).await {
+        Ok(reply) => Ok(reply),
+        Err(first_err) => {
+            // Core may have restarted on a new port; refresh ipc.json once.
+            let fresh = load_address(dir, true)?;
+            if fresh.port == addr.port && fresh.token == addr.token {
+                return Err(first_err);
+            }
+            request_with(&fresh, &bytes).await
+        }
+    }
 }
 
 async fn read(stream: &mut TcpStream, limit: usize) -> io::Result<Vec<u8>> {
@@ -156,6 +247,8 @@ async fn read(stream: &mut TcpStream, limit: usize) -> io::Result<Vec<u8>> {
 }
 
 async fn write(stream: &mut TcpStream, data: &[u8]) -> io::Result<()> {
-    stream.write_u32(data.len() as u32).await?;
-    stream.write_all(data).await
+    let mut frame = Vec::with_capacity(4 + data.len());
+    frame.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    frame.extend_from_slice(data);
+    stream.write_all(&frame).await
 }

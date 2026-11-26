@@ -224,13 +224,14 @@ async fn probe_http_head(
         let _ = io.flush().await;
         let mut buf = [0u8; 256];
         let n = io.read(&mut buf).await.ok()?;
-        Some(buf[..n].to_vec())
+        Some((buf, n))
     })
     .await;
     match res {
-        Ok(Some(bytes)) if bytes.is_empty() => HeadOutcome::ClosedOrAlert,
-        Ok(Some(bytes)) => {
-            if let Some(code) = parse_http_status_line(&bytes) {
+        Ok(Some((_, 0))) => HeadOutcome::ClosedOrAlert,
+        Ok(Some((buf, n))) => {
+            let bytes = &buf[..n];
+            if let Some(code) = parse_http_status_line(bytes) {
                 HeadOutcome::Http(code)
             } else if bytes.len() >= 2 && bytes[0] == 0x15 && bytes[1] == 0x03 {
                 HeadOutcome::ClosedOrAlert
@@ -310,29 +311,33 @@ pub async fn host_with_mode(
         return Ok(out);
     }
 
-    // Deep scan: bounded parallel TCP connect sweep across 1..=10000 (+ extras/27017),
-    // skipping noisy OS RPC ports, then fingerprinting only the discovered open ports.
-    let mut sweep_ports: Vec<u16> = (1u16..=10000)
-        .filter(|p| !NOISY_OS_PORTS.contains(p) || extras.contains(p))
-        .collect();
-    if !sweep_ports.contains(&27017) {
+    // Deep scan: prioritize common/extra/local ports first, then bounded parallel TCP connect sweep
+    // across 1..=10000 (+ extras/27017), skipping noisy OS RPC ports.
+    let mut sweep_seen = HashSet::with_capacity(10_048);
+    let mut sweep_ports: Vec<u16> = Vec::with_capacity(10_016);
+    for &p in DEFAULT_HOST_PORTS
+        .iter()
+        .chain(COMMON_HOST_PORTS.iter())
+        .chain(extras.iter())
+        .chain(local_hints.keys())
+    {
+        if sweep_seen.insert(p) {
+            sweep_ports.push(p);
+        }
+    }
+    for p in 1u16..=10000 {
+        if !NOISY_OS_PORTS.contains(&p) && sweep_seen.insert(p) {
+            sweep_ports.push(p);
+        }
+    }
+    if sweep_seen.insert(27017) {
         sweep_ports.push(27017);
-    }
-    for &p in &extras {
-        if p > 10000 && p != 27017 {
-            sweep_ports.push(p);
-        }
-    }
-    for &p in local_hints.keys() {
-        if p > 10000 && p != 27017 && !extras.contains(&p) {
-            sweep_ports.push(p);
-        }
     }
 
     let concurrency = if cfg!(target_os = "android") {
         64
     } else {
-        160
+        192
     };
     let open_ports: Vec<u16> = timeout(
         Duration::from_millis(12_000),
@@ -444,7 +449,7 @@ async fn probe_targets(
                 (probe, os)
             }
         }))
-        .buffer_unordered(18)
+        .buffer_unordered(48)
         .collect::<Vec<_>>(),
     )
     .await

@@ -1,4 +1,5 @@
 use crate::store;
+use axum::extract::ws::Utf8Bytes;
 use fesen_acl::{MAX_ADDRESSES, count, union};
 use fesen_proto::{
     Call, Code, DeviceOs, Event, MAX_CANDIDATES, MAX_DEVICES, MAX_IPV6_CANDIDATES,
@@ -20,10 +21,13 @@ use url::Url;
 #[derive(Clone)]
 pub struct App {
     pub inner: Arc<Mutex<Group>>,
-    pub changed: watch::Sender<u64>,
+    pub view_frame: watch::Sender<(u64, Utf8Bytes)>,
     pub password_slots: Arc<tokio::sync::Semaphore>,
     pub dummy_hash: Arc<String>,
     pub origin: Url,
+    pub origin_header: Arc<str>,
+    pub expected_authority: Arc<str>,
+    pub join_link: Arc<str>,
     pub udp_port: u16,
     pub stun: Option<String>,
 }
@@ -35,24 +39,55 @@ impl App {
         udp_port: u16,
         stun: Option<String>,
     ) -> Result<Self, Code> {
+        let initial_frame = Utf8Bytes::from(
+            serde_json::to_string(&Event::View {
+                view: View::default(),
+            })
+            .map_err(|_| Code::Internal)?,
+        );
+        let origin_header: Arc<str> = origin.origin().ascii_serialization().into();
+        let expected_authority: Arc<str> = match (origin.host_str(), origin.port()) {
+            (Some(host), Some(port)) => format!("{host}:{port}").into(),
+            (Some(host), None) => host.into(),
+            _ => String::new().into(),
+        };
+        let mut link = Url::parse("fesen://join").unwrap();
+        link.query_pairs_mut()
+            .append_pair("server", origin.as_str());
+        let join_link: Arc<str> = link.as_str().into();
         Ok(Self {
             inner: Arc::new(Mutex::new(Group {
                 db,
                 online: HashMap::new(),
                 probes: HashMap::new(),
                 probe_udp: udp_port != 0,
+                view_gen: 0,
             })),
-            changed: watch::channel(0).0,
+            view_frame: watch::channel((0u64, initial_frame)).0,
             password_slots: Arc::new(tokio::sync::Semaphore::new(3)),
             dummy_hash: Arc::new(store::password_hash(&store::secret())?),
             origin,
+            origin_header,
+            expected_authority,
+            join_link,
             udp_port,
             stun,
         })
     }
 
     pub fn changed(&self) {
-        self.changed.send_modify(|v| *v = v.wrapping_add(1));
+        let (revision, view) = self.inner.lock().unwrap().next_view();
+        if let Ok(json) = serde_json::to_string(&Event::View { view }) {
+            let frame = Utf8Bytes::from(json);
+            self.view_frame.send_if_modified(|slot| {
+                if revision > slot.0 {
+                    *slot = (revision, frame);
+                    true
+                } else {
+                    false
+                }
+            });
+        }
     }
 
     pub async fn verify(
@@ -99,6 +134,7 @@ pub struct Group {
     pub online: HashMap<String, Device>,
     probes: HashMap<String, String>,
     probe_udp: bool,
+    view_gen: u64,
 }
 
 pub struct Session {
@@ -117,7 +153,7 @@ pub struct Device {
     observed: Option<SocketAddrV4>,
     publications: Vec<Publication>,
     pub session: Arc<Session>,
-    outgoing: mpsc::Sender<Event>,
+    outgoing: mpsc::Sender<Utf8Bytes>,
 }
 
 impl Device {
@@ -138,7 +174,7 @@ impl Group {
         label: String,
         os: Option<DeviceOs>,
         cert: Vec<u8>,
-        outgoing: mpsc::Sender<Event>,
+        outgoing: mpsc::Sender<Utf8Bytes>,
     ) -> Result<Arc<Session>, Code> {
         if self.online.len() >= MAX_DEVICES && !self.online.contains_key(id) {
             return Err(Code::Limit);
@@ -215,9 +251,38 @@ impl Group {
         }
     }
 
+    pub fn next_view(&mut self) -> (u64, View) {
+        self.view_gen = self.view_gen.wrapping_add(1);
+        (self.view_gen, self.view())
+    }
+
+    pub fn services(&self) -> Vec<Offering> {
+        let cap: usize = self.online.values().map(|d| d.publications.len()).sum();
+        let mut services = Vec::with_capacity(cap);
+        for (id, d) in &self.online {
+            services.extend(d.publications.iter().map(|s| Offering {
+                owner: id.clone(),
+                member: d.member.clone(),
+                device: Some(d.label.clone()),
+                device_os: d.os,
+                service: s.clone(),
+            }));
+        }
+        services.sort_unstable_by(|a, b| {
+            (&a.member, &a.device, &a.service.name, &a.service.id).cmp(&(
+                &b.member,
+                &b.device,
+                &b.service.name,
+                &b.service.id,
+            ))
+        });
+        services
+    }
+
     pub fn view(&self) -> View {
         let mut peers = Vec::with_capacity(self.online.len());
-        let mut services = Vec::new();
+        let cap: usize = self.online.values().map(|d| d.publications.len()).sum();
+        let mut services = Vec::with_capacity(cap);
         for (id, d) in &self.online {
             peers.push(Peer {
                 id: id.clone(),
@@ -331,19 +396,23 @@ impl Group {
                     return Err(Code::Unauthorized);
                 }
                 let a = &self.online[id];
+                let to_b = serde_json::to_string(&Event::Punch {
+                    peer: id.to_owned(),
+                    candidates: a.candidates(),
+                    ipv6: a.ipv6.clone(),
+                })
+                .map_err(|_| Code::Internal)?;
+                let to_a = serde_json::to_string(&Event::Punch {
+                    peer,
+                    candidates: b.candidates(),
+                    ipv6: b.ipv6.clone(),
+                })
+                .map_err(|_| Code::Internal)?;
                 b.outgoing
-                    .try_send(Event::Punch {
-                        peer: id.to_owned(),
-                        candidates: a.candidates(),
-                        ipv6: a.ipv6.clone(),
-                    })
+                    .try_send(Utf8Bytes::from(to_b))
                     .map_err(|_| Code::Busy)?;
                 a.outgoing
-                    .try_send(Event::Punch {
-                        peer,
-                        candidates: b.candidates(),
-                        ipv6: b.ipv6.clone(),
-                    })
+                    .try_send(Utf8Bytes::from(to_a))
                     .map_err(|_| Code::Busy)?;
                 Ok(false)
             }
@@ -392,11 +461,12 @@ impl Group {
         let Ok(profiles) = store::list_profiles(&self.db, member) else {
             return;
         };
+        let Ok(json) = serde_json::to_string(&Event::Sync { prefs, profiles }) else {
+            return;
+        };
+        let frame = Utf8Bytes::from(json);
         for d in self.online.values().filter(|d| d.member == member) {
-            let _ = d.outgoing.try_send(Event::Sync {
-                prefs: prefs.clone(),
-                profiles: profiles.clone(),
-            });
+            let _ = d.outgoing.try_send(frame.clone());
         }
     }
 }

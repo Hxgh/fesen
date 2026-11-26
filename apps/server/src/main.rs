@@ -9,7 +9,7 @@ use axum::{
     Router,
     extract::{
         State, WebSocketUpgrade,
-        ws::{Message, WebSocket},
+        ws::{Message, Utf8Bytes, WebSocket},
     },
     http::{HeaderMap, header},
     response::{Html, IntoResponse, Response},
@@ -173,9 +173,7 @@ fn router(app: App) -> Router {
 }
 
 async fn join(State(app): State<App>, headers: HeaderMap) -> impl IntoResponse {
-    let mut link = url::Url::parse("fesen://join").unwrap();
-    link.query_pairs_mut()
-        .append_pair("server", app.origin.as_str());
+    let link = app.join_link.as_ref();
     let language = headers
         .get(header::ACCEPT_LANGUAGE)
         .and_then(|v| v.to_str().ok())
@@ -244,15 +242,16 @@ async fn upgrade(State(app): State<App>, ws: WebSocketUpgrade) -> Response {
         .into_response()
 }
 
+async fn send_raw(socket: &mut WebSocket, frame: Utf8Bytes) -> Result<(), ()> {
+    timeout(Duration::from_secs(4), socket.send(Message::Text(frame)))
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
+}
+
 async fn send(socket: &mut WebSocket, event: Event) -> Result<(), ()> {
     let text = serde_json::to_string(&event).map_err(|_| ())?;
-    timeout(
-        Duration::from_secs(4),
-        socket.send(Message::Text(text.into())),
-    )
-    .await
-    .map_err(|_| ())?
-    .map_err(|_| ())
+    send_raw(socket, text.into()).await
 }
 
 async fn control(mut socket: WebSocket, app: App) {
@@ -262,7 +261,7 @@ async fn control(mut socket: WebSocket, app: App) {
     let Ok(hello) = serde_json::from_str::<Hello>(&data) else {
         return;
     };
-    let mut changed = app.changed.subscribe();
+    let mut changed = app.view_frame.subscribe();
     let (tx, mut rx) = mpsc::channel(24);
     let cert = &hello.certificate;
     let authorized = async {
@@ -346,16 +345,14 @@ async fn control(mut socket: WebSocket, app: App) {
                 _ = tick.tick() => {
                     if last.elapsed() >= PRESENCE_TIMEOUT { break; }
                     allowance = 128;
-                    changed.borrow_and_update();
-                    let view = app.inner.lock().unwrap().view();
-                    send(&mut socket, Event::View { view }).await?;
+                    let frame = changed.borrow_and_update().1.clone();
+                    send_raw(&mut socket, frame).await?;
                 }
                 Ok(()) = changed.changed() => {
-                    changed.borrow_and_update();
-                    let view = app.inner.lock().unwrap().view();
-                    send(&mut socket, Event::View { view }).await?;
+                    let frame = changed.borrow_and_update().1.clone();
+                    send_raw(&mut socket, frame).await?;
                 }
-                Some(event) = rx.recv() => send(&mut socket, event).await?,
+                Some(frame) = rx.recv() => send_raw(&mut socket, frame).await?,
                 data = socket.recv() => {
                     let Some(Ok(message)) = data else { break };
                     match message {
@@ -376,9 +373,16 @@ async fn control(mut socket: WebSocket, app: App) {
         }
         Ok::<(), ()>(())
     }.await;
-    let mut g = app.inner.lock().unwrap();
-    if g.current(&id, &session) {
-        g.remove(&id, false);
+    let removed = {
+        let mut g = app.inner.lock().unwrap();
+        if g.current(&id, &session) {
+            g.remove(&id, false);
+            true
+        } else {
+            false
+        }
+    };
+    if removed {
         app.changed();
     }
 }

@@ -17,7 +17,7 @@ use std::{
 };
 use tokio::{
     net::TcpStream,
-    sync::{broadcast, mpsc, oneshot},
+    sync::{OnceCell, broadcast, mpsc, oneshot},
     time::{Instant, interval, timeout},
 };
 use tokio_tungstenite::{
@@ -26,6 +26,31 @@ use tokio_tungstenite::{
 };
 use tokio_util::sync::CancellationToken;
 use url::Url;
+
+pub(crate) async fn tls_client_config() -> Result<Arc<rustls::ClientConfig>, Code> {
+    static CONFIG: OnceCell<Arc<rustls::ClientConfig>> = OnceCell::const_new();
+    CONFIG
+        .get_or_try_init(|| async {
+            let native = tokio::task::spawn_blocking(rustls_native_certs::load_native_certs)
+                .await
+                .ok();
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            if let Some(native) = native {
+                roots.add_parsable_certificates(native.certs);
+            }
+            let config = rustls::ClientConfig::builder_with_provider(
+                crate::direct::crypto_provider(),
+            )
+            .with_safe_default_protocol_versions()
+            .map_err(|_| Code::Internal)?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+            Ok(Arc::new(config))
+        })
+        .await
+        .cloned()
+}
 
 type Wire = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Signals = broadcast::Sender<(String, Vec<SocketAddr>)>;
@@ -146,21 +171,7 @@ impl Session {
             }
             let (tcp, ip) = connected.ok_or(Code::NotConnected)?;
             let tls = if url.scheme() == "wss" {
-                let mut roots = rustls::RootCertStore::empty();
-                roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-                if let Ok(native) =
-                    tokio::task::spawn_blocking(rustls_native_certs::load_native_certs).await
-                {
-                    roots.add_parsable_certificates(native.certs);
-                }
-                let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-                    rustls::crypto::ring::default_provider(),
-                ))
-                .with_safe_default_protocol_versions()
-                .map_err(|_| Code::Internal)?
-                .with_root_certificates(roots)
-                .with_no_client_auth();
-                Some(Connector::Rustls(Arc::new(config)))
+                Some(Connector::Rustls(tls_client_config().await?))
             } else {
                 Some(Connector::Plain)
             };

@@ -22,6 +22,7 @@ function el(tag, cls = "", ...children) {
 /**
  * Shared Server Administration Workspace component.
  * Driven purely by an injected transport (fetch in Web /admin/, core IPC in Client).
+ * Renders an identical unified `.panel-bar` + `.panel-body` across Client and Web `/admin/`.
  * @param {{
  *   t: (k: string) => string,
  *   isZh: () => boolean,
@@ -31,6 +32,11 @@ function el(tag, cls = "", ...children) {
  *     action: (body: Record<string, unknown>) => Promise<void>,
  *   },
  *   dialog: HTMLDialogElement,
+ *   getContext?: () => {
+ *     member?: string | null,
+ *     machineId?: string,
+ *     deviceId?: string | null,
+ *   },
  *   onData?: (data: any) => void,
  *   onUnauthorized?: () => void,
  * }} opts
@@ -238,10 +244,22 @@ export function createAdminWorkspace(opts) {
     }
   }
 
-  function entityRow(name, statusKey, tone, actions, meta = "", osType = null, fallbackOs = false) {
-    const badge = osBadge(osType, fallbackOs ? "device" : false);
-    const main = el("div", "entity-main", ...(badge ? [badge] : []), el("span", "entity-name", name));
-    if (meta) main.append(el("span", "entity-meta", meta));
+  function entityRow(name, statusKey, tone, actions, { metaNodes = [], osType = null, fallbackOs = false, local = false, selfName = false } = {}) {
+    const badge = osBadge(osType, {
+      fallback: fallbackOs ? "device" : false,
+      local,
+      prefix: local ? t("badge_local") : "",
+    });
+    const nameEl = el("span", selfName ? "entity-name self" : "entity-name", name);
+    const main = el("div", "entity-main", ...(badge ? [badge] : []), nameEl);
+    if (metaNodes.length) {
+      const metaWrap = el("span", "entity-meta-wrap");
+      metaNodes.forEach((node, idx) => {
+        if (idx > 0) metaWrap.append(el("span", "meta-sep", "·"));
+        metaWrap.append(node);
+      });
+      main.append(metaWrap);
+    }
 
     const right = el("div", "entity-actions", el("span", `state-dot${tone ? ` ${tone}` : ""}`, t(statusKey)));
     if (actions.length) {
@@ -261,7 +279,33 @@ export function createAdminWorkspace(opts) {
     return el("div", "entity-row", main, right);
   }
 
-  function renderServices(services) {
+  function buildServiceMeta(s, clean, ctx) {
+    const isLocal = !!(ctx.deviceId && s.owner === ctx.deviceId);
+    const currentMember = ctx.member || data?.admin || "";
+    const isSelfAccount = !!(currentMember && s.member === currentMember);
+    const parts = [];
+    if (clean) parts.push(el("span", "service-name", clean));
+    if (isLocal) {
+      parts.push(el("span", "source-tag self", t("badge_local")));
+    }
+    if (s.member) {
+      parts.push(el("span", isSelfAccount ? "source-tag self" : "source-tag", s.member));
+    }
+    if (s.device) {
+      parts.push(el("span", "service-name", s.device));
+    }
+    return { isLocal, isSelfAccount, parts };
+  }
+
+  function appendMetaWithSeps(container, parts) {
+    parts.forEach((node, idx) => {
+      if (idx > 0) container.append(el("span", "meta-sep", "·"));
+      container.append(node);
+    });
+    return container;
+  }
+
+  function renderServices(services, ctx) {
     const wrap = el("div", "service-list");
     const entries = groupByHost(services, (s) => `${s.owner || s.member}:${singleIp(s)}`);
     for (const entry of entries) {
@@ -271,36 +315,35 @@ export function createAdminWorkspace(opts) {
         const os = resolveHostOs([s]);
         const ip = singleIp(s);
         const leadOs = os || s.device_os || null;
-        const osTag = osBadge(leadOs, "server");
+        const clean = ip ? meaningfulHostName(s.name, ip, os) : s.name;
+        const { isLocal, isSelfAccount, parts } = buildServiceMeta(s, clean, ctx);
+        const localPrefix = isLocal ? (isSelfAccount ? `${t("badge_local")} · ${t("source_self")}` : t("badge_local")) : "";
+        const osTag = osBadge(leadOs, { fallback: "server", local: isLocal, prefix: localPrefix });
         const title = el("div", "host-title-line", ...(osTag ? [osTag] : []), el("p", "endpoint", formatEndpoint(s.rules, isZh())));
         if (kind !== "tcp") title.append(el("span", "proto-tag", kind.toUpperCase()));
-        const clean = ip ? meaningfulHostName(s.name, ip, os) : s.name;
         const devTag = os && s.device_os && deviceOsLabel(s.device_os) !== osLabel(os) ? osBadge(s.device_os) : null;
-        const source = [s.member, s.device].filter(Boolean).join(" · ");
-        const sub = [clean, source].filter(Boolean).join(" · ");
-        const subRow = sub ? el("span", "entity-meta", sub) : null;
-        if (devTag && subRow) {
-          const metaLine = el("div", "service-meta", subRow, devTag);
-          wrap.append(el("article", "service-row", el("div", "service-main", title, metaLine), el("span", "state-dot good", t("broadcasting"))));
-          continue;
+        const metaNodes = [];
+        if (parts.length || devTag) {
+          const metaLine = appendMetaWithSeps(el("div", "service-meta"), parts);
+          if (devTag) metaLine.append(devTag);
+          metaNodes.push(metaLine);
         }
-        const main = el("div", "service-main", title, ...(subRow ? [subRow] : []));
+        const main = el("div", "service-main", title, ...metaNodes);
         wrap.append(el("article", "service-row", main, el("span", "state-dot good", t("broadcasting"))));
         continue;
       }
       const os = resolveHostOs(entry.items);
       const first = entry.items[0];
       const leadOs = os || first.device_os || null;
-      const osTag = osBadge(leadOs, "server");
-      const title = el("div", "host-title-line", ...(osTag ? [osTag] : []), el("p", "endpoint", entry.ip));
       const clean = meaningfulHostName(first.name, entry.ip, os);
+      const { isLocal, isSelfAccount, parts } = buildServiceMeta(first, clean, ctx);
+      const localPrefix = isLocal ? (isSelfAccount ? `${t("badge_local")} · ${t("source_self")}` : t("badge_local")) : "";
+      const osTag = osBadge(leadOs, { fallback: "server", local: isLocal, prefix: localPrefix });
+      const title = el("div", "host-title-line", ...(osTag ? [osTag] : []), el("p", "endpoint", entry.ip));
       const devTag = os && first.device_os && deviceOsLabel(first.device_os) !== osLabel(os) ? osBadge(first.device_os) : null;
-      const source = [first.member, first.device].filter(Boolean).join(" · ");
-      const sub = [clean, source].filter(Boolean).join(" · ");
       const subNodes = [];
-      if (sub || devTag) {
-        const metaLine = el("div", "service-meta");
-        if (sub) metaLine.append(el("span", "entity-meta", sub));
+      if (parts.length || devTag) {
+        const metaLine = appendMetaWithSeps(el("div", "service-meta"), parts);
         if (devTag) metaLine.append(devTag);
         subNodes.push(metaLine);
       }
@@ -369,7 +412,7 @@ export function createAdminWorkspace(opts) {
     btns.push(refreshBtn);
 
     const joinBtn = createIconButton({
-      icon: "link",
+      icon: "share",
       title: t("join"),
       variant: "ghost",
       size: "md",
@@ -380,15 +423,26 @@ export function createAdminWorkspace(opts) {
     return btns;
   }
 
-  function renderPanel() {
-    const panel = el("section", "panel");
+  function renderPanel({ enterPanel = false, enterBody = false } = {}) {
+    const panel = el("section", enterPanel ? "panel panel-enter" : "panel");
+    const ctx = opts.getContext?.() || {};
+
+    if (data) {
+      const nav = el("nav", "tabs");
+      renderTabs(nav);
+      const toolbar = el("div", "toolbar", ...buildToolbarButtons());
+      panel.append(el("div", "panel-bar", nav, toolbar));
+    }
+
+    const body = el("div", enterBody && !enterPanel ? "panel-body panel-enter" : "panel-body");
     if (errorText) {
       const err = el("p", "feedback error panel-feedback", errorText);
       err.setAttribute("role", "alert");
-      panel.append(err);
+      body.append(err);
     }
     if (!data) {
-      panel.append(el("p", "loading", loading ? t("loading") : (errorText || t("loading"))));
+      body.append(el("p", "loading", loading ? t("loading") : (errorText || t("loading"))));
+      panel.append(body);
       return panel;
     }
 
@@ -425,44 +479,61 @@ export function createAdminWorkspace(opts) {
         }
         return entityRow(
           u.name,
-          u.admin ? "admin" : u.disabled ? "disabled" : "enabled",
-          u.admin ? "" : u.disabled ? "bad" : "good",
-          menu
+          u.disabled ? "disabled" : u.admin ? "admin" : "enabled",
+          u.disabled ? "bad" : "good",
+          menu,
+          {
+            metaNodes: isSelf ? [el("span", "source-tag self", t("source_self"))] : [],
+            selfName: isSelf,
+          }
         );
       }));
-      panel.append(list);
+      if (data.users.length <= 1) list.dataset.single = "1";
+      body.append(list);
     } else if (tab === 1) {
       if (!data.devices.length) {
-        panel.append(el("p", "empty", t("devices_empty")));
+        body.append(el("p", "empty", t("devices_empty")));
       } else {
-        const list = el("div", "list-card", ...data.devices.map((d) => {
+        const isLocalDevice = (d) =>
+          !!(ctx.deviceId && d.id === ctx.deviceId)
+          || (!d.revoked && !!ctx.machineId && d.machine_id === ctx.machineId
+            && (!ctx.member || d.member === ctx.member));
+        const ordered = [...data.devices].sort((a, b) => {
+          const al = isLocalDevice(a) ? 1 : 0;
+          const bl = isLocalDevice(b) ? 1 : 0;
+          return bl - al;
+        });
+        const list = el("div", "list-card", ...ordered.map((d) => {
+          const local = isLocalDevice(d);
           const shortId = `#${(d.machine_id || d.id || "").slice(0, 6)}`;
-          const meta = [d.member, shortId].filter(Boolean).join(" · ");
+          const metaNodes = [];
+          if (local) metaNodes.push(el("span", "source-tag self", t("badge_local")));
+          if (d.member) metaNodes.push(el("span", "entity-meta", d.member));
+          if (shortId) metaNodes.push(el("span", "entity-meta", shortId));
           return entityRow(
             d.label,
             d.revoked ? "revoked" : d.online ? "online_state" : "offline_state",
             d.revoked ? "bad" : d.online ? "good" : "",
-            d.revoked ? [] : [
+            d.revoked || local ? [] : [
               { icon: "close", label: t("revoke"), danger: true, onSelect: () => openActionDialog({ op: "revoke", device: d.id }, d.label) },
             ],
-            meta,
-            d.os || null,
-            true
+            {
+              metaNodes,
+              osType: d.os || null,
+              fallbackOs: true,
+              local,
+              selfName: local,
+            }
           );
         }));
-        panel.append(list);
+        if (ordered.length <= 1) list.dataset.single = "1";
+        body.append(list);
       }
     } else {
-      panel.append(services.length ? renderServices(services) : el("p", "empty", t("services_empty")));
+      body.append(services.length ? renderServices(services, ctx) : el("p", "empty", t("services_empty")));
     }
+    panel.append(body);
     return panel;
-  }
-
-  function renderSubbar() {
-    const subtabs = el("div", "admin-subtabs");
-    renderTabs(subtabs);
-    const subactions = el("div", "admin-subactions", ...buildToolbarButtons());
-    return el("div", "admin-subbar", subtabs, subactions);
   }
 
   return {
@@ -473,7 +544,6 @@ export function createAdminWorkspace(opts) {
     setTabIndex,
     openJoinDialog,
     renderTabs,
-    renderSubbar,
     buildToolbarButtons,
     renderPanel,
     onUpdate(fn) {

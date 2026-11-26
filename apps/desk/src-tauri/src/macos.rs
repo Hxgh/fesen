@@ -71,6 +71,9 @@ fn notify_menu_status(reply: &Result<Value, String>) {
     static LAST: AtomicI32 = AtomicI32::new(-1);
     let next = match reply {
         Ok(val) => {
+            if val.get("unchanged").and_then(Value::as_bool) == Some(true) {
+                return;
+            }
             let data = &val["data"];
             if data["online"].as_bool() == Some(true) {
                 2

@@ -1,4 +1,7 @@
-use crate::platform::{self, Platform};
+use crate::{
+    control,
+    platform::{self, Platform},
+};
 use fesen_proto::{Code, MAX_FRAME, origin};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{
@@ -10,15 +13,26 @@ use hyper::{
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
 use serde_json::Value;
-use std::{net::SocketAddr, sync::Arc, time::Duration};
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    time::timeout,
-};
+use std::{net::SocketAddr, time::Duration};
+use tokio::{sync::Mutex, task::JoinHandle, time::timeout};
 use tokio_rustls::TlsConnector;
 use url::Url;
 
 const MAX_ADMIN_BODY: usize = 4096;
+
+struct PooledConn {
+    origin: String,
+    sender: http1::SendRequest<Full<Bytes>>,
+    driver: JoinHandle<()>,
+}
+
+impl Drop for PooledConn {
+    fn drop(&mut self) {
+        self.driver.abort();
+    }
+}
+
+static POOL: Mutex<Option<PooledConn>> = Mutex::const_new(None);
 
 pub async fn session(platform: &dyn Platform, server: &str, token: &str) -> Result<Value, Code> {
     let base = origin(server)?;
@@ -72,21 +86,9 @@ fn parse_error(status: StatusCode, payload: &[u8]) -> Code {
     }
 }
 
-async fn send(
-    platform: &dyn Platform,
-    base: &Url,
-    method: Method,
-    path: &str,
-    token: Option<&str>,
-    body: Option<Vec<u8>>,
-) -> Result<(StatusCode, HeaderMap, Vec<u8>), Code> {
+async fn open_conn(platform: &dyn Platform, base: &Url, origin_key: String) -> Result<PooledConn, Code> {
     let host = base.host_str().ok_or(Code::Invalid)?;
     let port = base.port_or_known_default().ok_or(Code::Invalid)?;
-    let host_header = match base.port() {
-        Some(p) => format!("{host}:{p}"),
-        None => host.to_owned(),
-    };
-    let origin_header = base.origin().ascii_serialization();
 
     let tcp = timeout(Duration::from_secs(10), async {
         let addrs = tokio::net::lookup_host((host, port))
@@ -111,55 +113,134 @@ async fn send(
     .map_err(|_| Code::NotConnected)??;
 
     if base.scheme() == "https" {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        if let Ok(native) =
-            tokio::task::spawn_blocking(rustls_native_certs::load_native_certs).await
-        {
-            roots.add_parsable_certificates(native.certs);
-        }
-        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(|_| Code::Internal)?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        let config = control::tls_client_config().await?;
         let server_name = ServerName::try_from(host.to_owned()).map_err(|_| Code::Invalid)?;
-        let connector = TlsConnector::from(Arc::new(config));
+        let connector = TlsConnector::from(config);
         let tls = timeout(Duration::from_secs(6), connector.connect(server_name, tcp))
             .await
             .map_err(|_| Code::NotConnected)?
             .map_err(|_| Code::NotConnected)?;
-        exchange(tls, method, path, &host_header, &origin_header, token, body).await
-    } else {
-        exchange(tcp, method, path, &host_header, &origin_header, token, body).await
-    }
-}
-
-async fn exchange(
-    io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    method: Method,
-    path: &str,
-    host_header: &str,
-    origin_header: &str,
-    token: Option<&str>,
-    body: Option<Vec<u8>>,
-) -> Result<(StatusCode, HeaderMap, Vec<u8>), Code> {
-    timeout(Duration::from_secs(12), async {
-        let (mut sender, conn) = http1::Builder::new()
-            .handshake(TokioIo::new(io))
+        let (sender, conn) = http1::Builder::new()
+            .handshake(TokioIo::new(tls))
             .await
             .map_err(|_| Code::NotConnected)?;
         let driver = tokio::spawn(async move {
             let _ = conn.await;
         });
+        Ok(PooledConn {
+            origin: origin_key,
+            sender,
+            driver,
+        })
+    } else {
+        let (sender, conn) = http1::Builder::new()
+            .handshake(TokioIo::new(tcp))
+            .await
+            .map_err(|_| Code::NotConnected)?;
+        let driver = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        Ok(PooledConn {
+            origin: origin_key,
+            sender,
+            driver,
+        })
+    }
+}
 
+async fn send(
+    platform: &dyn Platform,
+    base: &Url,
+    method: Method,
+    path: &str,
+    token: Option<&str>,
+    body: Option<Vec<u8>>,
+) -> Result<(StatusCode, HeaderMap, Vec<u8>), Code> {
+    let host = base.host_str().ok_or(Code::Invalid)?;
+    let host_header = match base.port() {
+        Some(p) => format!("{host}:{p}"),
+        None => host.to_owned(),
+    };
+    let origin_header = base.origin().ascii_serialization();
+    let idempotent = method == Method::GET;
+
+    let cached = {
+        let mut slot = POOL.lock().await;
+        if slot.as_ref().is_some_and(|c| c.origin == origin_header) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+
+    let (mut active, reused) = match cached {
+        Some(mut c) => {
+            if c.sender.ready().await.is_ok() {
+                (c, true)
+            } else {
+                drop(c);
+                (open_conn(platform, base, origin_header.clone()).await?, false)
+            }
+        }
+        None => (open_conn(platform, base, origin_header.clone()).await?, false),
+    };
+
+    let result = exchange(
+        &mut active.sender,
+        method.clone(),
+        path,
+        &host_header,
+        &origin_header,
+        token,
+        body.as_deref(),
+    )
+    .await;
+
+    let (status, headers, data) = match result {
+        Ok(ok) => ok,
+        Err(_) if reused && idempotent => {
+            drop(active);
+            active = open_conn(platform, base, origin_header.clone()).await?;
+            exchange(
+                &mut active.sender,
+                method,
+                path,
+                &host_header,
+                &origin_header,
+                token,
+                body.as_deref(),
+            )
+            .await?
+        }
+        Err(err) => return Err(err),
+    };
+
+    let server_closed = headers
+        .get(header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("close"));
+    if !server_closed && !active.driver.is_finished() {
+        *POOL.lock().await = Some(active);
+    }
+
+    Ok((status, headers, data))
+}
+
+async fn exchange(
+    sender: &mut http1::SendRequest<Full<Bytes>>,
+    method: Method,
+    path: &str,
+    host_header: &str,
+    origin_header: &str,
+    token: Option<&str>,
+    body: Option<&[u8]>,
+) -> Result<(StatusCode, HeaderMap, Vec<u8>), Code> {
+    timeout(Duration::from_secs(12), async {
         let mut builder = Request::builder()
             .method(method)
             .uri(path)
             .header(header::HOST, host_header)
-            .header(header::CONNECTION, "close")
+            .header(header::CONNECTION, "keep-alive")
             .header(header::ORIGIN, origin_header)
             .header("x-fesen-admin", "1");
         if let Some(tok) = token {
@@ -168,7 +249,7 @@ async fn exchange(
         let bytes = match body {
             Some(b) => {
                 builder = builder.header(header::CONTENT_TYPE, "application/json");
-                Bytes::from(b)
+                Bytes::copy_from_slice(b)
             }
             None => Bytes::new(),
         };
@@ -185,7 +266,6 @@ async fn exchange(
             .map_err(|_| Code::Internal)?
             .to_bytes()
             .to_vec();
-        driver.abort();
         Ok((status, headers, data))
     })
     .await

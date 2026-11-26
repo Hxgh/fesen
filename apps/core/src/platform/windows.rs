@@ -5,6 +5,7 @@ use fesen_proto::DeviceOs;
 use socket2::Socket;
 use std::{
     cell::Cell,
+    collections::HashSet,
     ffi::{OsStr, OsString},
     fs, io,
     net::Ipv4Addr,
@@ -16,7 +17,10 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex, OnceLock, RwLock},
+    sync::{
+        Arc, OnceLock, RwLock,
+        atomic::{AtomicU32, Ordering},
+    },
     time::Duration,
 };
 use tokio::{runtime::Handle, sync::mpsc};
@@ -219,8 +223,9 @@ impl Drop for Adapter {
 }
 
 pub struct Windows {
-    adapter: Mutex<Option<Adapter>>,
-    input: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    adapter: RwLock<Option<Adapter>>,
+    own_index: AtomicU32,
+    input: OnceLock<mpsc::Sender<Vec<u8>>>,
     dll: PathBuf,
     network: RwLock<Network>,
     device: OnceLock<DeviceInfo>,
@@ -230,8 +235,9 @@ impl Windows {
     pub fn new(dll: PathBuf) -> Self {
         let _ = nrpt(None);
         Self {
-            adapter: Mutex::new(None),
-            input: Mutex::new(None),
+            adapter: RwLock::new(None),
+            own_index: AtomicU32::new(0),
+            input: OnceLock::new(),
             dll,
             network: RwLock::new(Network::default()),
             device: OnceLock::new(),
@@ -260,9 +266,8 @@ impl Windows {
         let source = session.clone();
         let input = self
             .input
-            .lock()
-            .unwrap()
-            .clone()
+            .get()
+            .cloned()
             .ok_or_else(|| io::Error::other("packet input closed"))?;
         let reader = std::thread::Builder::new()
             .name("fesen-wintun".into())
@@ -378,8 +383,10 @@ impl Platform for Windows {
     }
 
     fn network(&self) -> io::Result<Network> {
-        let adapter = self.adapter.lock().unwrap();
-        let own = adapter.as_ref().map(|a| a.index);
+        let own = match self.own_index.load(Ordering::Acquire) {
+            0 => None,
+            idx => Some(idx),
+        };
         let mut routes = Vec::new();
         let mut gateways = Vec::new();
         let mut ips = Vec::new();
@@ -486,29 +493,34 @@ impl Platform for Windows {
     }
 
     fn apply(&self, tun: &Tun) -> io::Result<()> {
-        let mut active = self.adapter.lock().unwrap();
+        let mut active = self.adapter.write().unwrap();
         if active
             .as_ref()
             .is_some_and(|a| a.config.address != tun.address)
         {
+            self.own_index.store(0, Ordering::Release);
             active.take();
         }
         let Some(ip) = tun.address else { return Ok(()) };
         if active.is_none() {
-            *active = Some(self.adapter(ip)?);
+            let created = self.adapter(ip)?;
+            self.own_index.store(created.index, Ordering::Release);
+            *active = Some(created);
         }
         let adapter = active.as_mut().unwrap();
         let result = (|| {
+            let desired: HashSet<Cidr> = tun.routes.iter().copied().collect();
             for route in &adapter.config.routes {
-                if !tun.routes.contains(route) {
+                if !desired.contains(route) {
                     unsafe {
                         DeleteIpForwardEntry2(&route_row(adapter.index, *route));
                     }
                 }
             }
-            adapter.config.routes.retain(|r| tun.routes.contains(r));
+            adapter.config.routes.retain(|r| desired.contains(r));
+            let mut installed: HashSet<Cidr> = adapter.config.routes.iter().copied().collect();
             for route in &tun.routes {
-                if !adapter.config.routes.contains(route) {
+                if installed.insert(*route) {
                     check(unsafe { CreateIpForwardEntry2(&route_row(adapter.index, *route)) })?;
                     adapter.config.routes.push(*route);
                 }
@@ -520,13 +532,14 @@ impl Platform for Windows {
             Ok(())
         })();
         if result.is_err() {
+            self.own_index.store(0, Ordering::Release);
             active.take();
         }
         result
     }
 
     fn write_packet(&self, bytes: &[u8]) {
-        if let Some(adapter) = self.adapter.lock().unwrap().as_ref()
+        if let Some(adapter) = self.adapter.read().unwrap().as_ref()
             && let Ok(mut packet) = adapter.session.allocate_send_packet(bytes.len() as u16)
         {
             packet.bytes_mut().copy_from_slice(bytes);
@@ -535,7 +548,7 @@ impl Platform for Windows {
     }
 
     fn set_input(&self, input: mpsc::Sender<Vec<u8>>) {
-        *self.input.lock().unwrap() = Some(input);
+        let _ = self.input.set(input);
     }
 }
 
@@ -679,14 +692,7 @@ unsafe fn gen_tray_icon(visual: u8, light: bool) -> (HICON, bool) {
 }
 
 fn core_visual_state(core: &Core) -> u8 {
-    let status = core.status();
-    if status.online {
-        2
-    } else if status.running {
-        1
-    } else {
-        0
-    }
+    core.visual_state()
 }
 
 struct TrayState {
@@ -890,6 +896,7 @@ pub async fn tray(core: Arc<Core>, gui: PathBuf) {
     });
     if let Ok((id, hwnd)) = rx.await {
         let mut last = initial;
+        let mut changes = core.subscribe_changes();
         let mut tick = tokio::time::interval(Duration::from_secs(2));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let stopped = core.wait_stopped();
@@ -897,13 +904,13 @@ pub async fn tray(core: Arc<Core>, gui: PathBuf) {
         loop {
             tokio::select! {
                 () = &mut stopped => break,
-                _ = tick.tick() => {
-                    let current = core_visual_state(&core);
-                    if current != last {
-                        last = current;
-                        unsafe { PostMessageW(hwnd as HWND, TRAY_STATE_MESSAGE, usize::from(current), 0) };
-                    }
-                }
+                Ok(()) = changes.changed() => {}
+                _ = tick.tick() => {}
+            }
+            let current = core_visual_state(&core);
+            if current != last {
+                last = current;
+                unsafe { PostMessageW(hwnd as HWND, TRAY_STATE_MESSAGE, usize::from(current), 0) };
             }
         }
         unsafe {

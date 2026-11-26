@@ -8,7 +8,7 @@ pub const VIRTUAL: Range<Ipv4Addr> = Range {
     end: Ipv4Addr::new(198, 19, 255, 255),
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Range<T> {
     pub start: T,
     pub end: T,
@@ -42,16 +42,13 @@ pub struct Rules {
 
 impl Rules {
     pub fn parse(ips: &str, ports: &str) -> Result<Self, &'static str> {
-        let items = |s: &str| {
+        fn items(s: &str) -> impl Iterator<Item = &str> {
             s.split([',', '，', '\n'])
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        };
+        }
         let value = Self {
             ips: items(ips)
-                .iter()
                 .map(|s| {
                     if s.contains('/') {
                         s.parse::<Cidr>().map(Cidr::range)
@@ -61,7 +58,6 @@ impl Rules {
                 })
                 .collect::<Result<_, _>>()?,
             ports: items(ports)
-                .iter()
                 .map(|s| parse_range(s, "端口格式错误"))
                 .collect::<Result<_, _>>()?,
         };
@@ -162,7 +158,7 @@ fn parse_range<T: FromStr + Copy>(s: &str, error: &'static str) -> Result<Range<
     Ok(Range { start, end })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Cidr {
     pub ip: Ipv4Addr,
@@ -240,16 +236,22 @@ impl From<Cidr> for String {
 pub type Interval = (u32, u32);
 
 pub fn union(ranges: impl IntoIterator<Item = Interval>) -> Vec<Interval> {
-    let mut sorted: Vec<_> = ranges.into_iter().collect();
-    sorted.sort_unstable();
-    let mut out: Vec<Interval> = Vec::new();
-    for (a, b) in sorted {
-        if let Some(last) = out.last_mut().filter(|r| a <= r.1.saturating_add(1)) {
-            last.1 = last.1.max(b);
+    let mut out: Vec<Interval> = ranges.into_iter().collect();
+    if out.len() <= 1 {
+        return out;
+    }
+    out.sort_unstable();
+    let mut write = 0;
+    for read in 1..out.len() {
+        let (a, b) = out[read];
+        if a <= out[write].1.saturating_add(1) {
+            out[write].1 = out[write].1.max(b);
         } else {
-            out.push((a, b));
+            write += 1;
+            out[write] = (a, b);
         }
     }
+    out.truncate(write + 1);
     out
 }
 

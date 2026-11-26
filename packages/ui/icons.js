@@ -14,13 +14,16 @@ const paths = {
   copy: "M8.5 8.5h11v11h-11zM5.5 15.5h-1v-11h11v1",
   external: "M14 4.5h5.5V10m0-5.5L10.5 13.5M10 5H5.5a1 1 0 0 0-1 1v12.5a1 1 0 0 0 1 1H18a1 1 0 0 0 1-1V14",
   link: "M10 13a4.5 4.5 0 0 0 6.36.54l2.5-2.5a4.5 4.5 0 0 0-6.36-6.36l-1.43 1.43M14 11a4.5 4.5 0 0 0-6.36-.54l-2.5 2.5a4.5 4.5 0 0 0 6.36 6.36l1.42-1.42",
+  share: "M20.5 5.5a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0ZM8.5 12a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0ZM20.5 18.5a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0ZM8.2 10.8l7.6-4.1M8.2 13.2l7.6 4.1",
   unlink: "m18.84 12.25 1.72-1.71a4.5 4.5 0 0 0-6.36-6.36l-1.72 1.71M5.17 11.75l-1.72 1.71a4.5 4.5 0 1 0 6.36 6.36l1.71-1.71M8 2v3M2 8h3M16 19v3M19 16h3",
   edit: "M15.8 5.2a2.1 2.1 0 0 1 3 3L8.5 18.5 4.5 19.5l1-4Z",
   settings: "M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 0 0-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 0 0-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 0 0-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 0 0-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 0 0 1.066-2.573c-.94-1.543.826-3.31 2.37-2.37c1 .608 2.296.07 2.572-1.065Z M12 15a3 3 0 1 0 0-6a3 3 0 0 0 0 6Z",
   sun: "M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364-.707-.707M6.343 6.343l-.707-.707m12.728 0-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0Z",
   moon: "M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z",
   monitor: "M4 4.5h16a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-10a1 1 0 0 1 1-1ZM8 20h8m-4-3.5V20",
-  shield: "M12 3s7 3 7 8c0 5-7 10-7 10S5 16 5 11c0-5 7-8 7-8Z",
+  shield: "M12 3.5 5 6.5v5c0 4.6 3 7.8 7 9.3 4-1.5 7-4.7 7-9.3v-5l-7-3Z",
+  console: "M4 4.5h6.5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-13a1 1 0 0 1 1-1ZM14.5 4.5H20a1 1 0 0 1 1 1V10a1 1 0 0 1-1 1h-5.5a1 1 0 0 1-1-1V5.5a1 1 0 0 1 1-1ZM14.5 14H20a1 1 0 0 1 1 1v3.5a1 1 0 0 1-1 1h-5.5a1 1 0 0 1-1-1V15a1 1 0 0 1 1-1Z",
+  home: "M4.5 10.5 12 4l7.5 6.5V19a1 1 0 0 1-1 1H14v-5h-4v5H5.5a1 1 0 0 1-1-1v-8.5Z",
   check: "m5 13 4 4L19 7",
   alert: "m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3ZM12 9v4m0 4h.01",
   close: "M17.5 6.5 6.5 17.5M6.5 6.5l11 11",
@@ -50,23 +53,29 @@ const osTitles = {
   android: "Android",
 };
 
+const osIconCache = new Map();
+const iconCache = new Map();
+
 /**
  * Monochrome operating system icon SVG.
  * @param {"windows" | "macos" | "linux" | "android"} os
  */
 export function osIcon(os) {
-  const svg = document.createElementNS(NS, "svg");
-  for (const [key, value] of Object.entries({
-    viewBox: "0 0 24 24",
-    fill: "currentColor",
-    "aria-hidden": "true",
-    class: "icon os-icon",
-  })) svg.setAttribute(key, value);
-  const path = document.createElementNS(NS, "path");
-  path.setAttribute("d", osPaths[os] || osPaths.linux);
-  if (os === "linux" || os === "android") path.setAttribute("fill-rule", "evenodd");
-  svg.append(path);
-  return svg;
+  const key = osPaths[os] ? os : "linux";
+  let proto = osIconCache.get(key);
+  if (!proto) {
+    proto = document.createElementNS(NS, "svg");
+    proto.setAttribute("viewBox", "0 0 24 24");
+    proto.setAttribute("fill", "currentColor");
+    proto.setAttribute("aria-hidden", "true");
+    proto.setAttribute("class", "icon os-icon");
+    const path = document.createElementNS(NS, "path");
+    path.setAttribute("d", osPaths[key]);
+    if (key === "linux" || key === "android") path.setAttribute("fill-rule", "evenodd");
+    proto.append(path);
+    osIconCache.set(key, proto);
+  }
+  return /** @type {SVGSVGElement} */ (proto.cloneNode(true));
 }
 
 /**
@@ -116,35 +125,36 @@ export function osBadge(os, opts = false, fallbackTitle = "") {
 
 /** @param {keyof typeof paths | "more"} name */
 export function icon(name) {
-  const svg = document.createElementNS(NS, "svg");
-  for (const [key, value] of Object.entries({
-    viewBox: "0 0 24 24",
-    fill: "none",
-    stroke: "currentColor",
-    "stroke-width": "1.6",
-    "stroke-linecap": "round",
-    "stroke-linejoin": "round",
-    "aria-hidden": "true",
-    class: "icon",
-  })) svg.setAttribute(key, value);
-
-  if (name === "more") {
-    svg.setAttribute("fill", "currentColor");
-    svg.setAttribute("stroke", "none");
-    for (const cx of [6.5, 12, 17.5]) {
-      const c = document.createElementNS(NS, "circle");
-      c.setAttribute("cx", String(cx));
-      c.setAttribute("cy", "12");
-      c.setAttribute("r", "1.35");
-      svg.append(c);
+  const key = name === "more" || paths[name] ? name : "server";
+  let proto = iconCache.get(key);
+  if (!proto) {
+    proto = document.createElementNS(NS, "svg");
+    proto.setAttribute("viewBox", "0 0 24 24");
+    proto.setAttribute("aria-hidden", "true");
+    proto.setAttribute("class", "icon");
+    if (key === "more") {
+      proto.setAttribute("fill", "currentColor");
+      proto.setAttribute("stroke", "none");
+      for (const cx of ["6.5", "12", "17.5"]) {
+        const c = document.createElementNS(NS, "circle");
+        c.setAttribute("cx", cx);
+        c.setAttribute("cy", "12");
+        c.setAttribute("r", "1.35");
+        proto.append(c);
+      }
+    } else {
+      proto.setAttribute("fill", "none");
+      proto.setAttribute("stroke", "currentColor");
+      proto.setAttribute("stroke-width", "1.6");
+      proto.setAttribute("stroke-linecap", "round");
+      proto.setAttribute("stroke-linejoin", "round");
+      const path = document.createElementNS(NS, "path");
+      path.setAttribute("d", paths[key]);
+      proto.append(path);
     }
-    return svg;
+    iconCache.set(key, proto);
   }
-
-  const path = document.createElementNS(NS, "path");
-  path.setAttribute("d", paths[name] || paths.server);
-  svg.append(path);
-  return svg;
+  return /** @type {SVGSVGElement} */ (proto.cloneNode(true));
 }
 
 /**
@@ -222,23 +232,22 @@ const YAO_ROWS = [
 
 function buildTrigramSvg(mask, state) {
   const svg = document.createElementNS(NS, "svg");
-  for (const [key, value] of Object.entries({
-    viewBox: "0 0 64 64",
-    fill: "currentColor",
-    "aria-hidden": "true",
-    class: "brand-mark",
-    "data-state": state,
-    "data-mask": String(mask),
-  })) svg.setAttribute(key, value);
+  svg.setAttribute("viewBox", "0 0 64 64");
+  svg.setAttribute("fill", "currentColor");
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("class", "brand-mark");
+  svg.setAttribute("data-state", state);
+  svg.setAttribute("data-mask", String(mask));
 
+  const groups = [];
   for (const row of YAO_ROWS) {
     const g = document.createElementNS(NS, "g");
     g.setAttribute("class", row.cls);
     g.setAttribute("data-yang", (mask & row.bit) ? "1" : "0");
     g.setAttribute("data-hot", "0");
-    for (const [x, cls] of [[4, "yao-l"], [32, "yao-r"]]) {
+    for (const [x, cls] of [["4", "yao-l"], ["32", "yao-r"]]) {
       const rect = document.createElementNS(NS, "rect");
-      rect.setAttribute("x", String(x));
+      rect.setAttribute("x", x);
       rect.setAttribute("y", String(row.y));
       rect.setAttribute("width", "28");
       rect.setAttribute("height", "12");
@@ -246,17 +255,19 @@ function buildTrigramSvg(mask, state) {
       g.append(rect);
     }
     svg.append(g);
+    groups.push(g);
   }
-  return svg;
+  return { svg, groups };
 }
 
-function applyTrigramMask(svg, mask, changedBit = 0) {
+function applyTrigramMask(svg, groups, mask, changedBit = 0) {
   svg.setAttribute("data-mask", String(mask));
-  for (const row of YAO_ROWS) {
-    const g = svg.querySelector(`.${row.cls}`);
+  for (let i = 0; i < YAO_ROWS.length; i++) {
+    const g = groups[i];
     if (!g) continue;
-    g.setAttribute("data-yang", (mask & row.bit) ? "1" : "0");
-    g.setAttribute("data-hot", changedBit === 0 || (changedBit & row.bit) ? "1" : "0");
+    const bit = YAO_ROWS[i].bit;
+    g.setAttribute("data-yang", (mask & bit) ? "1" : "0");
+    g.setAttribute("data-hot", changedBit === 0 || (changedBit & bit) ? "1" : "0");
   }
 }
 
@@ -273,6 +284,10 @@ function shortestSingleYaoPath(from, to) {
   return steps;
 }
 
+const reducedMotionQuery = typeof window !== "undefined"
+  ? window.matchMedia?.("(prefers-reduced-motion: reduce)")
+  : null;
+
 /**
  * Reusable Bagua state-machine brand mark component.
  * Uses organic 2-stroke ink fusion (left & right strokes extend/retract toward center)
@@ -284,7 +299,7 @@ function shortestSingleYaoPath(from, to) {
  */
 export function createTrigram(initialState = "idle") {
   const initialMask = initialState === "active" ? 0b100 : initialState === "connecting" ? 0b001 : 0b000;
-  const el = buildTrigramSvg(initialMask, initialState);
+  const { svg: el, groups } = buildTrigramSvg(initialMask, initialState);
   let state = initialState;
   let mask = initialMask;
   let prevMask = -1;
@@ -293,8 +308,7 @@ export function createTrigram(initialState = "idle") {
   let lastPathIdx = -1;
   let stepIndex = 0;
 
-  const reducedMotion = () =>
-    typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  const reducedMotion = () => !!reducedMotionQuery?.matches;
 
   function clearTimer() {
     if (timer) {
@@ -307,7 +321,7 @@ export function createTrigram(initialState = "idle") {
     const diff = highlightChanged ? (mask ^ next) : 0;
     prevMask = mask;
     mask = next;
-    applyTrigramMask(el, mask, diff);
+    applyTrigramMask(el, groups, mask, diff);
   }
 
   function nextWalkMask() {
@@ -429,5 +443,5 @@ export function createTrigram(initialState = "idle") {
  */
 export function brandMark(state = "active") {
   const mask = state === "idle" ? 0b000 : 0b100;
-  return buildTrigramSvg(mask, state === "ready" ? "active" : state);
+  return buildTrigramSvg(mask, state === "ready" ? "active" : state).svg;
 }

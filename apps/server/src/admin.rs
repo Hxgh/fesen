@@ -13,9 +13,56 @@ use axum::{
 use fesen_proto::Code;
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 
-fn js_asset(body: &'static str) -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], body)
+fn asset_etag(body: &'static str) -> HeaderValue {
+    let digest = Sha256::digest(body.as_bytes());
+    let tag = format!("\"{}\"", hex::encode(&digest[..8]));
+    HeaderValue::from_str(&tag).unwrap()
+}
+
+fn static_asset(
+    content_type: &'static str,
+    body: &'static str,
+    etag: &'static OnceLock<HeaderValue>,
+    headers: &HeaderMap,
+) -> Response {
+    let etag = etag.get_or_init(|| asset_etag(body));
+    let matched = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|raw| {
+            let expected = etag.to_str().unwrap_or("");
+            raw.split(',')
+                .map(str::trim)
+                .any(|cand| cand == "*" || cand == expected || cand.strip_prefix("W/") == Some(expected))
+        });
+    if matched {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, etag.clone()),
+                (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+            ],
+        )
+            .into_response();
+    }
+    (
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
+            (header::ETAG, etag.clone()),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+fn js_route(body: &'static str, etag: &'static OnceLock<HeaderValue>) -> axum::routing::MethodRouter<App> {
+    get(move |headers: HeaderMap| async move {
+        static_asset("text/javascript; charset=utf-8", body, etag, &headers)
+    })
 }
 
 fn canonical_entry(uri: &Uri, headers: &HeaderMap, app: &App) -> Option<Response> {
@@ -23,17 +70,24 @@ fn canonical_entry(uri: &Uri, headers: &HeaderMap, app: &App) -> Option<Response
         .authority()
         .map(|a| a.as_str())
         .or_else(|| headers.get(header::HOST).and_then(|v| v.to_str().ok()))?;
-    let expected_host = app.origin.host_str()?;
-    let expected_authority = match app.origin.port() {
-        Some(p) => format!("{expected_host}:{p}"),
-        None => expected_host.to_owned(),
-    };
-    if host.eq_ignore_ascii_case(&expected_authority) {
+    if app.expected_authority.is_empty()
+        || host.eq_ignore_ascii_case(app.expected_authority.as_ref())
+    {
         return None;
     }
     let target = app.origin.join("/admin/").ok()?;
     Some(axum::response::Redirect::temporary(target.as_str()).into_response())
 }
+
+static ETAG_APP_JS: OnceLock<HeaderValue> = OnceLock::new();
+static ETAG_ICONS_JS: OnceLock<HeaderValue> = OnceLock::new();
+static ETAG_THEME_JS: OnceLock<HeaderValue> = OnceLock::new();
+static ETAG_I18N_JS: OnceLock<HeaderValue> = OnceLock::new();
+static ETAG_POPOVER_JS: OnceLock<HeaderValue> = OnceLock::new();
+static ETAG_HOST_CARD_JS: OnceLock<HeaderValue> = OnceLock::new();
+static ETAG_SETTINGS_JS: OnceLock<HeaderValue> = OnceLock::new();
+static ETAG_ADMIN_VIEW_JS: OnceLock<HeaderValue> = OnceLock::new();
+static ETAG_STYLE_CSS: OnceLock<HeaderValue> = OnceLock::new();
 
 pub fn router() -> Router<App> {
     Router::new()
@@ -48,24 +102,26 @@ pub fn router() -> Router<App> {
                 },
             ),
         )
-        .route("/app.js", get(|| async { js_asset(include_str!("../web/app.js")) }))
-        .route("/icons.js", get(|| async { js_asset(include_str!("../../../packages/ui/icons.js")) }))
-        .route("/theme.js", get(|| async { js_asset(include_str!("../../../packages/ui/theme.js")) }))
-        .route("/i18n.js", get(|| async { js_asset(include_str!("../../../packages/ui/i18n.js")) }))
-        .route("/popover.js", get(|| async { js_asset(include_str!("../../../packages/ui/popover.js")) }))
-        .route("/host-card.js", get(|| async { js_asset(include_str!("../../../packages/ui/host-card.js")) }))
-        .route("/settings.js", get(|| async { js_asset(include_str!("../../../packages/ui/settings.js")) }))
-        .route("/admin-view.js", get(|| async { js_asset(include_str!("../../../packages/ui/admin-view.js")) }))
+        .route("/app.js", js_route(include_str!("../web/app.js"), &ETAG_APP_JS))
+        .route("/icons.js", js_route(include_str!("../../../packages/ui/icons.js"), &ETAG_ICONS_JS))
+        .route("/theme.js", js_route(include_str!("../../../packages/ui/theme.js"), &ETAG_THEME_JS))
+        .route("/i18n.js", js_route(include_str!("../../../packages/ui/i18n.js"), &ETAG_I18N_JS))
+        .route("/popover.js", js_route(include_str!("../../../packages/ui/popover.js"), &ETAG_POPOVER_JS))
+        .route("/host-card.js", js_route(include_str!("../../../packages/ui/host-card.js"), &ETAG_HOST_CARD_JS))
+        .route("/settings.js", js_route(include_str!("../../../packages/ui/settings.js"), &ETAG_SETTINGS_JS))
+        .route("/admin-view.js", js_route(include_str!("../../../packages/ui/admin-view.js"), &ETAG_ADMIN_VIEW_JS))
         .route(
             "/style.css",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+            get(|headers: HeaderMap| async move {
+                static_asset(
+                    "text/css; charset=utf-8",
                     concat!(
                         include_str!("../../../packages/ui/base.css"),
                         "\n",
                         include_str!("../web/style.css")
                     ),
+                    &ETAG_STYLE_CSS,
+                    &headers,
                 )
             }),
         )
@@ -79,7 +135,9 @@ pub fn router() -> Router<App> {
 async fn headers(req: axum::extract::Request, next: Next) -> Response {
     let mut r = next.run(req).await;
     let headers = r.headers_mut();
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers
+        .entry(header::CACHE_CONTROL)
+        .or_insert_with(|| HeaderValue::from_static("no-store"));
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -120,7 +178,7 @@ fn check(headers: &HeaderMap, app: &App) -> Result<(), Code> {
     if headers.get("x-fesen-admin").is_none_or(|h| h != "1")
         || headers
             .get(header::ORIGIN)
-            .is_some_and(|h| h != app.origin.origin().ascii_serialization().as_str())
+            .is_some_and(|h| h != app.origin_header.as_ref())
     {
         return Err(Code::Unauthorized);
     }
@@ -188,17 +246,15 @@ async fn session(State(app): State<App>, headers: HeaderMap) -> Result<Response,
     for d in &mut devices {
         d.online = g.online.contains_key(&d.id);
     }
-    let mut link = url::Url::parse("fesen://join").unwrap();
-    link.query_pairs_mut()
-        .append_pair("server", app.origin.as_str());
-    let view = g.view();
+    let services = g.services();
+    drop(g);
     Ok(
         Json(json!({
             "admin": admin,
             "users": users,
             "devices": devices,
-            "link": link.as_str(),
-            "services": view.services,
+            "link": app.join_link.as_ref(),
+            "services": services,
         }))
         .into_response(),
     )
@@ -226,13 +282,13 @@ async fn action(
     Json(action): Json<Action>,
 ) -> Result<Response, Failure> {
     check(&headers, &app)?;
-    gate(&app.inner.lock().unwrap(), &headers)?;
     let changed = match action {
         Action::Create {
             username,
             password,
             admin,
         } => {
+            gate(&app.inner.lock().unwrap(), &headers)?;
             let hash = app.hash(password).await?;
             let g = app.inner.lock().unwrap();
             gate(&g, &headers)?;
@@ -240,6 +296,7 @@ async fn action(
             false
         }
         Action::Reset { username, password } => {
+            gate(&app.inner.lock().unwrap(), &headers)?;
             let hash = app.hash(password).await?;
             let mut g = app.inner.lock().unwrap();
             gate(&g, &headers)?;

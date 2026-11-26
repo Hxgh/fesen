@@ -76,8 +76,10 @@ type HostProbe = {
   cancelled?: boolean;
 };
 type Status = {
+  version?: number;
   server: string;
   member: string | null;
+  device_id?: string | null;
   machine_id?: string;
   device_os?: DeviceOs;
   device_name?: string;
@@ -110,7 +112,7 @@ type Status = {
   admin_data?: unknown;
 };
 type Request = Record<string, unknown> & { op: string };
-type Reply = { data?: Status; error?: string };
+type Reply = { data?: Status; unchanged?: boolean; error?: string };
 type BrandState = "idle" | "connecting" | "active";
 type IconName = Parameters<typeof icon>[0];
 type MenuEntry =
@@ -384,16 +386,70 @@ function matchesTokens(haystack: string, tokens: string[]): boolean {
   return tokens.every((tok) => haystack.includes(tok));
 }
 
+type StatusIndex = {
+  labels: Map<string, Label>;
+  forwards: Map<string, LocalForwardStatus[]>;
+  active: Set<string>;
+  remoteHaystack: Map<string, string>;
+  localHaystack: Map<string, string>;
+  locale: string;
+};
+const EMPTY_FORWARDS: LocalForwardStatus[] = [];
+const statusIndexCache = new WeakMap<Status, StatusIndex>();
+
+function indexOf(data: Status): StatusIndex {
+  const curLocale = i18n.getLocale();
+  let idx = statusIndexCache.get(data);
+  if (idx) {
+    if (idx.locale !== curLocale) {
+      idx.remoteHaystack.clear();
+      idx.localHaystack.clear();
+      idx.locale = curLocale;
+    }
+    return idx;
+  }
+  const labels = new Map<string, Label>();
+  for (const l of data.labels) labels.set(l.service, l);
+  const forwards = new Map<string, LocalForwardStatus[]>();
+  if (data.forwards) {
+    for (const f of data.forwards) {
+      const arr = forwards.get(f.service);
+      if (arr) arr.push(f);
+      else forwards.set(f.service, [f]);
+    }
+  }
+  idx = {
+    labels,
+    forwards,
+    active: new Set(data.active),
+    remoteHaystack: new Map(),
+    localHaystack: new Map(),
+    locale: curLocale,
+  };
+  statusIndexCache.set(data, idx);
+  return idx;
+}
+
+const labelFor = (serviceId: string, data?: Status): Label | undefined =>
+  data ? indexOf(data).labels.get(serviceId) : undefined;
+
+const isActiveShare = (shareId: string, data?: Status): boolean =>
+  data ? indexOf(data).active.has(shareId) : false;
+
 function remoteSearchHaystack(s: Offering, data: Status): string {
-  const label = data.labels.find((l) => l.service === s.id);
+  const idx = indexOf(data);
+  const key = serviceKey(s);
+  const cached = idx.remoteHaystack.get(key);
+  if (cached !== undefined) return cached;
+  const label = idx.labels.get(s.id);
   const kind = effectiveKind(s);
   const os = resolveHostOs([s]);
   const devOs = deviceOsLabel(s.device_os);
   const ips = addresses(s.rules.ips, mapsForService(s.id, data));
   const endpointOrig = endpoint(s.rules.ips, s.rules.ports);
   const endpointAccess = endpoint([...ips.original, ...ips.virtual], s.rules.ports);
-  const fwds = forwardsOfService(s.id, data);
-  return [
+  const fwds = idx.forwards.get(s.id) ?? EMPTY_FORWARDS;
+  const text = [
     s.name,
     label?.remark ?? "",
     label?.alias ?? "",
@@ -409,13 +465,18 @@ function remoteSearchHaystack(s: Offering, data: Status): string {
     inputRanges(s.rules.ports),
     ...fwds.map((f) => `127.0.0.1:${f.local_port} ${f.local_port} ${f.target_ip}:${f.target_port}`),
   ].join(" ").toLowerCase();
+  idx.remoteHaystack.set(key, text);
+  return text;
 }
 
 function localSearchHaystack(s: Share, data: Status): string {
+  const idx = indexOf(data);
+  const cached = idx.localHaystack.get(s.id);
+  if (cached !== undefined) return cached;
   const kind = effectiveKind(s);
   const os = resolveHostOs([s]);
-  const active = data.active.includes(s.id);
-  return [
+  const active = idx.active.has(s.id);
+  const text = [
     s.name,
     data.device_name ?? "",
     `${t("badge_local")} ${t("source_self")} 本机 本账号 local my account`,
@@ -426,6 +487,8 @@ function localSearchHaystack(s: Share, data: Status): string {
     inputRanges(s.rules.ports),
     active ? `${t("published")} 共享中 sharing` : "",
   ].join(" ").toLowerCase();
+  idx.localHaystack.set(s.id, text);
+  return text;
 }
 
 function syncSearchBar(_data?: Status, matchCount?: number, totalCount?: number) {
@@ -501,7 +564,6 @@ const probes = new Map<string, Probe>();
 const serviceKey = (service: Offering) => `${service.owner}:${service.id}`;
 const content = document.querySelector<HTMLDivElement>("#content")!;
 const actions = document.querySelector<HTMLDivElement>("#actions")!;
-const navTabs = document.querySelector<HTMLElement>("#nav-tabs")!;
 const brandBadge = document.querySelector<HTMLSpanElement>("#brand-badge")!;
 const brandMarkHost = document.querySelector<HTMLSpanElement>("#brand-mark")!;
 const brandNameEl = document.querySelector<HTMLSpanElement>("#brand-name")!;
@@ -526,21 +588,50 @@ function computeBrandState(): BrandState {
   return "active";
 }
 
+let lastWinTitle = "";
+let lastBrandName = "";
+let lastBrandTip = "";
+let cachedServerUrl = "";
+let cachedServerHost = "";
+
+function serverHost(server: string | undefined): string {
+  if (!server) return "";
+  if (server === cachedServerUrl) return cachedServerHost;
+  cachedServerUrl = server;
+  try {
+    cachedServerHost = new URL(server).host;
+  } catch {
+    cachedServerHost = "";
+  }
+  return cachedServerHost;
+}
+
 function syncBrand(instant = false) {
   const name = t("brand");
-  const title = tab === "admin" ? t("admin_title") : name;
-  document.title = title;
-  void getCurrentWindow().setTitle(title).catch(() => {});
-  brandNameEl.textContent = name;
+  const isAdminView = tab === "admin" && !!status?.member && !!status?.admin_ready;
+  const title = isAdminView ? t("admin_title") : name;
+  if (title !== lastWinTitle) {
+    lastWinTitle = title;
+    document.title = title;
+    void getCurrentWindow().setTitle(title).catch(() => {});
+  }
+  if (name !== lastBrandName) {
+    lastBrandName = name;
+    brandNameEl.textContent = name;
+  }
   const state = computeBrandState();
   topMark.setState(state, instant);
-  const hostText = status?.member && status.server ? new URL(status.server).host : "";
+  const hostText = status?.member ? serverHost(status.server) : "";
   const statusTip = state === "active"
     ? (isZh() ? "已连接" : "Connected")
     : state === "connecting"
       ? (isZh() ? "连接中" : "Connecting")
       : (isZh() ? "未连接" : "Disconnected");
-  brandBadge.title = [name, statusTip, hostText].filter(Boolean).join(" · ");
+  const tip = [name, statusTip, hostText].filter(Boolean).join(" · ");
+  if (tip !== lastBrandTip) {
+    lastBrandTip = tip;
+    brandBadge.title = tip;
+  }
 }
 
 syncBrand(true);
@@ -678,6 +769,11 @@ const adminWorkspace = createAdminWorkspace({
   isZh,
   failure,
   dialog: editor,
+  getContext: () => ({
+    member: status?.member,
+    machineId: status?.machine_id,
+    deviceId: status?.device_id,
+  }),
   transport: {
     session: async () => {
       const reply = await request({ op: "admin_session" }, false);
@@ -766,10 +862,10 @@ const accessIpFor = (serviceId: string, ip: string, data?: Status) =>
   accessIp(ip, mapsForService(serviceId, data));
 
 const forwardFor = (serviceId: string, ip: string, port: number, data?: Status): LocalForwardStatus | undefined =>
-  data?.forwards?.find(f => f.service === serviceId && f.target_ip === ip && f.target_port === port);
+  forwardsOfService(serviceId, data).find(f => f.target_ip === ip && f.target_port === port);
 
 const forwardsOfService = (serviceId: string, data?: Status): LocalForwardStatus[] =>
-  data?.forwards?.filter(f => f.service === serviceId) ?? [];
+  data ? (indexOf(data).forwards.get(serviceId) ?? EMPTY_FORWARDS) : EMPTY_FORWARDS;
 
 const kindBadgeText = (kind: ServiceKind) => kind.toUpperCase();
 
@@ -1439,7 +1535,7 @@ function portConflictPill(fwd: LocalForwardStatus): HTMLElement {
 
 function groupSingleRow(service: Offering, data: Status, routing: boolean, showSource = false, includeMember = true) {
   const kind = effectiveKind(service);
-  const label = data.labels.find((l) => l.service === service.id);
+  const label = labelFor(service.id, data);
   const { ips, overlapped, fwds, singleFwd, badge, httpTag, note, result } = probeVisual(service, data, routing);
   const origEndpoint = endpoint(service.rules.ips, service.rules.ports);
   const address = singleFwd ? `127.0.0.1:${singleFwd.local_port}` : endpoint([...ips.original, ...ips.virtual], service.rules.ports);
@@ -1547,7 +1643,7 @@ function groupHostCard(
   const expanded = forceExpand || !isCollapsed(collapseKey);
   const firstAccess = accessIpFor(items[0]!.id, ip, data);
   const overlapped = items.some(s => accessIpFor(s.id, ip, data) !== ip);
-  const labels = items.map(s => data.labels.find(l => l.service === s.id));
+  const labels = items.map(s => labelFor(s.id, data));
   const rawHostName = labels.find(l => l?.remark)?.remark || items[0]!.name;
   const alias = labels.map(l => l?.alias).find((a): a is string => !!a && !!data.aliases[a]) ?? null;
   const probed = items.map(s => probes.get(serviceKey(s)));
@@ -1610,7 +1706,7 @@ function groupHostCard(
 
 function groupSubSingleRow(service: Offering, data: Status, routing: boolean, _deviceOs?: DeviceOs) {
   const kind = effectiveKind(service);
-  const label = data.labels.find((l) => l.service === service.id);
+  const label = labelFor(service.id, data);
   const { ips, overlapped, fwds, singleFwd, badge, httpTag, note, result } = probeVisual(service, data, routing);
   const origEndpoint = endpoint(service.rules.ips, service.rules.ports);
   const address = singleFwd ? `127.0.0.1:${singleFwd.local_port}` : endpoint([...ips.original, ...ips.virtual], service.rules.ports);
@@ -1668,7 +1764,7 @@ function groupSubHostBlock(owner: string, ip: string, items: Offering[], data: S
   const expanded = forceExpand || !isCollapsed(key);
   const firstAccess = accessIpFor(items[0]!.id, ip, data);
   const overlapped = items.some(s => accessIpFor(s.id, ip, data) !== ip);
-  const labels = items.map(s => data.labels.find(l => l.service === s.id));
+  const labels = items.map(s => labelFor(s.id, data));
   const rawHostName = labels.find(l => l?.remark)?.remark || items[0]!.name;
   const alias = labels.map(l => l?.alias).find((a): a is string => !!a && !!data.aliases[a]) ?? null;
   const probed = items.map(s => probes.get(serviceKey(s)));
@@ -1819,7 +1915,7 @@ function renderDeviceBucket(bucket: DeviceBucket, data: Status, routing: boolean
 
 function flatRemoteRow(service: Offering, data: Status, routing: boolean, remoteIpOs?: Map<string, HostOs | null>): HTMLElement {
   const kind = effectiveKind(service);
-  const label = data.labels.find((l) => l.service === service.id);
+  const label = labelFor(service.id, data);
   const { ips, overlapped, fwds, singleFwd, badge, httpTag, note, result } = probeVisual(service, data, routing);
   const origEndpoint = endpoint(service.rules.ips, service.rules.ports);
   const address = singleFwd ? `127.0.0.1:${singleFwd.local_port}` : endpoint([...ips.original, ...ips.virtual], service.rules.ports);
@@ -2535,7 +2631,7 @@ function makeToggle(checked: boolean, label: string, onOffline: (() => void) | n
 
 function mineSingleRow(s: Share, data: Status, showDevice = false, includeMember = true) {
   const kind = effectiveKind(s);
-  const active = data.active.includes(s.id);
+  const active = isActiveShare(s.id, data);
   const ip = singleIp(s);
   const targetLabel = ip ? `${ip}:${ranges(s.rules.ports)}` : s.name;
   const publish = makeToggle(
@@ -2598,7 +2694,7 @@ function buildLocalHostMore(ip: string, cleanName: string, items: Share[]) {
 function buildLocalHostPorts(ip: string, items: Share[], data: Status, rawHostName: string, hostOs: HostOs | null) {
   return items.map((s) => {
     const kind = effectiveKind(s);
-    const active = data.active.includes(s.id);
+    const active = isActiveShare(s.id, data);
     const portText = `:${ranges(s.rules.ports)}`;
     const publish = makeToggle(
       active,
@@ -2632,7 +2728,7 @@ function mineHostCard(
   const rawHostName = items[0]!.name;
   const hostOs = resolveHostOs(items) as HostOs | null;
   const cleanName = meaningfulHostName(rawHostName, ip, hostOs);
-  const activeCount = items.filter(s => data.active.includes(s.id)).length;
+  const activeCount = items.filter(s => isActiveShare(s.id, data)).length;
   const allActive = activeCount === items.length;
   const partial = activeCount > 0 && activeCount < items.length;
 
@@ -2690,7 +2786,7 @@ function mineHostCard(
 
 function mineSubSingleRow(s: Share, data: Status) {
   const kind = effectiveKind(s);
-  const active = data.active.includes(s.id);
+  const active = isActiveShare(s.id, data);
   const ip = singleIp(s);
   const targetLabel = ip ? `${ip}:${ranges(s.rules.ports)}` : s.name;
   const publish = makeToggle(
@@ -2721,7 +2817,7 @@ function mineSubHostBlock(ip: string, items: Share[], data: Status, forceExpand 
   const rawHostName = items[0]!.name;
   const hostOs = resolveHostOs(items) as HostOs | null;
   const cleanName = meaningfulHostName(rawHostName, ip, hostOs);
-  const activeCount = items.filter(s => data.active.includes(s.id)).length;
+  const activeCount = items.filter(s => isActiveShare(s.id, data)).length;
   const allActive = activeCount === items.length;
   const partial = activeCount > 0 && activeCount < items.length;
 
@@ -2781,7 +2877,7 @@ function renderLocalBucket(
   const label = devName || t("badge_local");
   const localTip = includeMember ? `${t("badge_local")} · ${t("source_self")}` : t("badge_local");
   const devOsEl = osBadge(data.device_os, { fallback: "device", local: true, prefix: localTip });
-  const activeCount = shares.filter((s) => data.active.includes(s.id)).length;
+  const activeCount = shares.filter((s) => isActiveShare(s.id, data)).length;
   const allActive = activeCount === shares.length;
   const partial = activeCount > 0 && activeCount < shares.length;
   const master = makeToggle(
@@ -2816,7 +2912,7 @@ function renderLocalBucket(
 
 function flatMineRow(s: Share, data: Status, localIpOs?: Map<string, HostOs | null>): HTMLElement {
   const kind = effectiveKind(s);
-  const active = data.active.includes(s.id);
+  const active = isActiveShare(s.id, data);
   const ip = singleIp(s);
   const targetLabel = ip ? `${ip}:${ranges(s.rules.ports)}` : s.name;
   const publish = makeToggle(
@@ -2901,7 +2997,9 @@ function flatUnifiedList(localShares: Share[], remoteServices: Offering[], data:
     ...sortLocalShares(localShares).map((s) => flatMineRow(s, data, localIpOs)),
     ...sortRemoteServices(remoteServices, data).map((s) => flatRemoteRow(s, data, routing, remoteIpOs)),
   ];
-  return el("div", "list-card flat-list", ...rows);
+  const card = el("div", "list-card flat-list", ...rows);
+  card.dataset.rows = String(Math.min(rows.length, 5));
+  return card;
 }
 
 function restorePromptCard(profile: DeviceProfile) {
@@ -3392,11 +3490,15 @@ function render(force = false) {
     }
   }
   const next = JSON.stringify([data && {
-    ...data, error: null, background: null, active_flows: null, probe: null, host_probe: null, admin_data: null,
+    ...data, version: null, error: null, background: null, active_flows: null, probe: null, host_probe: null, admin_data: null,
   }, tab, joining]);
   if (!force && applied === next) return;
   if (!force && !data?.member && content.contains(document.activeElement)) return;
   applied = next;
+  const prevActive = document.activeElement as HTMLElement | null;
+  const restoreAdminBtnFocus = !!prevActive && actions.contains(prevActive) && (() => {
+    try { return prevActive.matches('[data-admin-btn="1"]:focus-visible'); } catch { return false; }
+  })();
   closePopoverMenu();
   actions.replaceChildren();
   const settingsBtn = createIconButton({
@@ -3409,12 +3511,7 @@ function render(force = false) {
   settingsBtn.setAttribute("aria-haspopup", "dialog");
   actions.append(settingsBtn);
 
-  const loggedIn = !!data?.member;
-  const showNav = loggedIn && !!data?.admin_ready;
-  brandNameEl.hidden = showNav;
-  navTabs.hidden = !showNav;
   if (!data) {
-    navTabs.replaceChildren();
     const attach = (caption: string) => button(caption, () => void act({ op: "attach" }), "button primary");
     if (mac && message === "extension_permission") {
       content.replaceChildren(el("div", "flex flex-wrap gap-2", button(t("system_settings"), () => {
@@ -3429,7 +3526,6 @@ function render(force = false) {
     return;
   }
   if (!data.member) {
-    navTabs.replaceChildren();
     const inlineAlert = el("p", "feedback error");
     inlineAlert.setAttribute("role", "alert");
     inlineAlert.hidden = true;
@@ -3472,40 +3568,43 @@ function render(force = false) {
     return;
   }
 
+  const adminBtn = data.admin_ready ? createIconButton({
+    icon: tab === "admin" ? "home" : "console",
+    title: tab === "admin" ? t("exit_admin") : t("admin_badge"),
+    variant: "solid",
+    size: "lg",
+    onClick: () => selectTab(tab === "admin" ? "services" : "admin"),
+  }) : null;
+  if (adminBtn) {
+    adminBtn.setAttribute("aria-pressed", String(tab === "admin"));
+    adminBtn.dataset.adminBtn = "1";
+  }
+
+  const adminSep = adminBtn ? el("span", "toolbar-sep") : null;
+  if (adminSep) adminSep.setAttribute("aria-hidden", "true");
+
   actions.prepend(
+    ...(adminBtn && adminSep ? [adminBtn, adminSep] : []),
     ...(tab === "services" ? [addShare()] : []),
     buildConnectionControl(data)
   );
-  if (data.admin_ready) {
-    const totalServices = data.services.length + data.shares.length;
-    navTabs.setAttribute("aria-label", t("services"));
-    const tabDefs: { id: "services" | "admin"; label: string; count?: number }[] = [
-      { id: "services", label: t("services"), count: totalServices },
-      { id: "admin", label: t("admin_tab") },
-    ];
-    navTabs.replaceChildren(...tabDefs.map((item) => {
-      const b = button(item.label, () => {
-        if (tab === item.id) return;
-        selectTab(item.id);
-        navTabs.querySelector<HTMLButtonElement>('[aria-current="page"]')?.focus();
-      }, "");
-      if (item.count !== undefined && item.count > 0) b.append(el("span", "count", String(item.count)));
-      b.setAttribute("aria-current", item.id === tab ? "page" : "false");
-      return b;
-    }));
-  } else {
-    navTabs.replaceChildren();
+  if (restoreAdminBtnFocus && adminBtn) {
+    adminBtn.focus({ preventScroll: true });
   }
 
   if (tab === "admin" && data.admin_ready) {
+    const activeEl = document.activeElement as HTMLElement | null;
+    const restoreTabFocus = !!activeEl && content.contains(activeEl) && (() => {
+      try { return activeEl.matches('[role="tab"]:focus-visible'); } catch { return false; }
+    })();
     const viewKey = `admin:${adminWorkspace.getTabIndex()}`;
-    const panel = adminWorkspace.renderPanel();
-    panel.prepend(adminWorkspace.renderSubbar());
-    if (viewKey !== lastViewKey) {
-      panel.classList.add("panel-enter");
-      lastViewKey = viewKey;
+    const enterPanel = !lastViewKey.startsWith("admin:");
+    const enterBody = !enterPanel && viewKey !== lastViewKey;
+    lastViewKey = viewKey;
+    content.replaceChildren(adminWorkspace.renderPanel({ enterPanel, enterBody }));
+    if (restoreTabFocus) {
+      content.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')?.focus({ preventScroll: true });
     }
-    content.replaceChildren(panel);
     return;
   }
 
@@ -3568,13 +3667,30 @@ async function boot() {
   if (status?.member && status.auto_connect !== false && !status.running && !status.online && !pendingJoin) {
     void act({ op: "start" });
   }
+  let pollTimer: number | undefined;
+  const schedulePoll = () => {
+    window.clearTimeout(pollTimer);
+    if (!desktop && document.visibilityState === "hidden") return;
+    const delay = document.visibilityState === "hidden" ? 5000 : 1800;
+    pollTimer = window.setTimeout(() => { void pollOnce(); }, delay);
+  };
   const pollOnce = async () => {
-    if (busy || polling || (mac && !status) || (!desktop && document.visibilityState === "hidden")) return;
+    window.clearTimeout(pollTimer);
+    if (busy || polling || (mac && !status) || (!desktop && document.visibilityState === "hidden")) {
+      schedulePoll();
+      return;
+    }
     polling = true;
     try {
-      const next = await request({ op: "status", ui: true }, false);
+      const since = status?.version ?? 0;
+      const reply = await invoke<Reply>("core_command", {
+        request: since ? { op: "status", ui: true, since } : { op: "status", ui: true },
+        launch: false,
+      });
+      if (reply.unchanged) return;
+      if (!reply.data) throw reply.error ?? "internal";
       if (!busy) {
-        status = next;
+        status = reply.data;
         render();
       }
     } catch {
@@ -3589,16 +3705,20 @@ async function boot() {
         } catch {}
       }
       if (status?.online || status?.running) {
-        status = { ...status, running: false, online: false, active: [], active_flows: 0, services: [], virtual_ips: [], aliases: {} };
+        status = { ...status, version: 0, running: false, online: false, active: [], active_flows: 0, services: [], virtual_ips: [], aliases: {} };
         render();
       }
-    } finally { polling = false; }
+    } finally {
+      polling = false;
+      schedulePoll();
+    }
   };
   window.addEventListener("focus", () => { void pollOnce(); });
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") void pollOnce();
+    else schedulePoll();
   });
-  window.setInterval(() => { void pollOnce(); }, 1800);
+  schedulePoll();
 }
 
 void boot();

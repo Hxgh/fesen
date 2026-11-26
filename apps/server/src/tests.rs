@@ -157,12 +157,18 @@ fn tcp_only_center_exchanges_bounded_ipv6_candidates() {
         )
         .unwrap();
     assert!(
-        matches!(owner_in.try_recv().unwrap(), Event::Punch { peer, candidates, ipv6 }
-        if peer == "access" && candidates.is_empty() && ipv6 == vec![mobile])
+        matches!(
+            serde_json::from_str::<Event>(owner_in.try_recv().unwrap().as_str()).unwrap(),
+            Event::Punch { peer, candidates, ipv6 }
+                if peer == "access" && candidates.is_empty() && ipv6 == vec![mobile]
+        )
     );
     assert!(
-        matches!(access_in.try_recv().unwrap(), Event::Punch { peer, candidates, ipv6 }
-        if peer == "owner" && candidates.is_empty() && ipv6 == vec![mac])
+        matches!(
+            serde_json::from_str::<Event>(access_in.try_recv().unwrap().as_str()).unwrap(),
+            Event::Punch { peer, candidates, ipv6 }
+                if peer == "owner" && candidates.is_empty() && ipv6 == vec![mac]
+        )
     );
 }
 
@@ -722,6 +728,20 @@ async fn admin_entry_loads_page_and_assets() {
     ] {
         let asset = client.get(format!("{base}{path}")).send().await.unwrap();
         assert_eq!(asset.status(), StatusCode::OK, "{path}");
+        let etag = asset
+            .headers()
+            .get(header::ETAG)
+            .expect("asset etag")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let cached = client
+            .get(format!("{base}{path}"))
+            .header(header::IF_NONE_MATCH, etag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cached.status(), StatusCode::NOT_MODIFIED, "{path}");
     }
     for (preferred, expected, text) in [
         ("zh-CN,en;q=0.8", "zh-CN", "接入组"),
@@ -1528,10 +1548,18 @@ async fn client_core_admin_bridge_follows_single_account_role() {
         .await
         .unwrap();
     assert!(s.is_admin && s.admin_ready);
+    let device_id = s.device_id.clone().expect("device_id");
     let snap = boss.execute(Command::AdminSession).await.unwrap();
     let data = snap.admin_data.expect("admin_data");
     assert_eq!(data["admin"], "boss");
     assert_eq!(data["users"].as_array().unwrap().len(), 2);
+    assert!(
+        data["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["id"] == device_id && d["machine_id"] == s.machine_id)
+    );
 
     // Create a new member and confirm self-demote is rejected.
     boss.execute(Command::AdminAction {

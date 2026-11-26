@@ -24,7 +24,7 @@ use std::{
     collections::HashMap,
     io,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket},
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     time::Duration,
 };
 use tokio::{
@@ -34,15 +34,23 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+pub(crate) fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    static PROVIDER: OnceLock<Arc<rustls::crypto::CryptoProvider>> = OnceLock::new();
+    PROVIDER
+        .get_or_init(|| Arc::new(ring::default_provider()))
+        .clone()
+}
+
 #[derive(Debug, Clone)]
 pub struct Allowed {
-    pub certificate: Vec<u8>,
+    pub certificate: Arc<[u8]>,
     pub cancel: CancellationToken,
 }
 
 #[derive(Debug, Default)]
 struct Lease {
     peers: HashMap<String, Allowed>,
+    by_cert: HashMap<Arc<[u8]>, String>,
     expires: Option<Instant>,
 }
 
@@ -53,20 +61,29 @@ impl Membership {
     pub fn renew(&self, peers: Vec<Peer>) {
         let mut lease = self.0.write().unwrap();
         let mut old = std::mem::take(&mut lease.peers);
+        lease.by_cert.clear();
+        lease.peers.reserve(peers.len());
+        lease.by_cert.reserve(peers.len());
         for p in peers {
             let prior = old.remove(&p.id);
             let valid = match prior {
-                Some(v) if v.certificate == p.certificate && !v.cancel.is_cancelled() => v,
+                Some(v)
+                    if v.certificate.as_ref() == p.certificate.as_slice()
+                        && !v.cancel.is_cancelled() =>
+                {
+                    v
+                }
                 stale => {
                     if let Some(v) = stale {
                         v.cancel.cancel();
                     }
                     Allowed {
-                        certificate: p.certificate,
+                        certificate: Arc::from(p.certificate),
                         cancel: CancellationToken::new(),
                     }
                 }
             };
+            lease.by_cert.insert(valid.certificate.clone(), p.id.clone());
             lease.peers.insert(p.id, valid);
         }
         lease.expires = Some(Instant::now() + fesen_proto::LEASE);
@@ -79,6 +96,7 @@ impl Membership {
     pub fn invalidate(&self) {
         let mut lease = self.0.write().unwrap();
         lease.expires = None;
+        lease.by_cert.clear();
         for p in lease.peers.drain().map(|(_, p)| p) {
             p.cancel.cancel();
         }
@@ -101,11 +119,8 @@ impl Membership {
     pub fn certificate(&self, cert: &[u8]) -> Option<Allowed> {
         let lease = self.0.read().unwrap();
         lease.expires.filter(|until| Instant::now() < *until)?;
-        lease
-            .peers
-            .values()
-            .find(|p| p.certificate.as_slice() == cert)
-            .cloned()
+        let id = lease.by_cert.get(cert)?;
+        lease.peers.get(id).cloned()
     }
 }
 
@@ -139,7 +154,7 @@ impl ClientCertVerifier for Membership {
             msg,
             cert,
             dss,
-            &ring::default_provider().signature_verification_algorithms,
+            &crypto_provider().signature_verification_algorithms,
         )
     }
 
@@ -153,18 +168,44 @@ impl ClientCertVerifier for Membership {
             msg,
             cert,
             dss,
-            &ring::default_provider().signature_verification_algorithms,
+            &crypto_provider().signature_verification_algorithms,
         )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
+        static SCHEMES: OnceLock<Vec<SignatureScheme>> = OnceLock::new();
+        SCHEMES
+            .get_or_init(|| {
+                crypto_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            })
+            .clone()
     }
 }
 
 type ConnectionSlot = Arc<tokio::sync::Mutex<Option<Connection>>>;
+
+fn tune_quic_udp(raw: &UdpSocket) {
+    let sock = socket2::SockRef::from(raw);
+    #[cfg(target_os = "android")]
+    const TARGETS: &[usize] = &[2 * 1024 * 1024, 1024 * 1024, 512 * 1024];
+    #[cfg(not(target_os = "android"))]
+    const TARGETS: &[usize] = &[4 * 1024 * 1024, 2 * 1024 * 1024, 1024 * 1024, 512 * 1024];
+
+    let cur_rcv = sock.recv_buffer_size().unwrap_or(0);
+    for &size in TARGETS {
+        if cur_rcv >= size || sock.set_recv_buffer_size(size).is_ok() {
+            break;
+        }
+    }
+    let cur_snd = sock.send_buffer_size().unwrap_or(0);
+    for &size in TARGETS {
+        if cur_snd >= size || sock.set_send_buffer_size(size).is_ok() {
+            break;
+        }
+    }
+}
 
 struct Path {
     endpoint: Endpoint,
@@ -175,6 +216,7 @@ struct Path {
 
 impl Path {
     fn new(raw: UdpSocket, config: quinn::ServerConfig, observe: bool) -> io::Result<Self> {
+        tune_quic_udp(&raw);
         let address = raw.local_addr()?;
         let runtime = Arc::new(quinn::TokioRuntime);
         let socket = runtime.wrap_udp_socket(raw.try_clone()?)?;
@@ -218,14 +260,34 @@ pub struct Direct {
 }
 
 fn transport() -> Arc<quinn::TransportConfig> {
-    let mut config = quinn::TransportConfig::default();
-    config.max_concurrent_bidi_streams(128u32.into());
-    config.max_concurrent_uni_streams(0u32.into());
-    config.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(Duration::from_secs(35)).unwrap(),
-    ));
-    config.keep_alive_interval(Some(Duration::from_secs(12)));
-    Arc::new(config)
+    static CONFIG: OnceLock<Arc<quinn::TransportConfig>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            #[cfg(target_os = "android")]
+            const STREAM_WINDOW: u32 = 2 * 1024 * 1024;
+            #[cfg(not(target_os = "android"))]
+            const STREAM_WINDOW: u32 = 4 * 1024 * 1024;
+
+            #[cfg(target_os = "android")]
+            const CONN_WINDOW: u32 = 8 * 1024 * 1024;
+            #[cfg(not(target_os = "android"))]
+            const CONN_WINDOW: u32 = 16 * 1024 * 1024;
+
+            let mut config = quinn::TransportConfig::default();
+            config.max_concurrent_bidi_streams(128u32.into());
+            config.max_concurrent_uni_streams(0u32.into());
+            config.stream_receive_window(STREAM_WINDOW.into());
+            config.receive_window(CONN_WINDOW.into());
+            config.send_window(u64::from(CONN_WINDOW));
+            config.initial_rtt(Duration::from_millis(100));
+            config.datagram_receive_buffer_size(None);
+            config.max_idle_timeout(Some(
+                quinn::IdleTimeout::try_from(Duration::from_secs(35)).unwrap(),
+            ));
+            config.keep_alive_interval(Some(Duration::from_secs(12)));
+            Arc::new(config)
+        })
+        .clone()
 }
 
 impl Direct {
@@ -236,11 +298,10 @@ impl Direct {
         observe: bool,
     ) -> anyhow::Result<Arc<Self>> {
         let membership = Arc::new(Membership::default());
-        let mut tls =
-            rustls::ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
-                .with_protocol_versions(&[&rustls::version::TLS13])?
-                .with_client_cert_verifier(membership.clone())
-                .with_single_cert(identity.chain(), identity.key())?;
+        let mut tls = rustls::ServerConfig::builder_with_provider(crypto_provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_client_cert_verifier(membership.clone())
+            .with_single_cert(identity.chain(), identity.key())?;
         tls.alpn_protocols = vec![ALPN.to_vec()];
         tls.send_tls13_tickets = 0;
         let mut config =
@@ -417,13 +478,16 @@ impl Direct {
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<Vec<SocketAddr>, Code>>,
     {
-        let slot = self
-            .connections
-            .lock()
-            .unwrap()
-            .entry(peer.to_owned())
-            .or_default()
-            .clone();
+        let slot = {
+            let mut connections = self.connections.lock().unwrap();
+            if let Some(slot) = connections.get(peer) {
+                slot.clone()
+            } else {
+                let slot = ConnectionSlot::default();
+                connections.insert(peer.to_owned(), slot.clone());
+                slot
+            }
+        };
         let mut slot = slot.lock().await;
         let allowed = self.membership.peer(peer).ok_or(Code::Offline)?;
         if let Some(existing) = slot
@@ -460,13 +524,12 @@ impl Direct {
         roots
             .add(CertificateDer::from(cert.to_vec()))
             .map_err(|_| Code::Unauthorized)?;
-        let mut tls =
-            rustls::ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
-                .with_protocol_versions(&[&rustls::version::TLS13])
-                .map_err(|_| Code::Internal)?
-                .with_root_certificates(roots)
-                .with_client_auth_cert(self.identity.chain(), self.identity.key())
-                .map_err(|_| Code::Internal)?;
+        let mut tls = rustls::ClientConfig::builder_with_provider(crypto_provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|_| Code::Internal)?
+            .with_root_certificates(roots)
+            .with_client_auth_cert(self.identity.chain(), self.identity.key())
+            .map_err(|_| Code::Internal)?;
         tls.alpn_protocols = vec![ALPN.to_vec()];
         let mut config = quinn::ClientConfig::new(Arc::new(
             QuicClientConfig::try_from(tls).map_err(|_| Code::Internal)?,
@@ -506,25 +569,34 @@ impl Direct {
 }
 
 pub async fn frame_in<T: DeserializeOwned>(stream: &mut (impl AsyncRead + Unpin)) -> io::Result<T> {
-    let count = stream.read_u32().await?;
+    let count = stream.read_u32().await? as usize;
     if count == 0 || count > 4096 {
         return Err(io::Error::other("invalid frame"));
     }
-    let mut data = vec![0; count as usize];
-    stream.read_exact(&mut data).await?;
-    serde_json::from_slice(&data).map_err(io::Error::other)
+    if count <= 256 {
+        let mut stack = [0u8; 256];
+        stream.read_exact(&mut stack[..count]).await?;
+        serde_json::from_slice(&stack[..count]).map_err(io::Error::other)
+    } else {
+        let mut data = vec![0; count];
+        stream.read_exact(&mut data).await?;
+        serde_json::from_slice(&data).map_err(io::Error::other)
+    }
 }
 
 pub async fn frame_out<T: Serialize>(
     stream: &mut (impl AsyncWrite + Unpin),
     body: &T,
 ) -> io::Result<()> {
-    let data = serde_json::to_vec(body).map_err(io::Error::other)?;
-    if data.len() > 4096 {
+    let mut buf = Vec::with_capacity(64);
+    buf.extend_from_slice(&[0u8; 4]);
+    serde_json::to_writer(&mut buf, body).map_err(io::Error::other)?;
+    let len = buf.len() - 4;
+    if len > 4096 {
         return Err(io::Error::other("invalid frame"));
     }
-    stream.write_u32(data.len() as u32).await?;
-    stream.write_all(&data).await?;
+    buf[..4].copy_from_slice(&(len as u32).to_be_bytes());
+    stream.write_all(&buf).await?;
     stream.flush().await
 }
 
@@ -693,5 +765,82 @@ mod tests {
         assert!(membership.peer("member").is_none());
         membership.invalidate();
         assert!(allowed.cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn quic_bulk_stream_throughput_and_o1_membership_lookup() {
+        let sender_id = Identity::new().unwrap();
+        let receiver_id = Identity::new().unwrap();
+        let sender = Direct::new(sender_id.clone(), &DualPath, CancellationToken::new(), false).unwrap();
+        let receiver = Direct::new(receiver_id.clone(), &DualPath, CancellationToken::new(), false).unwrap();
+
+        let mut peers = Vec::with_capacity(128);
+        peers.push(Peer {
+            id: "sender".into(),
+            certificate: sender_id.cert.clone(),
+        });
+        for i in 1..128u16 {
+            let mut fake = vec![0u8; 128];
+            fake[0..2].copy_from_slice(&i.to_be_bytes());
+            peers.push(Peer {
+                id: format!("peer-{i}"),
+                certificate: fake,
+            });
+        }
+        receiver.renew(peers);
+        sender.renew(vec![Peer {
+            id: "receiver".into(),
+            certificate: receiver_id.cert,
+        }]);
+        assert!(receiver.membership.certificate(&sender_id.cert).is_some());
+
+        let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, receiver.local_port());
+        const TOTAL: usize = 8 * 1024 * 1024;
+        const CHUNK: usize = 64 * 1024;
+
+        let server_task = tokio::spawn({
+            let receiver = receiver.clone();
+            async move {
+                let conn = receiver.accept().await.unwrap().await.unwrap();
+                let (mut tx, mut rx) = conn.accept_bi().await.unwrap();
+                let _open: Open = frame_in(&mut rx).await.unwrap();
+                frame_out(&mut tx, &Option::<Code>::None).await.unwrap();
+                let payload = vec![0x5au8; CHUNK];
+                let mut sent = 0;
+                while sent < TOTAL {
+                    tx.write_all(&payload).await.unwrap();
+                    sent += CHUNK;
+                }
+                tx.finish().unwrap();
+                let _ = tx.stopped().await;
+            }
+        });
+
+        let (conn, _) = sender
+            .connect("receiver", || async { Ok(vec![address.into()]) })
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let (_, mut rx) = open(
+            &conn,
+            Open {
+                service: "bench".into(),
+                target: "198.51.100.10:80".parse().unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut buf = vec![0u8; CHUNK];
+        let mut received = 0;
+        while let Some(n) = rx.read(&mut buf).await.unwrap() {
+            received += n;
+        }
+        let elapsed = started.elapsed();
+        server_task.await.unwrap();
+        assert_eq!(received, TOTAL);
+        let mbps = (TOTAL as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
+        eprintln!("QUIC loopback 8 MiB transfer: {elapsed:?} ({mbps:.1} MiB/s)");
+        sender.close();
+        receiver.close();
     }
 }

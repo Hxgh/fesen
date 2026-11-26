@@ -22,7 +22,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -33,6 +33,11 @@ use tokio::{
     time::{Instant, interval, timeout},
 };
 use tokio_util::sync::CancellationToken;
+
+#[cfg(target_os = "android")]
+const COPY_BUF: usize = 32 * 1024;
+#[cfg(not(target_os = "android"))]
+const COPY_BUF: usize = 64 * 1024;
 
 #[derive(Deserialize)]
 pub struct HostServiceInput {
@@ -177,8 +182,12 @@ fn default_device_os() -> DeviceOs {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Status {
+    #[serde(default)]
+    pub version: u64,
     pub server: String,
     pub member: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
     #[serde(default)]
     pub machine_id: String,
     #[serde(default = "default_device_os")]
@@ -271,7 +280,7 @@ pub struct Core {
     device_info: DeviceInfo,
     state: Mutex<State>,
     pub(crate) platform: Arc<dyn Platform>,
-    log: Log,
+    log: Arc<Log>,
     operations: tokio::sync::Mutex<()>,
     forwards_lock: tokio::sync::Mutex<HashMap<ForwardKey, ForwardHandle>>,
     host_probe_lock: tokio::sync::Mutex<()>,
@@ -279,6 +288,7 @@ pub struct Core {
     network_probe: tokio::sync::Mutex<Instant>,
     pub(crate) routes: RwLock<Routes>,
     changes: watch::Sender<u64>,
+    status_seq: AtomicU64,
     pub(crate) quit: CancellationToken,
     applied_shutdown: CancellationToken,
     forwards_shutdown: CancellationToken,
@@ -296,7 +306,7 @@ impl Core {
         let local = Local::load(&dir)?;
         let device_info = platform.device_info();
         let network = platform.network().unwrap_or_default();
-        let log = Log::new(&dir);
+        let log = Arc::new(Log::new(&dir));
         log.prune();
         let core = Arc::new(Self {
             dir,
@@ -329,6 +339,7 @@ impl Core {
             network_probe: tokio::sync::Mutex::new(Instant::now() - Duration::from_secs(1)),
             routes: RwLock::new(Routes::default()),
             changes: watch::channel(0).0,
+            status_seq: AtomicU64::new(1),
             quit: CancellationToken::new(),
             applied_shutdown: CancellationToken::new(),
             forwards_shutdown: CancellationToken::new(),
@@ -350,6 +361,10 @@ impl Core {
         self.state.lock().unwrap().network.clone()
     }
 
+    pub(crate) fn dns_servers(&self) -> Vec<Ipv4Addr> {
+        self.state.lock().unwrap().network.dns.clone()
+    }
+
     #[cfg(target_os = "android")]
     pub(crate) fn running(&self) -> bool {
         self.state.lock().unwrap().wanted
@@ -362,6 +377,59 @@ impl Core {
             || (state.wanted && !state.local.forwards().is_empty())
     }
 
+    #[cfg(windows)]
+    pub(crate) fn visual_state(&self) -> u8 {
+        let state = self.state.lock().unwrap();
+        let online = self.platform.access_ready()
+            && state
+                .link
+                .as_ref()
+                .is_some_and(|l| l.direct.membership.is_fresh());
+        if online {
+            2
+        } else if state.wanted {
+            1
+        } else {
+            0
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn subscribe_changes(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    fn bump_status(&self) {
+        self.status_seq.fetch_add(1, Ordering::Release);
+    }
+
+    fn status_tag(&self, state: &State) -> (u64, bool, bool) {
+        let seq = self.status_seq.load(Ordering::Acquire);
+        let online = self.platform.access_ready()
+            && state
+                .link
+                .as_ref()
+                .is_some_and(|l| l.direct.membership.is_fresh());
+        let background = self.has_work(state);
+        let tag = (seq << 2) | (u64::from(online) << 1) | u64::from(background);
+        (tag, online, background)
+    }
+
+    pub(crate) fn poll_status(&self, ui: bool, since: u64) -> Result<Option<Status>, Code> {
+        if self.quit.is_cancelled() {
+            return Err(Code::NotConnected);
+        }
+        let mut state = self.state.lock().unwrap();
+        if ui && state.ui_until.is_some() {
+            state.ui_until = Some(Instant::now() + Duration::from_secs(16));
+        }
+        let (tag, online, background) = self.status_tag(&state);
+        if since != 0 && since == tag {
+            return Ok(None);
+        }
+        Ok(Some(self.build_status(&state, tag, online, background)))
+    }
+
     fn device_name(&self, local: &Local) -> String {
         local
             .device_name
@@ -372,6 +440,11 @@ impl Core {
 
     pub fn status(&self) -> Status {
         let state = self.state.lock().unwrap();
+        let (tag, online, background) = self.status_tag(&state);
+        self.build_status(&state, tag, online, background)
+    }
+
+    fn build_status(&self, state: &State, version: u64, online: bool, background: bool) -> Status {
         let routes = self.routes.read().unwrap();
         let mut active: Vec<_> = state.sharing.keys().cloned().collect();
         active.sort_unstable();
@@ -420,18 +493,16 @@ impl Core {
             None
         };
         Status {
+            version,
             server: state.local.server.clone(),
             member: state.local.session.as_ref().map(|s| s.member.clone()),
+            device_id: state.link.as_ref().map(|l| l.id.clone()),
             machine_id: self.device_info.machine_id.clone(),
             device_os: self.device_info.os,
             device_name: self.device_name(&state.local),
-            online: self.platform.access_ready()
-                && state
-                    .link
-                    .as_ref()
-                    .is_some_and(|l| l.direct.membership.is_fresh()),
+            online,
             running: state.wanted,
-            background: self.has_work(&state),
+            background,
             system_routing: self.platform.system_routing(),
             routes_ready: routes.ready_for(&state.view),
             is_admin: state.is_admin,
@@ -474,11 +545,13 @@ impl Core {
             new
         };
         if new {
+            self.bump_status();
             self.log.event(error);
         }
     }
 
     fn changed(&self) {
+        self.bump_status();
         self.changes.send_modify(|n| *n = n.wrapping_add(1));
     }
 
@@ -488,6 +561,7 @@ impl Core {
         change(&mut next)?;
         next.save(&self.dir)?;
         state.local = next;
+        self.bump_status();
         Ok(())
     }
 
@@ -576,6 +650,7 @@ impl Core {
                     Err(e) => {
                         if e == Code::Unauthorized {
                             self.state.lock().unwrap().admin_token = None;
+                            self.bump_status();
                         }
                         return Err(e);
                     }
@@ -594,12 +669,14 @@ impl Core {
                     Ok(()) => {
                         if is_logout {
                             self.state.lock().unwrap().admin_token = None;
+                            self.bump_status();
                         }
                         return Ok(self.status());
                     }
                     Err(e) => {
                         if e == Code::Unauthorized {
                             self.state.lock().unwrap().admin_token = None;
+                            self.bump_status();
                         }
                         return Err(e);
                     }
@@ -624,6 +701,7 @@ impl Core {
                 })?;
                 if auto_share == Some(false) {
                     self.state.lock().unwrap().auto_share_blocked = false;
+                    self.bump_status();
                 }
                 if cloud_backup == Some(true) {
                     self.push_profile_bg();
@@ -643,6 +721,7 @@ impl Core {
             }
             Command::DismissRestore => {
                 self.state.lock().unwrap().dismissed_restore = true;
+                self.bump_status();
                 return Ok(self.status());
             }
             _ => {}
@@ -768,6 +847,8 @@ impl Core {
                 state.restore_pending = false;
                 state.auto_share_blocked = false;
                 state.error = None;
+                drop(state);
+                self.bump_status();
                 Ok(())
             }
             Command::Logout => {
@@ -807,6 +888,7 @@ impl Core {
                     Ok(())
                 })?;
                 self.state.lock().unwrap().error = None;
+                self.bump_status();
                 Ok(())
             }
             Command::Save {
@@ -1136,6 +1218,7 @@ impl Core {
                     .unwrap()
                     .cloud_profiles
                     .retain(|p| p.machine_id != machine_id);
+                self.bump_status();
                 Ok(())
             }
         }
@@ -1225,6 +1308,7 @@ impl Core {
                 share.cancel.cancel();
                 state.link.clone()
             };
+            self.bump_status();
             if let Some(link) = link
                 && link.call(Call::Unpublish { id: id.clone() }).await.is_err()
             {
@@ -1294,6 +1378,8 @@ impl Core {
             },
         );
         state.error = None;
+        drop(state);
+        self.bump_status();
         Ok(())
     }
 
@@ -1311,24 +1397,150 @@ impl Core {
         if unique.is_empty() || unique.len() > 32 {
             return Err(Code::Invalid);
         }
-        {
-            let state = self.state.lock().unwrap();
-            if unique
-                .iter()
-                .any(|id| !state.local.shares().iter().any(|s| &s.id == id))
+        if unique.len() == 1 {
+            return self.share(unique.pop().unwrap(), enabled).await;
+        }
+        if !enabled {
             {
+                let state = self.state.lock().unwrap();
+                if unique
+                    .iter()
+                    .any(|id| !state.local.shares().iter().any(|s| &s.id == id))
+                {
+                    return Err(Code::Invalid);
+                }
+            }
+            return self.unpublish_many(&unique).await;
+        }
+        if self.refresh_network().await {
+            return Err(Code::NetworkChanged);
+        }
+        let (link, net, to_publish) = {
+            let state = self.state.lock().unwrap();
+            let shares = state.local.shares();
+            if unique.iter().any(|id| !shares.iter().any(|s| &s.id == id)) {
                 return Err(Code::Invalid);
             }
-        }
+            let pending: Vec<Publication> = unique
+                .iter()
+                .filter(|id| !state.sharing.contains_key(*id))
+                .filter_map(|id| shares.iter().find(|s| &s.id == id).cloned())
+                .collect();
+            if pending.is_empty() {
+                return Ok(());
+            }
+            if !state.network.known() {
+                return Err(Code::NetworkChanged);
+            }
+            let link = state.link.clone().ok_or(Code::NotConnected)?;
+            if !link.direct.membership.is_fresh() {
+                return Err(Code::NotConnected);
+            }
+            (link, state.network.clone(), pending)
+        };
+        let results = futures_util::future::join_all(to_publish.into_iter().map(|service| {
+            let link = link.clone();
+            async move {
+                let res = link
+                    .call(Call::Publish {
+                        service: service.clone(),
+                    })
+                    .await;
+                (service, res)
+            }
+        }))
+        .await;
         let mut first_error = None;
-        for id in unique {
-            if let Err(err) = self.share(id, enabled).await
-                && first_error.is_none()
-            {
-                first_error = Some(err);
+        let mut disconnected = false;
+        let mut published = Vec::new();
+        for (service, res) in results {
+            match res {
+                Ok(()) => published.push(service),
+                Err(e) => {
+                    if e == Code::NotConnected {
+                        disconnected = true;
+                    }
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
             }
         }
+        if disconnected {
+            self.disconnect(true);
+            return Err(first_error.unwrap_or(Code::NotConnected));
+        }
+        if !published.is_empty() {
+            let mut state = self.state.lock().unwrap();
+            if state.network != net
+                || !Self::is_link(&state, &link)
+                || link.direct.cancel.is_cancelled()
+            {
+                drop(state);
+                link.direct.close();
+                return Err(Code::NetworkChanged);
+            }
+            let mut next = state.local.clone();
+            for service in published {
+                next.record_share_active(&service.id, true, &net.marker);
+                state.sharing.insert(
+                    service.id.clone(),
+                    Sharing {
+                        publication: service,
+                        cancel: link.direct.cancel.child_token(),
+                    },
+                );
+            }
+            let _ = next.save(&self.dir);
+            state.local = next;
+            state.auto_share_blocked = false;
+            if first_error.is_none() {
+                state.error = None;
+            }
+            drop(state);
+            self.bump_status();
+        }
         first_error.map_or(Ok(()), Err)
+    }
+
+    async fn unpublish_many(&self, ids: &[String]) -> Result<(), Code> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let (link, active_ids) = {
+            let mut state = self.state.lock().unwrap();
+            let mut removed = Vec::new();
+            for id in ids {
+                if let Some(share) = state.sharing.remove(id) {
+                    share.cancel.cancel();
+                    removed.push(id.clone());
+                }
+            }
+            (state.link.clone(), removed)
+        };
+        if active_ids.is_empty() {
+            return Ok(());
+        }
+        self.bump_status();
+        if let Some(link) = link {
+            let results = futures_util::future::join_all(active_ids.iter().map(|id| {
+                let link = link.clone();
+                let id = id.clone();
+                async move { link.call(Call::Unpublish { id }).await }
+            }))
+            .await;
+            if results.into_iter().any(|r| r.is_err()) {
+                self.disconnect(true);
+                return Err(Code::NotConnected);
+            }
+        }
+        let _ = self.edit(|local| {
+            for id in &active_ids {
+                local.record_share_active(id, false, "");
+            }
+            Ok(())
+        });
+        Ok(())
     }
 
     async fn remove_shares(self: &Arc<Self>, ids: Vec<String>) -> Result<(), Code> {
@@ -1345,9 +1557,7 @@ impl Core {
         if unique.is_empty() || unique.len() > 32 {
             return Err(Code::Invalid);
         }
-        for id in &unique {
-            self.share(id.clone(), false).await?;
-        }
+        self.unpublish_many(&unique).await?;
         let id_set: HashSet<&str> = unique.iter().map(String::as_str).collect();
         self.edit(|l| {
             for id in &unique {
@@ -1455,12 +1665,10 @@ impl Core {
             (remove_ids, stop_ids)
         };
 
-        for id in &remove_ids {
-            self.share(id.clone(), false).await?;
-        }
-        for id in &stop_before_update_ids {
-            self.share(id.clone(), false).await?;
-        }
+        let mut stop_all = Vec::with_capacity(remove_ids.len() + stop_before_update_ids.len());
+        stop_all.extend(remove_ids.iter().cloned());
+        stop_all.extend(stop_before_update_ids.iter().cloned());
+        self.unpublish_many(&stop_all).await?;
 
         let (publish_ids, republish_ids) = {
             let mut state = self.state.lock().unwrap();
@@ -1533,6 +1741,8 @@ impl Core {
             }
             next.save(&self.dir)?;
             state.local = next;
+            drop(state);
+            self.bump_status();
             (publish_ids, republish_ids)
         };
 
@@ -1552,8 +1762,13 @@ impl Core {
 
     fn restrict_local(&self) {
         let mut state = self.state.lock().unwrap();
+        let had = !state.sharing.is_empty();
         for (_, r) in state.sharing.drain() {
             r.cancel.cancel();
+        }
+        drop(state);
+        if had {
+            self.bump_status();
         }
     }
 
@@ -1715,6 +1930,8 @@ impl Core {
         };
         if labels_changed {
             self.changed();
+        } else {
+            self.bump_status();
         }
         if !to_push.is_empty() || initial_profile.is_some() {
             let core = self.clone();
@@ -1741,7 +1958,7 @@ impl Core {
 
     pub(crate) fn update_view(self: &Arc<Self>, link: &Arc<Link>, view: View) {
         let mut restore_ids: Option<Vec<String>> = None;
-        let changed = {
+        let (changed, blocked_changed) = {
             let mut state = self.state.lock().unwrap();
             if !Self::is_link(&state, link) {
                 return;
@@ -1757,6 +1974,7 @@ impl Core {
             if changed {
                 state.view = services;
             }
+            let prev_blocked = state.auto_share_blocked;
             if state.restore_pending {
                 state.restore_pending = false;
                 if state.local.auto_share {
@@ -1773,10 +1991,12 @@ impl Core {
                     }
                 }
             }
-            changed
+            (changed, state.auto_share_blocked != prev_blocked)
         };
         if changed {
             self.changed();
+        } else if blocked_changed {
+            self.bump_status();
         }
         if let Some(ids) = restore_ids {
             let core = self.clone();
@@ -1881,6 +2101,7 @@ impl Core {
             let tun = next.tun.clone();
             next.installed = tun == applied;
             *self.routes.write().unwrap() = next;
+            self.bump_status();
             if tun != applied {
                 let p = self.platform.clone();
                 let update = tun.clone();
@@ -1890,6 +2111,7 @@ impl Core {
                 if success {
                     applied = tun;
                     self.routes.write().unwrap().installed = true;
+                    self.bump_status();
                 } else {
                     self.report(Code::Conflict);
                     let p = self.platform.clone();
@@ -1897,6 +2119,7 @@ impl Core {
                     applied = Tun::default();
                     let cleared = self.routes.read().unwrap().cleared();
                     *self.routes.write().unwrap() = cleared;
+                    self.bump_status();
                 }
             }
             tokio::select! {
@@ -1935,7 +2158,8 @@ impl Core {
                 retry = None;
             }
             if cleanup.elapsed() >= Duration::from_secs(30) {
-                self.log.prune();
+                let log = self.log.clone();
+                let _ = tokio::task::spawn_blocking(move || log.prune()).await;
                 cleanup = Instant::now();
             }
             let wants = {
@@ -1979,11 +2203,15 @@ impl Core {
             for h in &drained {
                 h.cancel.cancel();
             }
-            for h in drained {
-                let _ = timeout(Duration::from_millis(200), h.closed).await;
-            }
+            futures_util::future::join_all(
+                drained
+                    .into_iter()
+                    .map(|h| timeout(Duration::from_millis(200), h.closed)),
+            )
+            .await;
         }
         self.state.lock().unwrap().forward_states.clear();
+        self.bump_status();
         self.forwards_shutdown.cancel();
     }
 
@@ -2008,10 +2236,18 @@ impl Core {
             for h in &drained {
                 h.cancel.cancel();
             }
-            for h in drained {
-                let _ = timeout(Duration::from_millis(200), h.closed).await;
+            futures_util::future::join_all(
+                drained
+                    .into_iter()
+                    .map(|h| timeout(Duration::from_millis(200), h.closed)),
+            )
+            .await;
+            let mut state = self.state.lock().unwrap();
+            if !state.forward_states.is_empty() {
+                state.forward_states.clear();
+                drop(state);
+                self.bump_status();
             }
-            self.state.lock().unwrap().forward_states.clear();
             return;
         }
         let mut desired: HashMap<ForwardKey, (String, u16)> = HashMap::new();
@@ -2044,9 +2280,12 @@ impl Core {
                 removed.push(handle);
             }
         }
-        for handle in removed {
-            let _ = timeout(Duration::from_millis(200), handle.closed).await;
-        }
+        futures_util::future::join_all(
+            removed
+                .into_iter()
+                .map(|h| timeout(Duration::from_millis(200), h.closed)),
+        )
+        .await;
         let mut states = HashMap::new();
         for m in configured {
             let key = (m.service.clone(), m.target_ip, m.target_port);
@@ -2150,7 +2389,12 @@ impl Core {
                 }
             }
         }
-        self.state.lock().unwrap().forward_states = states;
+        let mut state = self.state.lock().unwrap();
+        if state.forward_states != states {
+            state.forward_states = states;
+            drop(state);
+            self.bump_status();
+        }
     }
 
     async fn accept_forward_loop(
@@ -2185,7 +2429,7 @@ impl Core {
                     _ = cancel.cancelled() => {},
                     _ = core.with_peer(&owner, Open { service, target }, async |tx, rx, _| {
                         let mut remote = tokio::io::join(rx, tx);
-                        let _ = copy_bidirectional_with_sizes(&mut client, &mut remote, 16384, 16384).await;
+                        let _ = copy_bidirectional_with_sizes(&mut client, &mut remote, COPY_BUF, COPY_BUF).await;
                         Ok(())
                     }) => {},
                 }
@@ -2302,7 +2546,7 @@ impl Core {
                             Ok(mut tcp) => {
                                 direct::frame_out(&mut tx, &Option::<Code>::None).await.ok()?;
                                 let mut peer = tokio::io::join(&mut rx, &mut tx);
-                                let _ = copy_bidirectional_with_sizes(&mut peer, &mut tcp, 16384, 16384).await;
+                                let _ = copy_bidirectional_with_sizes(&mut peer, &mut tcp, COPY_BUF, COPY_BUF).await;
                             }
                             Err(e) => { direct::frame_out(&mut tx, &Some(e)).await.ok()?; }
                         }
@@ -2332,7 +2576,7 @@ impl Core {
                     _ = link.direct.cancel.cancelled() => Ok(()),
                     result = async {
                         let mut remote = platform::tcp(&*self.platform, address).await?;
-                        let _ = copy_bidirectional_with_sizes(&mut app, &mut remote, 16384, 16384).await;
+                        let _ = copy_bidirectional_with_sizes(&mut app, &mut remote, COPY_BUF, COPY_BUF).await;
                         Ok(())
                     } => result,
                 }
@@ -2345,7 +2589,7 @@ impl Core {
                 self.with_peer(&owner, Open { service, target }, async |tx, rx, _| {
                     let mut remote = tokio::io::join(rx, tx);
                     let _ =
-                        copy_bidirectional_with_sizes(&mut app, &mut remote, 16384, 16384).await;
+                        copy_bidirectional_with_sizes(&mut app, &mut remote, COPY_BUF, COPY_BUF).await;
                     Ok(())
                 })
                 .await
@@ -3223,6 +3467,40 @@ mod tests {
             .await
             .unwrap();
         assert!(s4.shares.is_empty());
+
+        core.stop();
+        core.wait_stopped().await;
+    }
+
+    #[tokio::test]
+    async fn conditional_status_poll_skips_unchanged_and_tracks_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::new(dir.path().to_path_buf(), Arc::new(LocalPlatform), false).unwrap();
+
+        let initial_bytes = crate::ipc::dispatch_bytes(&core, br#"{"op":"status","ui":true}"#).await;
+        let initial: serde_json::Value = serde_json::from_slice(&initial_bytes).unwrap();
+        let version = initial["data"]["version"].as_u64().unwrap();
+        assert!(version > 0);
+
+        // Matching version returns the static 18-byte unchanged sentinel.
+        let poll_req = format!(r#"{{"op":"status","ui":true,"since":{version}}}"#);
+        let unchanged = crate::ipc::dispatch_bytes(&core, poll_req.as_bytes()).await;
+        assert_eq!(unchanged, br#"{"unchanged":true}"#);
+
+        // Mutating state bumps version and returns full fresh status.
+        core.report(Code::Offline);
+        let updated_bytes = crate::ipc::dispatch_bytes(&core, poll_req.as_bytes()).await;
+        let updated: serde_json::Value = serde_json::from_slice(&updated_bytes).unwrap();
+        assert_eq!(updated["data"]["error"], "offline");
+        let next_version = updated["data"]["version"].as_u64().unwrap();
+        assert_ne!(next_version, version);
+
+        // Polling with the new version returns unchanged again.
+        let next_req = format!(r#"{{"op":"status","ui":true,"since":{next_version}}}"#);
+        assert_eq!(
+            crate::ipc::dispatch_bytes(&core, next_req.as_bytes()).await,
+            br#"{"unchanged":true}"#
+        );
 
         core.stop();
         core.wait_stopped().await;

@@ -43,6 +43,7 @@ private func provider(_ token: UInt) -> Tunnel {
 }
 
 final class Tunnel: NEPacketTunnelProvider {
+    private static let ipv4Protocols = [NSNumber(value: AF_INET)]
     private var engine: UnsafeMutableRawPointer?
     private let lane = DispatchQueue(label: "io.fesen.tunnel.core")
     private let physical = PhysicalNetwork()
@@ -65,7 +66,7 @@ final class Tunnel: NEPacketTunnelProvider {
                 }, { token, bytes, len in
                     guard let bytes else { return }
                     let tunnel = provider(token)
-                    _ = tunnel.packetFlow.writePackets([Data(bytes: bytes, count: len)], withProtocols: [NSNumber(value: AF_INET)])
+                    _ = tunnel.packetFlow.writePackets([Data(bytes: bytes, count: len)], withProtocols: Tunnel.ipv4Protocols)
                 }, { token in
                     let tunnel = provider(token)
                     tunnel.lane.async {
