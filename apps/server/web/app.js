@@ -1,11 +1,12 @@
-import { createTrigram, icon } from "./icons.js";
-import { createTheme } from "./theme.js";
+import { createIconButton, createTrigram } from "./icons.js";
+import { createScale, createTheme } from "./theme.js";
 import { createI18n } from "./i18n.js";
 import { openSettingsModal } from "./settings.js";
 import { createAdminWorkspace } from "./admin-view.js";
 
 const byId = (id) => document.getElementById(id);
 const theme = createTheme("fesen_admin_theme");
+const scale = createScale("fesen_admin_scale");
 const i18n = createI18n("fesen_admin_locale");
 const { t, isZh, failure } = i18n;
 
@@ -71,6 +72,7 @@ function openSettings() {
   openSettingsModal(settingsDialog, {
     t,
     theme,
+    scale,
     i18n,
     onLocaleChange: () => { syncCopy(); render(); },
     extraBody() {
@@ -137,14 +139,14 @@ function render() {
     navTabs.replaceChildren();
     content.replaceChildren();
   }
-  const settingsBtn = document.createElement("button");
-  settingsBtn.type = "button";
-  settingsBtn.className = "tool-btn icon-only";
-  settingsBtn.title = t("settings");
-  settingsBtn.setAttribute("aria-label", t("settings"));
+  const settingsBtn = createIconButton({
+    icon: "settings",
+    title: t("settings"),
+    variant: "solid",
+    size: "lg",
+    onClick: openSettings,
+  });
   settingsBtn.setAttribute("aria-haspopup", "dialog");
-  settingsBtn.append(icon("settings"));
-  settingsBtn.addEventListener("click", openSettings);
   actions.append(settingsBtn);
 }
 

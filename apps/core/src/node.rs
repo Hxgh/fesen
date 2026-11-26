@@ -76,6 +76,8 @@ pub enum Command {
         kind: Option<ServiceKind>,
         #[serde(default)]
         host_os: Option<HostOs>,
+        #[serde(default)]
+        republish: bool,
     },
     SaveHost {
         ip: Ipv4Addr,
@@ -85,6 +87,10 @@ pub enum Command {
         services: Vec<HostServiceInput>,
         #[serde(default)]
         publish: bool,
+        #[serde(default)]
+        replace: bool,
+        #[serde(default)]
+        old_host_name: Option<String>,
     },
     Share {
         id: String,
@@ -96,6 +102,9 @@ pub enum Command {
     },
     Remove {
         id: String,
+    },
+    RemoveMany {
+        ids: Vec<String>,
     },
     Customize {
         id: String,
@@ -808,13 +817,14 @@ impl Core {
                 http,
                 kind,
                 host_os,
+                republish,
             } => {
                 let id = id.unwrap_or_else(|| hex::encode(rand::random::<[u8; 16]>()));
                 let effective_http = match kind {
                     Some(k) => k == ServiceKind::Http,
                     None => http,
                 };
-                let rule = Publication {
+                let mut rule = Publication {
                     id: id.clone(),
                     name: name.trim().to_owned(),
                     rules: Rules::parse(&ips, &ports).map_err(|_| Code::Invalid)?,
@@ -823,11 +833,33 @@ impl Core {
                     host_os,
                 }
                 .checked()?;
-                if self.state.lock().unwrap().sharing.contains_key(&id) {
-                    return Err(Code::Busy);
+                if !matches!(rule.effective_kind(), ServiceKind::Ssh | ServiceKind::Rdp) {
+                    rule.host_os = None;
                 }
+                let (was_sharing, unchanged) = {
+                    let state = self.state.lock().unwrap();
+                    let sharing = state.sharing.contains_key(&id);
+                    let unchanged = state
+                        .local
+                        .shares()
+                        .iter()
+                        .find(|s| s.id == id)
+                        .is_some_and(|old| old == &rule);
+                    (sharing, unchanged)
+                };
+                if unchanged {
+                    return Ok(());
+                }
+                if was_sharing {
+                    self.share(id.clone(), false).await?;
+                }
+                let single_ip = rule.single_ip();
                 self.edit(|local| {
                     let shares = local.shares_mut()?;
+                    let old_ip = shares
+                        .iter()
+                        .find(|s| s.id == id)
+                        .and_then(Publication::single_ip);
                     if let Some(old) = shares.iter_mut().find(|s| s.id == id) {
                         *old = rule;
                     } else if shares.len() < 32 {
@@ -835,8 +867,21 @@ impl Core {
                     } else {
                         return Err(Code::Limit);
                     }
+                    if let Some(ip) = old_ip {
+                        normalize_ip_host_os(shares, ip);
+                    }
+                    if let Some(ip) = single_ip
+                        && Some(ip) != old_ip
+                    {
+                        normalize_ip_host_os(shares, ip);
+                    }
                     Ok(())
                 })?;
+                if was_sharing && republish {
+                    let res = self.share(id, true).await;
+                    self.push_profile_bg();
+                    return res;
+                }
                 self.push_profile_bg();
                 Ok(())
             }
@@ -846,44 +891,26 @@ impl Core {
                 host_os,
                 services,
                 publish,
+                replace,
+                old_host_name,
             } => {
-                self.save_host(ip, name, host_os, services, publish).await?;
+                self.save_host(HostUpdate {
+                    ip,
+                    name,
+                    host_os,
+                    services,
+                    publish,
+                    replace,
+                    old_host_name,
+                })
+                .await?;
                 self.push_profile_bg();
                 Ok(())
             }
             Command::Share { id, enabled } => self.share(id, enabled).await,
             Command::ShareMany { ids, enabled } => self.share_many(ids, enabled).await,
-            Command::Remove { id } => {
-                self.share(id.clone(), false).await?;
-                self.edit(|l| {
-                    l.record_share_active(&id, false, "");
-                    let shares = l.shares_mut()?;
-                    let removed_ip = shares
-                        .iter()
-                        .find(|s| s.id == id)
-                        .and_then(Publication::single_ip);
-                    shares.retain(|s| s.id != id);
-                    if let Some(ip) = removed_ip {
-                        let keeps_os = shares.iter().any(|s| {
-                            s.single_ip() == Some(ip)
-                                && matches!(
-                                    s.effective_kind(),
-                                    ServiceKind::Ssh | ServiceKind::Rdp
-                                )
-                        });
-                        if !keeps_os {
-                            for s in shares {
-                                if s.single_ip() == Some(ip) {
-                                    s.host_os = None;
-                                }
-                            }
-                        }
-                    }
-                    Ok(())
-                })?;
-                self.push_profile_bg();
-                Ok(())
-            }
+            Command::Remove { id } => self.remove_shares(vec![id]).await,
+            Command::RemoveMany { ids } => self.remove_shares(ids).await,
             Command::Customize {
                 id,
                 remark,
@@ -1304,14 +1331,57 @@ impl Core {
         first_error.map_or(Ok(()), Err)
     }
 
-    async fn save_host(
-        &self,
-        ip: Ipv4Addr,
-        name: String,
-        host_os: Option<HostOs>,
-        services: Vec<HostServiceInput>,
-        publish: bool,
-    ) -> Result<(), Code> {
+    async fn remove_shares(self: &Arc<Self>, ids: Vec<String>) -> Result<(), Code> {
+        let mut unique = Vec::new();
+        let mut seen = HashSet::new();
+        for id in ids {
+            if !valid_id(&id) {
+                return Err(Code::Invalid);
+            }
+            if seen.insert(id.clone()) {
+                unique.push(id);
+            }
+        }
+        if unique.is_empty() || unique.len() > 32 {
+            return Err(Code::Invalid);
+        }
+        for id in &unique {
+            self.share(id.clone(), false).await?;
+        }
+        let id_set: HashSet<&str> = unique.iter().map(String::as_str).collect();
+        self.edit(|l| {
+            for id in &unique {
+                l.record_share_active(id, false, "");
+            }
+            let shares = l.shares_mut()?;
+            let mut touched_ips = HashSet::new();
+            for s in shares.iter() {
+                if id_set.contains(s.id.as_str())
+                    && let Some(ip) = s.single_ip()
+                {
+                    touched_ips.insert(ip);
+                }
+            }
+            shares.retain(|s| !id_set.contains(s.id.as_str()));
+            for ip in touched_ips {
+                normalize_ip_host_os(shares, ip);
+            }
+            Ok(())
+        })?;
+        self.push_profile_bg();
+        Ok(())
+    }
+
+    async fn save_host(&self, update: HostUpdate) -> Result<(), Code> {
+        let HostUpdate {
+            ip,
+            name,
+            host_os,
+            services,
+            publish,
+            replace,
+            old_host_name,
+        } = update;
         if services.is_empty() || services.len() > probe::MAX_HOST_PROBE_PORTS {
             return Err(Code::Invalid);
         }
@@ -1339,15 +1409,75 @@ impl Core {
             .iter()
             .any(|s| matches!(s.kind, ServiceKind::Ssh | ServiceKind::Rdp));
         let host_os = if has_os_port { host_os } else { None };
+        let old_name_cmp = old_host_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
 
-        let target_ids = {
+        let (remove_ids, stop_before_update_ids) = {
+            let state = self.state.lock().unwrap();
+            let mut remove_ids = Vec::new();
+            let mut stop_ids = Vec::new();
+            for share in state.local.shares() {
+                if share.single_ip() != Some(ip) {
+                    continue;
+                }
+                let [port] = share.rules.ports.as_slice() else {
+                    continue;
+                };
+                if port.start != port.end {
+                    continue;
+                }
+                let found = services.iter().find(|s| s.port == port.start);
+                match found {
+                    None if replace => remove_ids.push(share.id.clone()),
+                    Some(svc) if state.sharing.contains_key(&share.id) => {
+                        let rename = !replace
+                            || share.name == ip_text
+                            || old_name_cmp.as_ref().is_some_and(|old| &share.name == old);
+                        let next_name = if rename { &label } else { &share.name };
+                        let next_os = if matches!(svc.kind, ServiceKind::Ssh | ServiceKind::Rdp) {
+                            host_os
+                        } else {
+                            None
+                        };
+                        if next_name != &share.name
+                            || share.effective_kind() != svc.kind
+                            || share.host_os != next_os
+                        {
+                            stop_ids.push(share.id.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (remove_ids, stop_ids)
+        };
+
+        for id in &remove_ids {
+            self.share(id.clone(), false).await?;
+        }
+        for id in &stop_before_update_ids {
+            self.share(id.clone(), false).await?;
+        }
+
+        let (publish_ids, republish_ids) = {
             let mut state = self.state.lock().unwrap();
-            let sharing_ids: HashSet<String> = state.sharing.keys().cloned().collect();
+            let remove_set: HashSet<&str> = remove_ids.iter().map(String::as_str).collect();
+            let stop_set: HashSet<&str> = stop_before_update_ids.iter().map(String::as_str).collect();
             let mut next = state.local.clone();
-            let mut target_ids = Vec::with_capacity(services.len());
+            for id in &remove_ids {
+                next.record_share_active(id, false, "");
+            }
+            let mut publish_ids = Vec::new();
+            let mut republish_ids = Vec::new();
             let mut new_entries = Vec::new();
             {
                 let shares = next.shares_mut()?;
+                if !remove_set.is_empty() {
+                    shares.retain(|s| !remove_set.contains(s.id.as_str()));
+                }
                 for svc in &services {
                     let existing = shares.iter_mut().find(|s| {
                         s.single_ip() == Some(ip)
@@ -1357,14 +1487,23 @@ impl Core {
                             )
                     });
                     if let Some(share) = existing {
-                        target_ids.push(share.id.clone());
-                        if !sharing_ids.contains(&share.id) {
+                        let rename = !replace
+                            || share.name == ip_text
+                            || old_name_cmp.as_ref().is_some_and(|old| &share.name == old);
+                        if rename {
                             share.name = label.clone();
-                            share.kind = Some(svc.kind);
-                            share.http = svc.kind == ServiceKind::Http;
-                            if host_os.is_some() {
-                                share.host_os = host_os;
-                            }
+                        }
+                        share.kind = Some(svc.kind);
+                        share.http = svc.kind == ServiceKind::Http;
+                        share.host_os = if matches!(svc.kind, ServiceKind::Ssh | ServiceKind::Rdp) {
+                            host_os
+                        } else {
+                            None
+                        };
+                        if stop_set.contains(share.id.as_str()) {
+                            republish_ids.push(share.id.clone());
+                        } else if publish {
+                            publish_ids.push(share.id.clone());
                         }
                     } else {
                         let id = hex::encode(rand::random::<[u8; 16]>());
@@ -1375,32 +1514,38 @@ impl Core {
                                 .map_err(|_| Code::Invalid)?,
                             http: svc.kind == ServiceKind::Http,
                             kind: Some(svc.kind),
-                            host_os,
+                            host_os: if matches!(svc.kind, ServiceKind::Ssh | ServiceKind::Rdp) {
+                                host_os
+                            } else {
+                                None
+                            },
                         }
                         .checked()?;
-                        target_ids.push(id);
+                        publish_ids.push(id);
                         new_entries.push(rule);
                     }
                 }
                 if shares.len() + new_entries.len() > 32 {
                     return Err(Code::Limit);
                 }
-                if let Some(os) = host_os {
-                    for share in shares.iter_mut() {
-                        if share.single_ip() == Some(ip) && !sharing_ids.contains(&share.id) {
-                            share.host_os = Some(os);
-                        }
-                    }
-                }
                 shares.extend(new_entries);
+                normalize_ip_host_os(shares, ip);
             }
             next.save(&self.dir)?;
             state.local = next;
-            target_ids
+            (publish_ids, republish_ids)
         };
 
+        let mut to_share = republish_ids;
         if publish {
-            self.share_many(target_ids, true).await?;
+            for id in publish_ids {
+                if !to_share.contains(&id) {
+                    to_share.push(id);
+                }
+            }
+        }
+        if !to_share.is_empty() {
+            self.share_many(to_share, true).await?;
         }
         Ok(())
     }
@@ -2430,6 +2575,32 @@ impl Drop for Flow<'_> {
     }
 }
 
+struct HostUpdate {
+    ip: Ipv4Addr,
+    name: String,
+    host_os: Option<HostOs>,
+    services: Vec<HostServiceInput>,
+    publish: bool,
+    replace: bool,
+    old_host_name: Option<String>,
+}
+
+fn normalize_ip_host_os(shares: &mut [Publication], ip: Ipv4Addr) {
+    let resolved = shares
+        .iter()
+        .filter(|s| s.single_ip() == Some(ip))
+        .find_map(|s| match s.effective_kind() {
+            ServiceKind::Rdp => Some(HostOs::Windows),
+            ServiceKind::Ssh => s.host_os,
+            _ => None,
+        });
+    for s in shares.iter_mut() {
+        if s.single_ip() == Some(ip) {
+            s.host_os = resolved;
+        }
+    }
+}
+
 fn suggest_free_port(preferred: Option<u16>, used: &HashSet<u16>) -> Option<u16> {
     let is_free = |port: u16| {
         port != 0
@@ -2713,6 +2884,8 @@ mod tests {
                     kind: ServiceKind::Ssh,
                 }],
                 publish: false,
+                replace: false,
+                old_host_name: None,
             })
             .await
             .err(),
@@ -2734,6 +2907,8 @@ mod tests {
                     },
                 ],
                 publish: false,
+                replace: false,
+                old_host_name: None,
             })
             .await
             .err(),
@@ -2749,6 +2924,7 @@ mod tests {
                 http: true,
                 kind: None,
                 host_os: None,
+                republish: false,
             })
             .await
             .unwrap();
@@ -2775,6 +2951,8 @@ mod tests {
                     },
                 ],
                 publish: false,
+                replace: false,
+                old_host_name: None,
             })
             .await
             .unwrap();
@@ -2927,6 +3105,124 @@ mod tests {
             })
             .await;
         assert!(quick.is_ok());
+
+        core.stop();
+        core.wait_stopped().await;
+    }
+
+    #[tokio::test]
+    async fn host_replace_edit_and_remove_many_manage_full_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::new(dir.path().to_path_buf(), Arc::new(LocalPlatform), false).unwrap();
+        core.state.lock().unwrap().local.session = Some(Login {
+            member: "alice".into(),
+            token: "t".repeat(64),
+        });
+
+        let host_ip = Ipv4Addr::new(198, 51, 100, 50);
+        let s1 = core
+            .execute(Command::SaveHost {
+                ip: host_ip,
+                name: "Server-A".into(),
+                host_os: Some(HostOs::Linux),
+                services: vec![
+                    HostServiceInput {
+                        port: 22,
+                        kind: ServiceKind::Ssh,
+                    },
+                    HostServiceInput {
+                        port: 80,
+                        kind: ServiceKind::Tcp,
+                    },
+                    HostServiceInput {
+                        port: 8080,
+                        kind: ServiceKind::Http,
+                    },
+                ],
+                publish: false,
+                replace: false,
+                old_host_name: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(s1.shares.len(), 3);
+        let id_80 = s1
+            .shares
+            .iter()
+            .find(|s| s.rules.ports[0].start == 80)
+            .unwrap()
+            .id
+            .clone();
+
+        // Give port 80 a custom subname and change it via Command::Save.
+        let s2 = core
+            .execute(Command::Save {
+                id: Some(id_80.clone()),
+                name: "Web Gateway".into(),
+                ips: "198.51.100.50".into(),
+                ports: "80".into(),
+                http: true,
+                kind: Some(ServiceKind::Http),
+                host_os: Some(HostOs::Linux),
+                republish: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            s2.shares.iter().find(|s| s.id == id_80).unwrap().name,
+            "Web Gateway"
+        );
+
+        // Manage Host with replace=true: remove 22 (SSH), keep 80 (preserve custom name "Web Gateway"),
+        // rename host-named 8080 -> "Server-B" & upgrade kind, add 443 (HTTPS).
+        let s3 = core
+            .execute(Command::SaveHost {
+                ip: host_ip,
+                name: "Server-B".into(),
+                host_os: None,
+                services: vec![
+                    HostServiceInput {
+                        port: 80,
+                        kind: ServiceKind::Http,
+                    },
+                    HostServiceInput {
+                        port: 8080,
+                        kind: ServiceKind::Https,
+                    },
+                    HostServiceInput {
+                        port: 443,
+                        kind: ServiceKind::Https,
+                    },
+                ],
+                publish: false,
+                replace: true,
+                old_host_name: Some("Server-A".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(s3.shares.len(), 3);
+        assert!(!s3.shares.iter().any(|s| s.rules.ports[0].start == 22));
+        assert_eq!(
+            s3.shares.iter().find(|s| s.id == id_80).unwrap().name,
+            "Web Gateway"
+        );
+        let port_8080 = s3
+            .shares
+            .iter()
+            .find(|s| s.rules.ports[0].start == 8080)
+            .unwrap();
+        assert_eq!(port_8080.name, "Server-B");
+        assert_eq!(port_8080.effective_kind(), ServiceKind::Https);
+        // Since SSH was removed, host_os is cleared across remaining ports.
+        assert!(s3.shares.iter().all(|s| s.host_os.is_none()));
+
+        // RemoveMany removes the entire host atomically.
+        let all_ids: Vec<String> = s3.shares.iter().map(|s| s.id.clone()).collect();
+        let s4 = core
+            .execute(Command::RemoveMany { ids: all_ids })
+            .await
+            .unwrap();
+        assert!(s4.shares.is_empty());
 
         core.stop();
         core.wait_stopped().await;

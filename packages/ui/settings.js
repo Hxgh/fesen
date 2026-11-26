@@ -1,4 +1,4 @@
-import { icon } from "./icons.js";
+import { createIconButton } from "./icons.js";
 
 function el(tag, cls = "", ...children) {
   const node = document.createElement(tag);
@@ -14,6 +14,7 @@ function el(tag, cls = "", ...children) {
  * @param {{
  *   t: (k: string) => string,
  *   theme: { get: () => string, set: (v: string) => void },
+ *   scale?: { get: () => string, set: (v: string) => void },
  *   i18n: { getMode?: () => string, getLocale: () => string, setLocale: (v: string) => void },
  *   onLocaleChange?: () => void,
  *   extraBody?: (redraw: () => void) => HTMLElement[],
@@ -21,17 +22,19 @@ function el(tag, cls = "", ...children) {
  * }} opts
  */
 export function openSettingsModal(dialog, opts) {
-  const { t, theme, i18n } = opts;
+  const { t, theme, scale, i18n } = opts;
 
   function draw() {
     dialog.replaceChildren();
     const title = el("h2", "", t("settings"));
     title.id = "settings-heading";
-    const closeBtn = el("button", "button icon-button", icon("close"));
-    closeBtn.type = "button";
-    closeBtn.title = t("close");
-    closeBtn.setAttribute("aria-label", t("close"));
-    closeBtn.addEventListener("click", () => dialog.close());
+    const closeBtn = createIconButton({
+      icon: "close",
+      title: t("close"),
+      variant: "ghost",
+      size: "md",
+      onClick: () => dialog.close(),
+    });
     const header = el("div", "dialog-header", title, closeBtn);
 
     const body = el("div", "dialog-body");
@@ -60,6 +63,19 @@ export function openSettingsModal(dialog, opts) {
       langSeg.append(btn);
     }
     body.append(el("div", "settings-row", el("span", "settings-label", t("language")), langSeg));
+
+    if (scale) {
+      const curScale = scale.get();
+      const scaleSeg = el("div", "segmented");
+      for (const [id, key] of [["sm", "scale_sm"], ["md", "scale_md"], ["lg", "scale_lg"]]) {
+        const btn = el("button", id === curScale ? "active" : "", t(key));
+        btn.type = "button";
+        btn.setAttribute("aria-pressed", String(id === curScale));
+        btn.addEventListener("click", () => { scale.set(id); draw(); });
+        scaleSeg.append(btn);
+      }
+      body.append(el("div", "settings-row", el("span", "settings-label", t("ui_scale")), scaleSeg));
+    }
 
     if (opts.extraBody) {
       body.append(...opts.extraBody(draw));

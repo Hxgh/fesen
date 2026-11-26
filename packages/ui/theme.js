@@ -30,3 +30,30 @@ export function createTheme(storageKey = "fesen_theme") {
   apply(get());
   return { get, set, apply };
 }
+
+/**
+ * Shared UI element scale controller (sm | md | lg) for Client and Web Admin.
+ * @param {string} [storageKey]
+ */
+export function createScale(storageKey = "fesen_scale") {
+  function get() {
+    try {
+      const v = localStorage.getItem(storageKey);
+      if (v === "sm" || v === "md" || v === "lg") return v;
+    } catch {}
+    return "md";
+  }
+
+  function apply(scale = get()) {
+    document.documentElement.setAttribute("data-scale", scale);
+  }
+
+  function set(scale) {
+    const next = scale === "sm" || scale === "lg" ? scale : "md";
+    try { localStorage.setItem(storageKey, next); } catch {}
+    apply(next);
+  }
+
+  apply(get());
+  return { get, set, apply };
+}

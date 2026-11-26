@@ -13,7 +13,7 @@ export function closePopoverMenu() {
 /**
  * Anchored dropdown popover menu (icon + label), shared across Client and Web Admin.
  * @param {HTMLButtonElement} anchor
- * @param {Array<{sep: true} | {icon: string, label: string, danger?: boolean, onSelect: () => void}>} entries
+ * @param {Array<{sep: true} | {icon: string, label: string, danger?: boolean, active?: boolean, onSelect: () => void}>} entries
  */
 export function openPopoverMenu(anchor, entries) {
   if (active?.anchor === anchor) {
@@ -37,9 +37,19 @@ export function openPopoverMenu(anchor, entries) {
     }
     const item = document.createElement("button");
     item.type = "button";
-    item.className = `menu-item${entry.danger ? " danger" : ""}`;
-    item.setAttribute("role", "menuitem");
+    item.className = `menu-item${entry.danger ? " danger" : ""}${entry.active ? " active" : ""}`;
+    if (entry.active !== undefined) {
+      item.setAttribute("role", "menuitemradio");
+      item.setAttribute("aria-checked", String(!!entry.active));
+    } else {
+      item.setAttribute("role", "menuitem");
+    }
     item.append(icon(entry.icon), entry.label);
+    if (entry.active) {
+      const chk = icon("check");
+      chk.classList.add("menu-check");
+      item.append(chk);
+    }
     item.addEventListener("click", () => {
       closePopoverMenu();
       entry.onSelect();

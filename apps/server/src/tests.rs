@@ -385,6 +385,7 @@ async fn preset(core: &Arc<Core>, name: &str, ip: Ipv4Addr, port: u16, http: boo
         http,
         kind: None,
         host_os: None,
+        republish: false,
     })
     .await
     .unwrap()
@@ -1407,6 +1408,8 @@ async fn lab_host_discovery_and_quic_tunnel() {
             host_os: probed.host_os,
             services: chosen,
             publish: true,
+            replace: false,
+            old_host_name: None,
         })
         .await
         .unwrap();
@@ -1676,6 +1679,7 @@ async fn same_account_supports_multiple_concurrent_devices() {
             http: true,
             kind: Some(fesen_proto::ServiceKind::Http),
             host_os: None,
+            republish: false,
         })
         .await
         .unwrap();
@@ -1748,6 +1752,7 @@ async fn startup_preferences_auto_restore_only_on_same_network() {
             http: true,
             kind: Some(fesen_proto::ServiceKind::Http),
             host_os: None,
+            republish: false,
         })
         .await
         .unwrap();
@@ -1761,6 +1766,7 @@ async fn startup_preferences_auto_restore_only_on_same_network() {
             http: false,
             kind: Some(fesen_proto::ServiceKind::Ssh),
             host_os: None,
+            republish: false,
         })
         .await
         .unwrap();
@@ -2191,6 +2197,7 @@ async fn device_identity_os_reinstall_restore_and_cloud_sync() {
             http: true,
             kind: Some(fesen_proto::ServiceKind::Http),
             host_os: None,
+            republish: false,
         })
         .await
         .unwrap()
@@ -2257,6 +2264,7 @@ async fn device_identity_os_reinstall_restore_and_cloud_sync() {
             http: false,
             kind: Some(fesen_proto::ServiceKind::Ssh),
             host_os: Some(fesen_proto::HostOs::Linux),
+            republish: false,
         })
         .await
         .unwrap()

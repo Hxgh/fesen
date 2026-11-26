@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { onBackButtonPress } from "@tauri-apps/api/app";
 import { failure, t } from "./i18n";
-import { icon } from "../../../packages/ui/icons.js";
+import { icon, setIconButton } from "../../../packages/ui/icons.js";
 
 const dialog = document.querySelector<HTMLDialogElement>("#site-dialog")!;
 const stage = dialog.querySelector<HTMLElement>("#site-stage")!;
@@ -17,9 +17,7 @@ let attempt = 0, sequence = Date.now();
 let invalidate: (() => boolean) | undefined;
 
 function setBtn(btn: HTMLButtonElement, name: Parameters<typeof icon>[0], label: string) {
-  btn.replaceChildren(icon(name));
-  btn.title = label;
-  btn.setAttribute("aria-label", label);
+  setIconButton(btn, name, label);
 }
 
 function syncExpandBtn() {

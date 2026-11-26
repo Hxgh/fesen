@@ -1,4 +1,4 @@
-import { icon } from "./icons.js";
+import { createIconButton, osBadge } from "./icons.js";
 import { closePopoverMenu, openPopoverMenu } from "./popover.js";
 import {
   deviceOsLabel,
@@ -87,11 +87,13 @@ export function createAdminWorkspace(opts) {
     })();
     const title = el("h2", "", t("join"));
     title.id = "editor-title";
-    const closeBtn = el("button", "button icon-button", icon("close"));
-    closeBtn.type = "button";
-    closeBtn.title = t("close");
-    closeBtn.setAttribute("aria-label", t("close"));
-    closeBtn.addEventListener("click", () => dialog.close());
+    const closeBtn = createIconButton({
+      icon: "close",
+      title: t("close"),
+      variant: "ghost",
+      size: "md",
+      onClick: () => dialog.close(),
+    });
     const header = el("div", "dialog-header", title, closeBtn);
 
     const textarea = el("textarea", "join-address");
@@ -146,11 +148,13 @@ export function createAdminWorkspace(opts) {
     let submitting = false;
     const title = el("h2", "", t(key));
     title.id = "editor-title";
-    const closeBtn = el("button", "button icon-button", icon("close"));
-    closeBtn.type = "button";
-    closeBtn.title = t("close");
-    closeBtn.setAttribute("aria-label", t("close"));
-    closeBtn.addEventListener("click", () => { if (!submitting) dialog.close(); });
+    const closeBtn = createIconButton({
+      icon: "close",
+      title: t("close"),
+      variant: "ghost",
+      size: "md",
+      onClick: () => { if (!submitting) dialog.close(); },
+    });
     const header = el("div", "dialog-header", title, closeBtn);
 
     const body = el("div", "dialog-body");
@@ -234,20 +238,22 @@ export function createAdminWorkspace(opts) {
     }
   }
 
-  function entityRow(name, statusKey, tone, actions, meta = "", tagText = "") {
-    const main = el("div", "entity-main", el("span", "entity-name", name));
-    if (tagText) main.append(el("span", "host-os-tag", tagText));
+  function entityRow(name, statusKey, tone, actions, meta = "", osType = null, fallbackOs = false) {
+    const badge = osBadge(osType, fallbackOs ? "device" : false);
+    const main = el("div", "entity-main", ...(badge ? [badge] : []), el("span", "entity-name", name));
     if (meta) main.append(el("span", "entity-meta", meta));
 
     const right = el("div", "entity-actions", el("span", `state-dot${tone ? ` ${tone}` : ""}`, t(statusKey)));
     if (actions.length) {
-      const more = el("button", "button icon-button", icon("more"));
-      more.type = "button";
-      more.title = `${t("configure")} · ${name}`;
-      more.setAttribute("aria-label", more.title);
+      const more = createIconButton({
+        icon: "more",
+        title: `${t("configure")} · ${name}`,
+        variant: "ghost",
+        size: "md",
+        onClick: () => openPopoverMenu(more, actions),
+      });
       more.setAttribute("aria-haspopup", "menu");
       more.setAttribute("aria-expanded", "false");
-      more.addEventListener("click", () => openPopoverMenu(more, actions));
       right.append(more);
     } else {
       right.append(el("span", "entity-slot"));
@@ -264,29 +270,42 @@ export function createAdminWorkspace(opts) {
         const kind = effectiveKind(s);
         const os = resolveHostOs([s]);
         const ip = singleIp(s);
-        const title = el("div", "host-title-line", el("p", "endpoint", formatEndpoint(s.rules, isZh())));
-        if (os) title.append(el("span", "host-os-tag", osLabel(os)));
+        const leadOs = os || s.device_os || null;
+        const osTag = osBadge(leadOs, "server");
+        const title = el("div", "host-title-line", ...(osTag ? [osTag] : []), el("p", "endpoint", formatEndpoint(s.rules, isZh())));
         if (kind !== "tcp") title.append(el("span", "proto-tag", kind.toUpperCase()));
         const clean = ip ? meaningfulHostName(s.name, ip, os) : s.name;
-        const devOs = deviceOsLabel(s.device_os);
-        const devTag = [s.device, devOs].filter(Boolean).join(" ");
-        const source = [s.member, devTag].filter(Boolean).join(" · ");
+        const devTag = os && s.device_os && deviceOsLabel(s.device_os) !== osLabel(os) ? osBadge(s.device_os) : null;
+        const source = [s.member, s.device].filter(Boolean).join(" · ");
         const sub = [clean, source].filter(Boolean).join(" · ");
-        const main = el("div", "service-main", title, ...(sub ? [el("span", "entity-meta", sub)] : []));
+        const subRow = sub ? el("span", "entity-meta", sub) : null;
+        if (devTag && subRow) {
+          const metaLine = el("div", "service-meta", subRow, devTag);
+          wrap.append(el("article", "service-row", el("div", "service-main", title, metaLine), el("span", "state-dot good", t("broadcasting"))));
+          continue;
+        }
+        const main = el("div", "service-main", title, ...(subRow ? [subRow] : []));
         wrap.append(el("article", "service-row", main, el("span", "state-dot good", t("broadcasting"))));
         continue;
       }
       const os = resolveHostOs(entry.items);
       const first = entry.items[0];
-      const title = el("div", "host-title-line", el("p", "endpoint", entry.ip));
-      if (os) title.append(el("span", "host-os-tag", osLabel(os)));
+      const leadOs = os || first.device_os || null;
+      const osTag = osBadge(leadOs, "server");
+      const title = el("div", "host-title-line", ...(osTag ? [osTag] : []), el("p", "endpoint", entry.ip));
       const clean = meaningfulHostName(first.name, entry.ip, os);
-      const devOs = deviceOsLabel(first.device_os);
-      const devTag = [first.device, devOs].filter(Boolean).join(" ");
-      const source = [first.member, devTag].filter(Boolean).join(" · ");
+      const devTag = os && first.device_os && deviceOsLabel(first.device_os) !== osLabel(os) ? osBadge(first.device_os) : null;
+      const source = [first.member, first.device].filter(Boolean).join(" · ");
       const sub = [clean, source].filter(Boolean).join(" · ");
+      const subNodes = [];
+      if (sub || devTag) {
+        const metaLine = el("div", "service-meta");
+        if (sub) metaLine.append(el("span", "entity-meta", sub));
+        if (devTag) metaLine.append(devTag);
+        subNodes.push(metaLine);
+      }
       const head = el("div", "host-head",
-        el("div", "host-info", title, ...(sub ? [el("span", "entity-meta", sub)] : [])),
+        el("div", "host-info", title, ...subNodes),
         el("span", "state-dot good", t("broadcasting"))
       );
       const portsWrap = el("div", "host-ports", ...entry.items.map((s) => {
@@ -330,27 +349,33 @@ export function createAdminWorkspace(opts) {
   function buildToolbarButtons() {
     const btns = [];
     if (tab === 0) {
-      const addBtn = el("button", "tool-btn icon-only", icon("plus"));
-      addBtn.type = "button";
-      addBtn.title = t("create");
-      addBtn.setAttribute("aria-label", t("create"));
-      addBtn.addEventListener("click", () => openActionDialog({ op: "create" }));
-      btns.push(addBtn);
+      btns.push(createIconButton({
+        icon: "plus",
+        title: t("create"),
+        variant: "ghost",
+        size: "md",
+        onClick: () => openActionDialog({ op: "create" }),
+      }));
     }
-    const refreshBtn = el("button", loading ? "tool-btn icon-only spinning" : "tool-btn icon-only", icon("refresh"));
-    refreshBtn.type = "button";
-    refreshBtn.title = t("refresh");
-    refreshBtn.setAttribute("aria-label", t("refresh"));
+    const refreshBtn = createIconButton({
+      icon: "refresh",
+      title: t("refresh"),
+      variant: "ghost",
+      size: "md",
+      spinning: loading,
+      onClick: () => void refresh(),
+    });
     refreshBtn.disabled = loading;
-    refreshBtn.addEventListener("click", () => void refresh());
     btns.push(refreshBtn);
 
-    const joinBtn = el("button", "tool-btn icon-only", icon("link"));
-    joinBtn.type = "button";
-    joinBtn.title = t("join");
-    joinBtn.setAttribute("aria-label", t("join"));
+    const joinBtn = createIconButton({
+      icon: "link",
+      title: t("join"),
+      variant: "ghost",
+      size: "md",
+      onClick: openJoinDialog,
+    });
     joinBtn.disabled = !data?.link;
-    joinBtn.addEventListener("click", openJoinDialog);
     btns.push(joinBtn);
     return btns;
   }
@@ -421,7 +446,8 @@ export function createAdminWorkspace(opts) {
               { icon: "close", label: t("revoke"), danger: true, onSelect: () => openActionDialog({ op: "revoke", device: d.id }, d.label) },
             ],
             meta,
-            deviceOsLabel(d.os)
+            d.os || null,
+            true
           );
         }));
         panel.append(list);

@@ -26,7 +26,93 @@ const paths = {
   close: "M17.5 6.5 6.5 17.5M6.5 6.5l11 11",
   maximize: "M15 4.5h4.5V9M9 19.5H4.5V15M19.5 4.5 14 10M4.5 19.5 10 14",
   minimize: "M14 10h4.5V5.5M10 14H5.5v4.5M18.5 5.5 14 10M5.5 18.5 10 14",
+  search: "M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16Zm10 2-4.35-4.35",
+  list: "M8.5 6.5h11M8.5 12h11M8.5 17.5h11M4.5 6.5h.01M4.5 12h.01M4.5 17.5h.01",
+  bars: "M4.5 7h15M4.5 12h15M4.5 17h15",
+  card: "M4 5.5h16a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-11a1 1 0 0 1 1-1ZM3 10.5h18",
+  cards: "M4 4.5h16a1 1 0 0 1 1 1v4.5a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5.5a1 1 0 0 1 1-1ZM4 14h16a1 1 0 0 1 1 1v3.5a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V15a1 1 0 0 1 1-1Z",
+  layers: "M12 3.5 3.5 8 12 12.5 20.5 8 12 3.5ZM3.5 12.2 12 16.7l8.5-4.5M3.5 16.3 12 20.8l8.5-4.5",
+  collapse: "M5 12h14M8.5 5.5 12 9l3.5-3.5M8.5 18.5 12 15l3.5 3.5",
+  expand: "m7.5 9.5 4.5-4.5 4.5 4.5M7.5 14.5 12 19l4.5-4.5",
 };
+
+const osPaths = {
+  windows: "M2.5 2.5h8.8v8.8H2.5zm10.2 0h8.8v8.8h-8.8zm-10.2 10.2h8.8v8.8H2.5zm10.2 0h8.8v8.8h-8.8z",
+  macos: "M14.95 5.45c.8-1 1.35-2.35 1.2-3.7-1.15.05-2.55.77-3.35 1.75-.72.84-1.35 2.2-1.18 3.5 1.3.1 2.55-.65 3.33-1.55ZM12 8.2C10.5 8.2 9.7 7.4 8.2 7.4 5.2 7.4 3.8 10.1 3.8 13c0 4.5 2.6 9.1 5 9.1 1.4 0 2-.9 3.2-.9s1.8.9 3.2.9c1.9 0 4-2.9 4.8-5.2-.2-.1-2.9-1.2-2.9-4.1 0-2.6 2.1-3.8 2.2-3.9C18.1 7.3 16.7 7.4 15.8 7.4 14.3 7.4 13.5 8.2 12 8.2Z",
+  android: "M6.6 8.3 4.6 4.8a.9.9 0 1 1 1.55-.9l2.05 3.55A9.6 9.6 0 0 1 12 6.7c1.35 0 2.65.27 3.8.75l2.05-3.55a.9.9 0 1 1 1.55.9l-2 3.5A9.2 9.2 0 0 1 21.5 16v2.3a1.2 1.2 0 0 1-1.2 1.2H3.7a1.2 1.2 0 0 1-1.2-1.2V16c0-3.25 1.6-6.1 4.1-7.7ZM8.3 13a1.3 1.3 0 1 0 0 2.6 1.3 1.3 0 0 0 0-2.6Zm7.4 0a1.3 1.3 0 1 0 0 2.6 1.3 1.3 0 0 0 0-2.6Z",
+  linux: "M12 2c-2.85 0-4.7 1.85-4.7 4.75 0 1.3-.55 2.4-1.65 3.9-1.1 1.65-1.85 3.35-1.85 5.2 0 2.25 1.2 4 3.05 4.95-.32.45-.32 1.2.32 1.52.88.44 2.3.32 3.28-.1.54.1.98.1 1.55.1s1.01 0 1.55-.1c.98.42 2.4.54 3.28.1.64-.32.64-1.07.32-1.52 1.85-.95 3.05-2.7 3.05-4.95 0-1.85-.75-3.55-1.85-5.2-1.1-1.5-1.65-2.6-1.65-3.9C16.7 3.85 14.85 2 12 2Zm-1.85 3.3a1 1 0 1 1 0 2 1 1 0 0 1 0-2Zm3.7 0a1 1 0 1 1 0 2 1 1 0 0 1 0-2ZM10.25 7.7 12 9.25l1.75-1.55-1.75-.85-1.75.85ZM12 10.75c-2.4 0-3.9 2.25-3.9 5.05 0 2.6 1.5 4.25 3.9 4.25s3.9-1.65 3.9-4.25c0-2.8-1.5-5.05-3.9-5.05Z",
+};
+
+const osTitles = {
+  windows: "Windows",
+  macos: "macOS",
+  linux: "Linux",
+  android: "Android",
+};
+
+/**
+ * Monochrome operating system icon SVG.
+ * @param {"windows" | "macos" | "linux" | "android"} os
+ */
+export function osIcon(os) {
+  const svg = document.createElementNS(NS, "svg");
+  for (const [key, value] of Object.entries({
+    viewBox: "0 0 24 24",
+    fill: "currentColor",
+    "aria-hidden": "true",
+    class: "icon os-icon",
+  })) svg.setAttribute(key, value);
+  const path = document.createElementNS(NS, "path");
+  path.setAttribute("d", osPaths[os] || osPaths.linux);
+  if (os === "linux" || os === "android") path.setAttribute("fill-rule", "evenodd");
+  svg.append(path);
+  return svg;
+}
+
+/**
+ * Encapsulated OS icon badge with optional fallback glyph, local theme tint, and hover details.
+ * @param {"windows" | "macos" | "linux" | "android" | null | undefined} os
+ * @param {"server" | "device" | false | {
+ *   fallback?: "server" | "device" | false,
+ *   local?: boolean,
+ *   prefix?: string,
+ *   fallbackTitle?: string,
+ * }} [opts]
+ * @param {string} [fallbackTitle]
+ */
+export function osBadge(os, opts = false, fallbackTitle = "") {
+  const cfg = typeof opts === "object" && opts !== null
+    ? opts
+    : { fallback: opts, fallbackTitle };
+  const fallback = cfg.fallback ?? false;
+  const local = !!cfg.local;
+  const prefix = cfg.prefix ? String(cfg.prefix).trim() : "";
+  const fbTitle = cfg.fallbackTitle ?? fallbackTitle;
+
+  if (os && osTitles[os]) {
+    const tag = document.createElement("span");
+    tag.className = local ? "host-os-tag is-local" : "host-os-tag";
+    const label = prefix ? `${prefix} · ${osTitles[os]}` : osTitles[os];
+    tag.title = label;
+    tag.setAttribute("aria-label", label);
+    tag.append(osIcon(os));
+    return tag;
+  }
+  if (!fallback) return null;
+  const tag = document.createElement("span");
+  tag.className = local ? "host-os-tag is-fallback is-local" : "host-os-tag is-fallback";
+  const label = prefix || fbTitle;
+  if (label) {
+    tag.title = label;
+    tag.setAttribute("aria-label", label);
+  } else {
+    tag.setAttribute("aria-hidden", "true");
+  }
+  const svg = icon(fallback === "device" ? "device" : "server");
+  svg.classList.add("os-icon");
+  tag.append(svg);
+  return tag;
+}
 
 /** @param {keyof typeof paths | "more"} name */
 export function icon(name) {
@@ -59,6 +145,64 @@ export function icon(name) {
   path.setAttribute("d", paths[name] || paths.server);
   svg.append(path);
   return svg;
+}
+
+/**
+ * Update an icon button's icon(s) and accessible tooltip/label.
+ * @param {HTMLButtonElement} btn
+ * @param {keyof typeof paths | "more"} name
+ * @param {string} title
+ * @param {boolean} [dropdown]
+ */
+export function setIconButton(btn, name, title, dropdown = false) {
+  const nodes = [icon(name)];
+  if (dropdown) {
+    const caret = icon("chevron");
+    caret.classList.add("dropdown-caret");
+    nodes.push(caret);
+  }
+  btn.replaceChildren(...nodes);
+  btn.title = title;
+  btn.setAttribute("aria-label", title);
+}
+
+/**
+ * Unified icon button component shared across all Fesen surfaces.
+ * @param {{
+ *   icon: keyof typeof paths | "more",
+ *   title: string,
+ *   label?: string,
+ *   variant?: "solid" | "ghost",
+ *   size?: "sm" | "md" | "lg",
+ *   tone?: "default" | "accent" | "muted",
+ *   dropdown?: boolean,
+ *   active?: boolean,
+ *   spinning?: boolean,
+ *   className?: string,
+ *   onClick?: (event: MouseEvent) => void,
+ * }} opts
+ */
+export function createIconButton(opts) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  const variant = opts.variant === "solid" ? "solid" : "ghost";
+  const size = opts.size === "lg" ? "lg" : opts.size === "sm" ? "sm" : "md";
+  const classes = ["icon-btn", variant, size];
+  if (opts.tone === "accent") classes.push("accent");
+  else if (opts.tone === "muted") classes.push("muted");
+  if (opts.dropdown) classes.push("dropdown");
+  if (opts.active) classes.push("is-active");
+  if (opts.spinning) classes.push("spinning");
+  if (opts.className) classes.push(opts.className);
+  btn.className = classes.join(" ");
+  setIconButton(btn, opts.icon, opts.title, !!opts.dropdown);
+  if (opts.label) btn.setAttribute("aria-label", opts.label);
+  if (opts.dropdown) {
+    btn.setAttribute("aria-haspopup", "menu");
+    btn.setAttribute("aria-expanded", "false");
+  }
+  if (opts.onClick) btn.addEventListener("click", opts.onClick);
+  return btn;
 }
 
 const TRIGRAM_PATHS = [
