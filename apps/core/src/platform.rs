@@ -1,6 +1,7 @@
 use fesen_acl::Cidr;
-use fesen_proto::Code;
+use fesen_proto::{Code, DeviceOs};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     io,
@@ -59,12 +60,86 @@ pub struct Tun {
     pub routes: Vec<Cidr>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceInfo {
+    pub machine_id: String,
+    pub os: DeviceOs,
+    pub name: String,
+}
+
+pub fn hash_machine_id(os: DeviceOs, raw: &str) -> String {
+    let tag = match os {
+        DeviceOs::Macos => "macos",
+        DeviceOs::Windows => "windows",
+        DeviceOs::Android => "android",
+        DeviceOs::Linux => "linux",
+    };
+    let digest = Sha256::digest(format!("fesen-v1:{tag}:{raw}").as_bytes());
+    hex::encode(&digest[..16])
+}
+
+#[cfg(unix)]
+pub(crate) fn unix_hostname() -> String {
+    let mut buf = [0u8; 256];
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc == 0 {
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        if let Ok(s) = std::str::from_utf8(&buf[..len]) {
+            let trimmed = s.trim().trim_end_matches(".local").trim();
+            if !trimmed.is_empty() {
+                return trimmed.chars().take(64).collect();
+            }
+        }
+    }
+    String::new()
+}
+
 pub trait Platform: Send + Sync + 'static {
     fn keep_empty_tun(&self) -> bool {
         false
     }
     fn access_ready(&self) -> bool {
         true
+    }
+    fn device_info(&self) -> DeviceInfo {
+        #[cfg(unix)]
+        {
+            let name = unix_hostname();
+            let raw = std::fs::read_to_string("/etc/machine-id")
+                .or_else(|_| std::fs::read_to_string("/var/lib/dbus/machine-id"))
+                .unwrap_or_else(|_| name.clone());
+            let trimmed = raw.trim();
+            let fallback_name = if name.is_empty() {
+                "Linux".to_owned()
+            } else {
+                name
+            };
+            let id_seed = if trimmed.is_empty() {
+                fallback_name.as_str()
+            } else {
+                trimmed
+            };
+            DeviceInfo {
+                machine_id: hash_machine_id(DeviceOs::Linux, id_seed),
+                os: DeviceOs::Linux,
+                name: fallback_name,
+            }
+        }
+        #[cfg(not(unix))]
+        DeviceInfo {
+            machine_id: hash_machine_id(DeviceOs::Linux, "unknown"),
+            os: DeviceOs::Linux,
+            name: "Device".into(),
+        }
+    }
+    fn local_listeners(&self, ip: Ipv4Addr) -> Vec<(u16, Option<String>)> {
+        let _ = ip;
+        #[cfg(target_os = "linux")]
+        {
+            return linux_proc_listeners(ip);
+        }
+        #[cfg(not(target_os = "linux"))]
+        Vec::new()
     }
     fn network(&self) -> io::Result<Network>;
     fn protect(&self, socket: &Socket, target: Option<Ipv4Addr>) -> io::Result<()>;
@@ -80,6 +155,34 @@ pub trait Platform: Send + Sync + 'static {
     fn apply(&self, tun: &Tun) -> io::Result<()>;
     fn write_packet(&self, packet: &[u8]);
     fn set_input(&self, input: mpsc::Sender<Vec<u8>>);
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_listeners(target_ip: Ipv4Addr) -> Vec<(u16, Option<String>)> {
+    let Ok(raw) = std::fs::read_to_string("/proc/net/tcp") else {
+        return Vec::new();
+    };
+    let target_le = u32::from_le_bytes(target_ip.octets());
+    let mut ports = std::collections::BTreeSet::new();
+    for line in raw.lines().skip(1) {
+        let cols: Vec<_> = line.split_whitespace().collect();
+        if cols.len() < 4 || cols[3] != "0A" {
+            continue;
+        }
+        let Some((ip_hex, port_hex)) = cols[1].split_once(':') else {
+            continue;
+        };
+        let Ok(ip_val) = u32::from_str_radix(ip_hex, 16) else {
+            continue;
+        };
+        let Ok(port) = u16::from_str_radix(port_hex, 16) else {
+            continue;
+        };
+        if (ip_val == 0 || ip_val == target_le) && port > 0 && port < 49152 {
+            ports.insert(port);
+        }
+    }
+    ports.into_iter().take(24).map(|p| (p, None)).collect()
 }
 
 pub async fn tcp(platform: &dyn Platform, target: SocketAddrV4) -> Result<TcpStream, Code> {

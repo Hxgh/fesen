@@ -82,13 +82,13 @@ export function checkSiteDialog() {
 
 type Target = { id: string; owner: string | null; ip: string; port: number };
 export function showSiteDialog(target: Target, access: string, valid: () => boolean,
-  report: (result: "visible" | { error: string }) => void) {
+  report: (result: "visible" | { error: string }) => void, accessPort?: number) {
   stop();
   invalidate = valid;
   retry.disabled = false;
   expanded = false;
   syncExpandBtn();
-  const original = `http://${access}:${target.port}/`;
+  const original = `http://${access}:${accessPort ?? target.port}/`;
   address.textContent = original;
   address.title = original;
   dialog.showModal();

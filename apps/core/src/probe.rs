@@ -1,13 +1,13 @@
 use crate::platform::{self, Platform};
 use fesen_acl::Rules;
 use fesen_proto::{Code, HostOs, ServiceKind};
-use futures_util::future::join_all;
+use futures_util::stream::{self, StreamExt};
 use http_body_util::{BodyExt, Empty};
 use hyper::{Request, body::Bytes, client::conn::http1};
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{Ipv4Addr, SocketAddrV4},
     time::Duration,
 };
@@ -17,13 +17,22 @@ use tokio::{
 };
 
 pub const DEFAULT_HOST_PORTS: [u16; 5] = [22, 3389, 445, 80, 443];
-pub const MAX_HOST_PROBE_PORTS: usize = 10;
-
-// Well-known non-HTTP binary/database/mail ports: never send synthetic HTTP HEAD noise to them.
-const NON_HTTP_PORTS: [u16; 18] = [
-    21, 25, 53, 110, 143, 465, 587, 993, 995, 1433, 1521, 3306, 5432, 5672, 6379, 9092, 11211,
+pub const COMMON_HOST_PORTS: [u16; 33] = [
+    21, 22, 80, 443, 445, 1080, 1433, 3000, 3001, 3306, 3389, 4000, 5000, 5173, 5432, 5900, 6379,
+    7000, 7890, 8000, 8008, 8080, 8081, 8088, 8090, 8100, 8443, 8888, 9000, 9001, 9090, 9200,
     27017,
 ];
+pub const MAX_EXTRA_PORTS: usize = 5;
+pub const MAX_HOST_PROBE_PORTS: usize = 24;
+
+// Well-known non-HTTP binary/database/mail/proxy ports: never send synthetic HTTP HEAD noise to them.
+const NON_HTTP_PORTS: [u16; 20] = [
+    21, 25, 53, 110, 143, 465, 587, 993, 995, 1080, 1433, 1521, 3306, 5432, 5672, 5900, 6379, 9092,
+    11211, 27017,
+];
+
+// Noisy OS RPC/background ports skipped during automatic deep sweeps (still addable manually).
+const NOISY_OS_PORTS: [u16; 6] = [135, 137, 138, 139, 5040, 7680];
 
 // Standard X.224 Connection Request (TPKT + COTP CR + RDP Negotiation Request, zero credentials).
 const RDP_X224_REQ: [u8; 19] = [
@@ -67,6 +76,8 @@ pub struct HostProbe {
     pub host_os: Option<HostOs>,
     pub ports: Vec<HostPortProbe>,
     pub duration_ms: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,30 +243,154 @@ async fn probe_http_head(
     }
 }
 
+#[cfg(test)]
 pub async fn host(
     platform: &dyn Platform,
     ip: Ipv4Addr,
     extra_ports: &[u16],
 ) -> Result<HostProbe, Code> {
+    host_with_mode(platform, ip, extra_ports, false, false).await
+}
+
+pub async fn host_with_mode(
+    platform: &dyn Platform,
+    ip: Ipv4Addr,
+    extra_ports: &[u16],
+    deep: bool,
+    is_local_ip: bool,
+) -> Result<HostProbe, Code> {
     // Enforce the exact same IPv4 non-reserved boundary as publishing rules.
     Rules::parse(&ip.to_string(), "80").map_err(|_| Code::Invalid)?;
-    let mut targets: Vec<(u16, bool)> = DEFAULT_HOST_PORTS.iter().map(|&p| (p, false)).collect();
-    let mut seen: HashSet<u16> = DEFAULT_HOST_PORTS.into_iter().collect();
+    let mut seen_extra = HashSet::new();
     let mut extras = Vec::new();
     for &port in extra_ports {
         if port == 0 {
             return Err(Code::Invalid);
         }
-        if seen.insert(port) {
+        if seen_extra.insert(port) {
             extras.push(port);
         }
     }
-    extras.sort_unstable();
-    targets.extend(extras.into_iter().map(|p| (p, true)));
-    if targets.len() > MAX_HOST_PROBE_PORTS {
+    if extras.len() > MAX_EXTRA_PORTS {
         return Err(Code::Invalid);
     }
-    probe_targets(platform, ip, targets).await
+    extras.sort_unstable();
+
+    let local_hints: HashMap<u16, Option<String>> = if is_local_ip {
+        platform.local_listeners(ip).into_iter().collect()
+    } else {
+        HashMap::new()
+    };
+
+    let started = Instant::now();
+    let mut targets: Vec<(u16, bool)> = Vec::new();
+    let mut seen = HashSet::new();
+
+    if !deep {
+        for &port in &COMMON_HOST_PORTS {
+            if seen.insert(port) {
+                targets.push((port, !DEFAULT_HOST_PORTS.contains(&port)));
+            }
+        }
+        for &port in &extras {
+            if seen.insert(port) {
+                targets.push((port, !DEFAULT_HOST_PORTS.contains(&port)));
+            }
+        }
+        for &port in local_hints.keys() {
+            if targets.len() >= 48 {
+                break;
+            }
+            if seen.insert(port) {
+                targets.push((port, !DEFAULT_HOST_PORTS.contains(&port)));
+            }
+        }
+        let mut out = probe_targets(platform, ip, targets, &seen_extra, &local_hints).await?;
+        out.duration_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+        return Ok(out);
+    }
+
+    // Deep scan: bounded parallel TCP connect sweep across 1..=10000 (+ extras/27017),
+    // skipping noisy OS RPC ports, then fingerprinting only the discovered open ports.
+    let mut sweep_ports: Vec<u16> = (1u16..=10000)
+        .filter(|p| !NOISY_OS_PORTS.contains(p) || extras.contains(p))
+        .collect();
+    if !sweep_ports.contains(&27017) {
+        sweep_ports.push(27017);
+    }
+    for &p in &extras {
+        if p > 10000 && p != 27017 {
+            sweep_ports.push(p);
+        }
+    }
+    for &p in local_hints.keys() {
+        if p > 10000 && p != 27017 && !extras.contains(&p) {
+            sweep_ports.push(p);
+        }
+    }
+
+    let concurrency = if cfg!(target_os = "android") {
+        64
+    } else {
+        160
+    };
+    let open_ports: Vec<u16> = timeout(
+        Duration::from_millis(12_000),
+        stream::iter(sweep_ports)
+            .map(|port| async move {
+                let target = SocketAddrV4::new(ip, port);
+                platform::tcp_timeout(platform, target, Duration::from_millis(160))
+                    .await
+                    .ok()
+                    .map(|_| port)
+            })
+            .buffer_unordered(concurrency)
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .map_err(|_| Code::TargetTimeout)?
+    .into_iter()
+    .flatten()
+    .collect();
+
+    if open_ports.is_empty() {
+        return Ok(HostProbe {
+            ip,
+            host_os: None,
+            ports: Vec::new(),
+            duration_ms: started.elapsed().as_millis().min(u32::MAX as u128) as u32,
+            cancelled: false,
+        });
+    }
+
+    let open_set: HashSet<u16> = open_ports.iter().copied().collect();
+    for &port in DEFAULT_HOST_PORTS
+        .iter()
+        .chain(COMMON_HOST_PORTS.iter())
+        .chain(extras.iter())
+        .chain(local_hints.keys())
+    {
+        if open_set.contains(&port) && seen.insert(port) && targets.len() < MAX_HOST_PROBE_PORTS {
+            targets.push((port, !DEFAULT_HOST_PORTS.contains(&port)));
+        }
+    }
+    let mut rest: Vec<u16> = open_ports
+        .into_iter()
+        .filter(|p| !seen.contains(p))
+        .collect();
+    rest.sort_unstable();
+    for port in rest {
+        if targets.len() >= MAX_HOST_PROBE_PORTS {
+            break;
+        }
+        if seen.insert(port) {
+            targets.push((port, !DEFAULT_HOST_PORTS.contains(&port)));
+        }
+    }
+
+    let mut out = probe_targets(platform, ip, targets, &seen_extra, &local_hints).await?;
+    out.duration_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+    Ok(out)
 }
 
 pub async fn ports(
@@ -277,24 +412,40 @@ pub async fn ports(
     if targets.is_empty() || targets.len() > MAX_HOST_PROBE_PORTS {
         return Err(Code::Invalid);
     }
-    probe_targets(platform, ip, targets).await
+    let empty_hints = HashMap::new();
+    probe_targets(platform, ip, targets, &seen, &empty_hints).await
 }
 
 async fn probe_targets(
     platform: &dyn Platform,
     ip: Ipv4Addr,
     targets: Vec<(u16, bool)>,
+    user_requested: &HashSet<u16>,
+    local_hints: &HashMap<u16, Option<String>>,
 ) -> Result<HostProbe, Code> {
     let started = Instant::now();
     // Each port enforces its own bounded budget (<=2200ms) so one slow custom port never discards
     // healthy results from sibling ports; outer timeout is a pure safety guard.
     let raw = timeout(
         Duration::from_millis(3200),
-        join_all(
-            targets
-                .into_iter()
-                .map(|(port, extra)| probe_host_port_bounded(platform, ip, port, extra)),
-        ),
+        stream::iter(targets.into_iter().map(|(port, extra)| {
+            let timeout_ms = if DEFAULT_HOST_PORTS.contains(&port) || user_requested.contains(&port) {
+                950
+            } else {
+                550
+            };
+            let local_proc = local_hints.get(&port).and_then(|v| v.clone());
+            async move {
+                let (mut probe, os) =
+                    probe_host_port_bounded(platform, ip, port, extra, timeout_ms).await;
+                if probe.open && probe.detail.is_none() && local_proc.is_some() {
+                    probe.detail = local_proc;
+                }
+                (probe, os)
+            }
+        }))
+        .buffer_unordered(18)
+        .collect::<Vec<_>>(),
     )
     .await
     .map_err(|_| Code::TargetTimeout)?;
@@ -328,25 +479,31 @@ async fn probe_targets(
         }
     }
 
-    let ports = raw
+    let mut ports: Vec<_> = raw
         .into_iter()
         .map(|(mut entry, _)| {
+            let explicit = user_requested.contains(&entry.port);
             entry.recommended = entry.open
                 && match entry.kind {
                     ServiceKind::Ssh | ServiceKind::Rdp => true,
-                    ServiceKind::Smb => entry.extra,
+                    ServiceKind::Smb => explicit,
                     ServiceKind::Http | ServiceKind::Https => entry.extra || !has_remote_entry,
-                    ServiceKind::Tcp => entry.extra,
+                    ServiceKind::Tcp => {
+                        (explicit || local_hints.contains_key(&entry.port))
+                            && !NON_HTTP_PORTS.contains(&entry.port)
+                    }
                 };
             entry
         })
         .collect();
+    ports.sort_unstable_by_key(|p| p.port);
 
     Ok(HostProbe {
         ip,
         host_os,
         ports,
         duration_ms: started.elapsed().as_millis().min(u32::MAX as u128) as u32,
+        cancelled: false,
     })
 }
 
@@ -355,6 +512,7 @@ async fn probe_host_port_bounded(
     ip: Ipv4Addr,
     port: u16,
     extra: bool,
+    connect_ms: u64,
 ) -> (HostPortProbe, Option<HostOs>) {
     let default_kind = match port {
         22 => ServiceKind::Ssh,
@@ -366,7 +524,8 @@ async fn probe_host_port_bounded(
     };
     let target = SocketAddrV4::new(ip, port);
     let started = Instant::now();
-    let Ok(mut stream) = platform::tcp_timeout(platform, target, Duration::from_millis(1000)).await
+    let Ok(mut stream) =
+        platform::tcp_timeout(platform, target, Duration::from_millis(connect_ms)).await
     else {
         return (
             HostPortProbe {
@@ -791,17 +950,20 @@ mod tests {
         });
 
         let p = LoopbackPlatform;
-        let (ssh_res, ssh_os) = probe_host_port_bounded(&p, Ipv4Addr::LOCALHOST, ssh_port, true).await;
+        let (ssh_res, ssh_os) =
+            probe_host_port_bounded(&p, Ipv4Addr::LOCALHOST, ssh_port, true, 1000).await;
         assert!(ssh_res.open && ssh_res.kind == ServiceKind::Ssh);
         assert_eq!(ssh_os, Some(HostOs::Linux));
 
-        let (http_res, _) = probe_host_port_bounded(&p, Ipv4Addr::LOCALHOST, http_port, true).await;
+        let (http_res, _) =
+            probe_host_port_bounded(&p, Ipv4Addr::LOCALHOST, http_port, true, 1000).await;
         assert!(http_res.open && http_res.kind == ServiceKind::Http);
         assert_eq!(http_res.http_status, Some(200));
         // Pure TCP connect latency must not include the 240ms passive SSH banner wait.
         assert!(http_res.rtt_ms.unwrap() < 150, "rtt={:?}", http_res.rtt_ms);
 
-        let (tls_res, _) = probe_host_port_bounded(&p, Ipv4Addr::LOCALHOST, tls_port, true).await;
+        let (tls_res, _) =
+            probe_host_port_bounded(&p, Ipv4Addr::LOCALHOST, tls_port, true, 1000).await;
         assert!(tls_res.open && tls_res.kind == ServiceKind::Https);
 
         // Slow/silent peer on an extra port must stay bounded and fall back to open TCP without aborting.
@@ -813,7 +975,42 @@ mod tests {
             }
         });
         let (silent_res, _) =
-            probe_host_port_bounded(&p, Ipv4Addr::LOCALHOST, silent_port, true).await;
+            probe_host_port_bounded(&p, Ipv4Addr::LOCALHOST, silent_port, true, 1000).await;
         assert!(silent_res.open && silent_res.kind == ServiceKind::Tcp);
+    }
+
+    #[tokio::test]
+    async fn local_hints_enrich_tcp_detail_and_skip_non_http_recommendations() {
+        let tcp_ln = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let tcp_port = tcp_ln.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = tcp_ln.accept().await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+
+        let p = LoopbackPlatform;
+        let user_req = HashSet::new();
+        let mut local_hints = HashMap::new();
+        local_hints.insert(tcp_port, Some("node".to_owned()));
+        local_hints.insert(3306, Some("mysqld".to_owned()));
+
+        let res = probe_targets(
+            &p,
+            Ipv4Addr::LOCALHOST,
+            vec![(tcp_port, true), (3306, true)],
+            &user_req,
+            &local_hints,
+        )
+        .await
+        .unwrap();
+
+        let node_entry = res.ports.iter().find(|e| e.port == tcp_port).unwrap();
+        assert!(node_entry.open);
+        assert!(node_entry.recommended);
+        assert_eq!(node_entry.detail.as_deref(), Some("node"));
+
+        // Non-HTTP DB port stays unchecked by default unless explicitly requested.
+        let db_entry = res.ports.iter().find(|e| e.port == 3306).unwrap();
+        assert!(!db_entry.recommended);
     }
 }

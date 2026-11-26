@@ -8,6 +8,12 @@ export const singleIp = (s) => (singleSpan(s?.rules?.ips) ? s.rules.ips[0].start
 export const singlePort = (s) => (singleSpan(s?.rules?.ports) ? s.rules.ports[0].start : null);
 export const effectiveKind = (s) => s?.kind ?? (s?.http ? "http" : "tcp");
 export const osLabel = (os) => (os === "windows" ? "Windows" : os === "linux" ? "Linux" : "");
+export const deviceOsLabel = (os) =>
+  os === "macos" ? "macOS"
+    : os === "windows" ? "Windows"
+    : os === "android" ? "Android"
+    : os === "linux" ? "Linux"
+    : "";
 
 export function formatRanges(spans, zh = false) {
   return (spans || [])

@@ -57,7 +57,7 @@ internal class SiteView(private val activity: Activity, private val main: WebVie
             uri.fragment == null && uri.host?.matches(Regex("""\d{1,3}(\.\d{1,3}){3}""")) == true && uri.port in 1..65535)
         val ip = InetAddress.getByName(uri.host)
         val cm = activity.getSystemService(ConnectivityManager::class.java)
-        routeOk = { !group || cm.activeNetwork?.let { net ->
+        routeOk = { !group || ip.isLoopbackAddress || cm.activeNetwork?.let { net ->
             val cap = cm.getNetworkCapabilities(net)
             cap?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true &&
                 cap.ownerUid == android.os.Process.myUid() &&

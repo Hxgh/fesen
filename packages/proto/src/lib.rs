@@ -2,7 +2,7 @@ use fesen_acl::{Rules, VIRTUAL};
 use serde::{Deserialize, Serialize};
 use std::{
     fmt,
-    net::{SocketAddrV4, SocketAddrV6},
+    net::{Ipv4Addr, SocketAddrV4, SocketAddrV6},
     time::Duration,
 };
 use url::Url;
@@ -15,7 +15,7 @@ pub const ALPN: &[u8] = b"fesen/1";
 pub const CERT_NAME: &str = "peer.fesen";
 pub const PROBE_PREFIX: &[u8] = b"fesen-probe/1:";
 pub const MAX_FRAME: usize = 1024 * 1024;
-pub const MAX_REQUEST: usize = 16 * 1024;
+pub const MAX_REQUEST: usize = 64 * 1024;
 pub const MAX_PUBLICATIONS: usize = 256;
 pub const MAX_DEVICES: usize = 128;
 pub const MAX_CANDIDATES: usize = 8;
@@ -80,6 +80,15 @@ pub enum HostOs {
     Windows,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceOs {
+    Macos,
+    Windows,
+    Android,
+    Linux,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Publication {
     pub id: String,
@@ -134,6 +143,23 @@ pub fn valid_id(s: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
+pub fn valid_machine_id(s: &str) -> bool {
+    valid_id(s)
+}
+
+pub fn alias_name(label: &str) -> Result<String, Code> {
+    let bare = label.trim().trim_end_matches('.').to_ascii_lowercase();
+    let bare = bare.strip_suffix(".fesen").unwrap_or(&bare);
+    if !(1..=63).contains(&bare.len())
+        || bare.starts_with('-')
+        || bare.ends_with('-')
+        || !bare.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+    {
+        return Err(Code::Invalid);
+    }
+    Ok(format!("{bare}.fesen"))
+}
+
 pub fn valid_username(s: &str) -> bool {
     (1..=64).contains(&s.len())
         && s.bytes()
@@ -150,8 +176,55 @@ pub struct Offering {
     pub member: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_os: Option<DeviceOs>,
     #[serde(flatten)]
     pub service: Publication,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberPref {
+    pub service: String,
+    #[serde(default)]
+    pub remark: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip: Option<Ipv4Addr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalMapping {
+    pub service: String,
+    pub target_ip: Ipv4Addr,
+    pub target_port: u16,
+    pub local_port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalForwardStatus {
+    pub service: String,
+    pub target_ip: Ipv4Addr,
+    pub target_port: u16,
+    pub local_port: u16,
+    pub active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<Code>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceProfile {
+    pub machine_id: String,
+    pub name: String,
+    pub os: DeviceOs,
+    #[serde(default)]
+    pub shares: Vec<Publication>,
+    #[serde(default)]
+    pub forwards: Vec<LocalMapping>,
+    #[serde(default)]
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +257,10 @@ pub struct Hello {
     pub version: u8,
     pub certificate: Vec<u8>,
     pub credential: Credential,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<DeviceOs>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -207,6 +284,18 @@ pub enum Call {
     },
     Ping,
     Logout,
+    RenameDevice {
+        label: String,
+    },
+    SavePref {
+        pref: MemberPref,
+    },
+    SaveProfile {
+        profile: DeviceProfile,
+    },
+    DeleteProfile {
+        machine_id: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -249,6 +338,12 @@ pub enum Event {
         error: Code,
     },
     Revoked,
+    Sync {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        prefs: Vec<MemberPref>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        profiles: Vec<DeviceProfile>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]

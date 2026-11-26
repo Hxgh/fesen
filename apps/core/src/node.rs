@@ -4,14 +4,15 @@ use crate::{
     direct::{self, Allowed},
     local::{Identity, Local, Log, Login, private_dir},
     packets,
-    platform::{self, Network, Platform, Tun},
+    platform::{self, DeviceInfo, Network, Platform, Tun},
     probe,
     routing::{Destination, Label, Mapping, Routes, alias_name},
 };
 use fesen_acl::Rules;
 use fesen_proto::{
-    Call, Code, Credential, HostOs, Offering, Open, Publication, ServiceKind, View, origin,
-    valid_id, valid_label, valid_username,
+    Call, Code, Credential, DeviceOs, DeviceProfile, HostOs, LocalForwardStatus, LocalMapping,
+    MemberPref, Offering, Open, Publication, ServiceKind, View, origin, valid_id, valid_label,
+    valid_machine_id, valid_username,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -27,6 +28,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, copy_bidirectional_with_sizes},
+    net::TcpListener,
     sync::watch,
     time::{Instant, interval, timeout},
 };
@@ -53,6 +55,10 @@ pub enum Command {
     Login {
         username: String,
         password: String,
+        #[serde(default)]
+        label: String,
+    },
+    RenameDevice {
         label: String,
     },
     Start,
@@ -113,7 +119,10 @@ pub enum Command {
         extra_ports: Vec<u16>,
         #[serde(default)]
         ports: Vec<u16>,
+        #[serde(default)]
+        deep: bool,
     },
+    CancelProbeHost,
     AdminSession,
     AdminAction {
         action: serde_json::Value,
@@ -123,17 +132,50 @@ pub enum Command {
         auto_connect: Option<bool>,
         #[serde(default)]
         auto_share: Option<bool>,
+        #[serde(default)]
+        cloud_backup: Option<bool>,
     },
+    SetLocalForward {
+        service: String,
+        target_ip: Ipv4Addr,
+        target_port: u16,
+        local_port: u16,
+    },
+    SuggestLocalPort {
+        #[serde(default)]
+        preferred: Option<u16>,
+    },
+    ImportProfile {
+        machine_id: String,
+        #[serde(default = "default_true")]
+        import_shares: bool,
+        #[serde(default = "default_true")]
+        import_forwards: bool,
+    },
+    DeleteProfile {
+        machine_id: String,
+    },
+    DismissRestore,
 }
 
 fn default_true() -> bool {
     true
 }
 
+fn default_device_os() -> DeviceOs {
+    DeviceOs::Linux
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Status {
     pub server: String,
     pub member: Option<String>,
+    #[serde(default)]
+    pub machine_id: String,
+    #[serde(default = "default_device_os")]
+    pub device_os: DeviceOs,
+    #[serde(default)]
+    pub device_name: String,
     pub online: bool,
     pub running: bool,
     pub background: bool,
@@ -151,14 +193,26 @@ pub struct Status {
     pub active_flows: usize,
     pub labels: Vec<Label>,
     pub virtual_ips: Vec<Mapping>,
+    #[serde(default)]
+    pub service_virtual_ips: HashMap<String, Vec<Mapping>>,
     pub aliases: HashMap<String, Ipv4Addr>,
+    #[serde(default)]
+    pub forwards: Vec<LocalForwardStatus>,
+    #[serde(default)]
+    pub cloud_profiles: Vec<DeviceProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_prompt: Option<DeviceProfile>,
     pub error: Option<Code>,
     #[serde(default = "default_true")]
     pub auto_connect: bool,
     #[serde(default = "default_true")]
     pub auto_share: bool,
+    #[serde(default = "default_true")]
+    pub cloud_backup: bool,
     #[serde(default)]
     pub auto_share_blocked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -167,6 +221,15 @@ pub struct Status {
     pub host_probe: Option<probe::HostProbe>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admin_data: Option<serde_json::Value>,
+}
+
+type ForwardKey = (String, Ipv4Addr, u16);
+
+struct ForwardHandle {
+    owner: String,
+    local_port: u16,
+    cancel: CancellationToken,
+    closed: tokio::sync::oneshot::Receiver<()>,
 }
 
 struct Sharing {
@@ -181,6 +244,10 @@ struct State {
     view: Vec<Offering>,
     latest: HashSet<String>,
     sharing: HashMap<String, Sharing>,
+    forward_states: HashMap<ForwardKey, LocalForwardStatus>,
+    cloud_profiles: Vec<DeviceProfile>,
+    profile_synced: bool,
+    dismissed_restore: bool,
     wanted: bool,
     restore_pending: bool,
     auto_share_blocked: bool,
@@ -192,16 +259,20 @@ struct State {
 
 pub struct Core {
     dir: PathBuf,
+    device_info: DeviceInfo,
     state: Mutex<State>,
     pub(crate) platform: Arc<dyn Platform>,
     log: Log,
     operations: tokio::sync::Mutex<()>,
+    forwards_lock: tokio::sync::Mutex<HashMap<ForwardKey, ForwardHandle>>,
     host_probe_lock: tokio::sync::Mutex<()>,
+    probe_cancel: Mutex<Option<CancellationToken>>,
     network_probe: tokio::sync::Mutex<Instant>,
     pub(crate) routes: RwLock<Routes>,
     changes: watch::Sender<u64>,
     pub(crate) quit: CancellationToken,
     applied_shutdown: CancellationToken,
+    forwards_shutdown: CancellationToken,
     flows: AtomicUsize,
     keep_access: bool,
 }
@@ -214,11 +285,13 @@ impl Core {
     ) -> io::Result<Arc<Self>> {
         private_dir(&dir)?;
         let local = Local::load(&dir)?;
+        let device_info = platform.device_info();
         let network = platform.network().unwrap_or_default();
         let log = Log::new(&dir);
         log.prune();
         let core = Arc::new(Self {
             dir,
+            device_info,
             platform,
             log,
             state: Mutex::new(State {
@@ -228,6 +301,10 @@ impl Core {
                 view: vec![],
                 latest: HashSet::new(),
                 sharing: HashMap::new(),
+                forward_states: HashMap::new(),
+                cloud_profiles: vec![],
+                profile_synced: false,
+                dismissed_restore: false,
                 wanted: false,
                 restore_pending: false,
                 auto_share_blocked: false,
@@ -237,12 +314,15 @@ impl Core {
                 admin_token: None,
             }),
             operations: tokio::sync::Mutex::new(()),
+            forwards_lock: tokio::sync::Mutex::new(HashMap::new()),
             host_probe_lock: tokio::sync::Mutex::new(()),
+            probe_cancel: Mutex::new(None),
             network_probe: tokio::sync::Mutex::new(Instant::now() - Duration::from_secs(1)),
             routes: RwLock::new(Routes::default()),
             changes: watch::channel(0).0,
             quit: CancellationToken::new(),
             applied_shutdown: CancellationToken::new(),
+            forwards_shutdown: CancellationToken::new(),
             flows: AtomicUsize::new(0),
             keep_access,
         });
@@ -252,6 +332,7 @@ impl Core {
         } else {
             core.applied_shutdown.cancel();
         }
+        tokio::spawn(core.clone().forward_worker());
         tokio::spawn(core.clone().monitor());
         Ok(core)
     }
@@ -269,6 +350,15 @@ impl Core {
         !state.sharing.is_empty()
             || self.flows.load(Ordering::Acquire) != 0
             || (self.keep_access && state.wanted)
+            || (state.wanted && !state.local.forwards().is_empty())
+    }
+
+    fn device_name(&self, local: &Local) -> String {
+        local
+            .device_name
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| self.device_info.name.clone())
     }
 
     pub fn status(&self) -> Status {
@@ -276,9 +366,56 @@ impl Core {
         let routes = self.routes.read().unwrap();
         let mut active: Vec<_> = state.sharing.keys().cloned().collect();
         active.sort_unstable();
+        let mut forwards: Vec<_> = state
+            .local
+            .forwards()
+            .iter()
+            .map(|m| {
+                state
+                    .forward_states
+                    .get(&(m.service.clone(), m.target_ip, m.target_port))
+                    .cloned()
+                    .unwrap_or(LocalForwardStatus {
+                        service: m.service.clone(),
+                        target_ip: m.target_ip,
+                        target_port: m.target_port,
+                        local_port: m.local_port,
+                        active: false,
+                        error: None,
+                        suggested_port: None,
+                    })
+            })
+            .collect();
+        forwards.sort_unstable_by(|a, b| {
+            (&a.service, a.target_ip, a.target_port, a.local_port).cmp(&(
+                &b.service,
+                b.target_ip,
+                b.target_port,
+                b.local_port,
+            ))
+        });
+        let restore_prompt = if state.local.session.is_some()
+            && state.local.shares().is_empty()
+            && state.local.forwards().is_empty()
+            && !state.dismissed_restore
+        {
+            state
+                .cloud_profiles
+                .iter()
+                .find(|p| {
+                    p.machine_id == self.device_info.machine_id
+                        && (!p.shares.is_empty() || !p.forwards.is_empty())
+                })
+                .cloned()
+        } else {
+            None
+        };
         Status {
             server: state.local.server.clone(),
             member: state.local.session.as_ref().map(|s| s.member.clone()),
+            machine_id: self.device_info.machine_id.clone(),
+            device_os: self.device_info.os,
+            device_name: self.device_name(&state.local),
             online: self.platform.access_ready()
                 && state
                     .link
@@ -296,11 +433,17 @@ impl Core {
             active_flows: self.flows.load(Ordering::Acquire),
             labels: state.local.labels().to_vec(),
             virtual_ips: routes.mappings.clone(),
+            service_virtual_ips: routes.service_mappings.clone(),
             aliases: routes.aliases.clone(),
+            forwards,
+            cloud_profiles: state.cloud_profiles.clone(),
+            restore_prompt,
             error: state.error,
             auto_connect: state.local.auto_connect,
             auto_share: state.local.auto_share,
+            cloud_backup: state.local.cloud_backup(),
             auto_share_blocked: state.auto_share_blocked,
+            suggested_port: None,
             http_status: None,
             probe: None,
             host_probe: None,
@@ -390,12 +533,21 @@ impl Core {
                 ip,
                 extra_ports,
                 ports,
+                deep,
             } => {
-                let host_probe = self.probe_host(ip, &extra_ports, &ports).await?;
+                let host_probe = self.probe_host(ip, &extra_ports, &ports, deep).await?;
                 return Ok(Status {
                     host_probe: Some(host_probe),
                     ..self.status()
                 });
+            }
+            Command::CancelProbeHost => {
+                let token = self.probe_cancel.lock().unwrap().take();
+                if let Some(tok) = token {
+                    tok.cancel();
+                    let _ = timeout(Duration::from_millis(200), self.host_probe_lock.lock()).await;
+                }
+                return Ok(self.status());
             }
             Command::AdminSession => {
                 let (server, token) = {
@@ -447,6 +599,7 @@ impl Core {
             Command::SetPreferences {
                 auto_connect,
                 auto_share,
+                cloud_backup,
             } => {
                 self.edit(|local| {
                     if let Some(v) = auto_connect {
@@ -455,11 +608,32 @@ impl Core {
                     if let Some(v) = auto_share {
                         local.auto_share = v;
                     }
+                    if let Some(v) = cloud_backup {
+                        local.set_cloud_backup(v)?;
+                    }
                     Ok(())
                 })?;
                 if auto_share == Some(false) {
                     self.state.lock().unwrap().auto_share_blocked = false;
                 }
+                if cloud_backup == Some(true) {
+                    self.push_profile_bg();
+                }
+                return Ok(self.status());
+            }
+            Command::SuggestLocalPort { preferred } => {
+                let used: HashSet<u16> = {
+                    let state = self.state.lock().unwrap();
+                    state.local.forwards().iter().map(|f| f.local_port).collect()
+                };
+                let port = suggest_free_port(preferred, &used).ok_or(Code::Conflict)?;
+                return Ok(Status {
+                    suggested_port: Some(port),
+                    ..self.status()
+                });
+            }
+            Command::DismissRestore => {
+                self.state.lock().unwrap().dismissed_restore = true;
                 return Ok(self.status());
             }
             _ => {}
@@ -485,9 +659,12 @@ impl Core {
             | Command::TestConnection { .. }
             | Command::TestLocalSite { .. }
             | Command::ProbeHost { .. }
+            | Command::CancelProbeHost
             | Command::AdminSession
             | Command::AdminAction { .. }
-            | Command::SetPreferences { .. } => unreachable!(),
+            | Command::SetPreferences { .. }
+            | Command::SuggestLocalPort { .. }
+            | Command::DismissRestore => unreachable!(),
             Command::Join { address } => {
                 let address = origin(&address)?.to_string();
                 let res = self.edit(|local| {
@@ -505,6 +682,9 @@ impl Core {
                     let mut s = self.state.lock().unwrap();
                     s.is_admin = false;
                     s.admin_token = None;
+                    s.cloud_profiles.clear();
+                    s.profile_synced = false;
+                    s.dismissed_restore = false;
                 }
                 res
             }
@@ -513,6 +693,15 @@ impl Core {
                 password,
                 label,
             } => {
+                let auto_name = {
+                    let s = self.state.lock().unwrap();
+                    self.device_name(&s.local)
+                };
+                let label = if label.trim().is_empty() {
+                    auto_name
+                } else {
+                    label.trim().to_owned()
+                };
                 if !valid_username(&username) || !valid_label(&label) {
                     return Err(Code::Invalid);
                 }
@@ -528,6 +717,25 @@ impl Core {
                     &username,
                 )
                 .await
+            }
+            Command::RenameDevice { label } => {
+                let trimmed = label.trim().to_owned();
+                if !valid_label(&trimmed) {
+                    return Err(Code::Invalid);
+                }
+                let link = self.state.lock().unwrap().link.clone();
+                if let Some(link) = link {
+                    link.call(Call::RenameDevice {
+                        label: trimmed.clone(),
+                    })
+                    .await?;
+                }
+                self.edit(|local| {
+                    local.device_name = Some(trimmed);
+                    Ok(())
+                })?;
+                self.push_profile_bg();
+                Ok(())
             }
             Command::Start => {
                 {
@@ -546,6 +754,7 @@ impl Core {
             }
             Command::Stop => {
                 self.disconnect(false);
+                self.reconcile_forwards().await;
                 let mut state = self.state.lock().unwrap();
                 state.restore_pending = false;
                 state.auto_share_blocked = false;
@@ -558,6 +767,9 @@ impl Core {
                     s.is_admin = false;
                     s.restore_pending = false;
                     s.auto_share_blocked = false;
+                    s.cloud_profiles.clear();
+                    s.profile_synced = false;
+                    s.dismissed_restore = false;
                     (
                         s.link.clone(),
                         s.local.server.clone(),
@@ -579,6 +791,7 @@ impl Core {
                     let _ = link.call(Call::Logout).await;
                 }
                 self.disconnect(false);
+                self.reconcile_forwards().await;
                 self.edit(|l| {
                     l.clear_active_shares();
                     l.session = None;
@@ -623,7 +836,9 @@ impl Core {
                         return Err(Code::Limit);
                     }
                     Ok(())
-                })
+                })?;
+                self.push_profile_bg();
+                Ok(())
             }
             Command::SaveHost {
                 ip,
@@ -631,7 +846,11 @@ impl Core {
                 host_os,
                 services,
                 publish,
-            } => self.save_host(ip, name, host_os, services, publish).await,
+            } => {
+                self.save_host(ip, name, host_os, services, publish).await?;
+                self.push_profile_bg();
+                Ok(())
+            }
             Command::Share { id, enabled } => self.share(id, enabled).await,
             Command::ShareMany { ids, enabled } => self.share_many(ids, enabled).await,
             Command::Remove { id } => {
@@ -661,7 +880,9 @@ impl Core {
                         }
                     }
                     Ok(())
-                })
+                })?;
+                self.push_profile_bg();
+                Ok(())
             }
             Command::Customize {
                 id,
@@ -672,6 +893,7 @@ impl Core {
                 if !valid_id(&id) || !(remark.is_empty() || valid_label(&remark)) {
                     return Err(Code::Invalid);
                 }
+                let remark = remark.trim().to_owned();
                 let alias = (!alias.trim().is_empty())
                     .then(|| alias_name(&alias))
                     .transpose()?;
@@ -700,15 +922,193 @@ impl Core {
                             return Err(Code::Limit);
                         }
                         labels.push(Label {
-                            service: id,
-                            remark,
-                            alias,
+                            service: id.clone(),
+                            remark: remark.clone(),
+                            alias: alias.clone(),
                             ip,
                         });
                     }
+                    local.mark_pref_dirty(&id);
                     Ok(())
                 })?;
+                let link = self.state.lock().unwrap().link.clone();
+                if let Some(link) = link {
+                    let core = self.clone();
+                    let pref = MemberPref {
+                        service: id.clone(),
+                        remark,
+                        alias,
+                        ip,
+                    };
+                    tokio::spawn(async move {
+                        if link.call(Call::SavePref { pref }).await.is_ok() {
+                            let _ = core.edit(|local| {
+                                if let Some(member) = local.active_member().map(str::to_owned)
+                                    && let Some(acct) = local.accounts.get_mut(&member)
+                                {
+                                    acct.dirty_prefs.retain(|s| s != &id);
+                                }
+                                Ok(())
+                            });
+                        }
+                    });
+                }
                 self.changed();
+                Ok(())
+            }
+            Command::SetLocalForward {
+                service,
+                target_ip,
+                target_port,
+                local_port,
+            } => {
+                if !valid_id(&service) || target_port == 0 {
+                    return Err(Code::Invalid);
+                }
+                if local_port == 0 {
+                    self.edit(|local| {
+                        local.forwards_mut()?.retain(|f| {
+                            !(f.service == service
+                                && f.target_ip == target_ip
+                                && f.target_port == target_port)
+                        });
+                        Ok(())
+                    })?;
+                    self.reconcile_forwards().await;
+                    self.push_profile_bg();
+                    return Ok(());
+                }
+                {
+                    let listeners = self.forwards_lock.lock().await;
+                    let key = (service.clone(), target_ip, target_port);
+                    let already_bound = listeners
+                        .get(&key)
+                        .is_some_and(|h| h.local_port == local_port);
+                    {
+                        let state = self.state.lock().unwrap();
+                        if let Some(o) = state.view.iter().find(|o| o.service.id == service)
+                            && !o.service.rules.allows(target_ip, target_port)
+                        {
+                            return Err(Code::Invalid);
+                        }
+                        if state.local.forwards().iter().any(|f| {
+                            f.local_port == local_port
+                                && !(f.service == service
+                                    && f.target_ip == target_ip
+                                    && f.target_port == target_port)
+                        }) {
+                            return Err(Code::Conflict);
+                        }
+                    }
+                    if !already_bound
+                        && std::net::TcpListener::bind(SocketAddrV4::new(
+                            Ipv4Addr::LOCALHOST,
+                            local_port,
+                        ))
+                        .is_err()
+                    {
+                        return Err(Code::Conflict);
+                    }
+                }
+                self.edit(|local| {
+                    let list = local.forwards_mut()?;
+                    if let Some(existing) = list.iter_mut().find(|f| {
+                        f.service == service
+                            && f.target_ip == target_ip
+                            && f.target_port == target_port
+                    }) {
+                        existing.local_port = local_port;
+                    } else if list.len() < 64 {
+                        list.push(LocalMapping {
+                            service: service.clone(),
+                            target_ip,
+                            target_port,
+                            local_port,
+                        });
+                    } else {
+                        return Err(Code::Limit);
+                    }
+                    Ok(())
+                })?;
+                self.reconcile_forwards().await;
+                self.push_profile_bg();
+                self.changed();
+                Ok(())
+            }
+            Command::ImportProfile {
+                machine_id,
+                import_shares,
+                import_forwards,
+            } => {
+                if !valid_machine_id(&machine_id) {
+                    return Err(Code::Invalid);
+                }
+                let profile = {
+                    let state = self.state.lock().unwrap();
+                    state
+                        .cloud_profiles
+                        .iter()
+                        .find(|p| p.machine_id == machine_id)
+                        .cloned()
+                        .ok_or(Code::Invalid)?
+                };
+                let same_machine = profile.machine_id == self.device_info.machine_id;
+                self.edit(|local| {
+                    if import_shares {
+                        let shares = local.shares_mut()?;
+                        for s in &profile.shares {
+                            if shares.len() >= 32 {
+                                break;
+                            }
+                            if shares.iter().any(|cur| cur.rules == s.rules && cur.name == s.name) {
+                                continue;
+                            }
+                            let mut imported = s.clone();
+                            if !same_machine || shares.iter().any(|cur| cur.id == imported.id) {
+                                imported.id = hex::encode(rand::random::<[u8; 16]>());
+                            }
+                            shares.push(imported);
+                        }
+                    }
+                    if import_forwards {
+                        let forwards = local.forwards_mut()?;
+                        for f in &profile.forwards {
+                            if forwards.len() >= 64 {
+                                break;
+                            }
+                            if forwards.iter().any(|cur| {
+                                cur.local_port == f.local_port
+                                    || (cur.service == f.service
+                                        && cur.target_ip == f.target_ip
+                                        && cur.target_port == f.target_port)
+                            }) {
+                                continue;
+                            }
+                            forwards.push(f.clone());
+                        }
+                    }
+                    Ok(())
+                })?;
+                self.state.lock().unwrap().dismissed_restore = true;
+                self.reconcile_forwards().await;
+                self.push_profile_bg();
+                self.changed();
+                Ok(())
+            }
+            Command::DeleteProfile { machine_id } => {
+                if !valid_machine_id(&machine_id) {
+                    return Err(Code::Invalid);
+                }
+                let link = self.state.lock().unwrap().link.clone().ok_or(Code::NotConnected)?;
+                link.call(Call::DeleteProfile {
+                    machine_id: machine_id.clone(),
+                })
+                .await?;
+                self.state
+                    .lock()
+                    .unwrap()
+                    .cloud_profiles
+                    .retain(|p| p.machine_id != machine_id);
                 Ok(())
             }
         }
@@ -1018,6 +1418,8 @@ impl Core {
             state.wanted &= keep_wanted;
             state.view.clear();
             state.latest.clear();
+            state.profile_synced = false;
+            state.forward_states.clear();
             for (_, r) in state.sharing.drain() {
                 r.cancel.cancel();
             }
@@ -1041,6 +1443,8 @@ impl Core {
         state.link = None;
         state.view.clear();
         state.latest.clear();
+        state.profile_synced = false;
+        state.forward_states.clear();
         for (_, r) in state.sharing.drain() {
             r.cancel.cancel();
         }
@@ -1054,6 +1458,140 @@ impl Core {
             self.report(e);
         }
         self.changed();
+    }
+
+    fn push_profile_bg(self: &Arc<Self>) {
+        let (link, profile) = {
+            let state = self.state.lock().unwrap();
+            if !state.local.cloud_backup() {
+                return;
+            }
+            let Some(link) = state.link.clone() else {
+                return;
+            };
+            let profile = DeviceProfile {
+                machine_id: self.device_info.machine_id.clone(),
+                name: self.device_name(&state.local),
+                os: self.device_info.os,
+                shares: state.local.shares().to_vec(),
+                forwards: state.local.forwards().to_vec(),
+                updated_at: 0,
+            };
+            (link, profile)
+        };
+        tokio::spawn(async move {
+            let _ = link.call(Call::SaveProfile { profile }).await;
+        });
+    }
+
+    pub(crate) fn update_sync(
+        self: &Arc<Self>,
+        link: &Arc<Link>,
+        prefs: Vec<MemberPref>,
+        profiles: Vec<DeviceProfile>,
+    ) {
+        let (labels_changed, to_push, initial_profile) = {
+            let mut state = self.state.lock().unwrap();
+            if !Self::is_link(&state, link) {
+                return;
+            }
+            state.cloud_profiles = profiles;
+            let initial_profile = if !state.profile_synced {
+                state.profile_synced = true;
+                if state.local.cloud_backup()
+                    && (!state.local.shares().is_empty() || !state.local.forwards().is_empty())
+                {
+                    Some(DeviceProfile {
+                        machine_id: self.device_info.machine_id.clone(),
+                        name: self.device_name(&state.local),
+                        os: self.device_info.os,
+                        shares: state.local.shares().to_vec(),
+                        forwards: state.local.forwards().to_vec(),
+                        updated_at: 0,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let dirty: HashSet<String> = state.local.dirty_prefs().iter().cloned().collect();
+            let before = state.local.labels().to_vec();
+            let mut merged: Vec<Label> = Vec::new();
+            for p in &prefs {
+                if !dirty.contains(&p.service) {
+                    merged.push(Label {
+                        service: p.service.clone(),
+                        remark: p.remark.clone(),
+                        alias: p.alias.clone(),
+                        ip: p.ip,
+                    });
+                }
+            }
+            let mut to_push: Vec<MemberPref> = Vec::new();
+            for l in &before {
+                if dirty.contains(&l.service) {
+                    merged.push(l.clone());
+                    to_push.push(MemberPref {
+                        service: l.service.clone(),
+                        remark: l.remark.clone(),
+                        alias: l.alias.clone(),
+                        ip: l.ip,
+                    });
+                }
+            }
+            for svc in &dirty {
+                if !before.iter().any(|l| &l.service == svc) {
+                    to_push.push(MemberPref {
+                        service: svc.clone(),
+                        remark: String::new(),
+                        alias: None,
+                        ip: None,
+                    });
+                }
+            }
+            let same = merged.len() == before.len()
+                && merged.iter().zip(&before).all(|(a, b)| {
+                    a.service == b.service
+                        && a.remark == b.remark
+                        && a.alias == b.alias
+                        && a.ip == b.ip
+                });
+            if !same {
+                let mut next = state.local.clone();
+                if let Ok(labels) = next.labels_mut() {
+                    *labels = merged;
+                    if next.save(&self.dir).is_ok() {
+                        state.local = next;
+                    }
+                }
+            }
+            (!same, to_push, initial_profile)
+        };
+        if labels_changed {
+            self.changed();
+        }
+        if !to_push.is_empty() || initial_profile.is_some() {
+            let core = self.clone();
+            let link = link.clone();
+            tokio::spawn(async move {
+                let mut pushed_all = true;
+                for pref in to_push {
+                    if link.call(Call::SavePref { pref }).await.is_err() {
+                        pushed_all = false;
+                    }
+                }
+                if pushed_all {
+                    let _ = core.edit(|local| {
+                        local.clear_dirty_prefs();
+                        Ok(())
+                    });
+                }
+                if let Some(profile) = initial_profile {
+                    let _ = link.call(Call::SaveProfile { profile }).await;
+                }
+            });
+        }
     }
 
     pub(crate) fn update_view(self: &Arc<Self>, link: &Arc<Link>, view: View) {
@@ -1278,6 +1816,240 @@ impl Core {
         }
     }
 
+    async fn forward_worker(self: Arc<Self>) {
+        let mut rx = self.changes.subscribe();
+        loop {
+            if self.quit.is_cancelled() {
+                break;
+            }
+            self.reconcile_forwards().await;
+            tokio::select! {
+                _ = self.quit.cancelled() => break,
+                _ = rx.changed() => {},
+            }
+        }
+        {
+            let mut listeners = self.forwards_lock.lock().await;
+            let drained: Vec<_> = listeners.drain().map(|(_, h)| h).collect();
+            for h in &drained {
+                h.cancel.cancel();
+            }
+            for h in drained {
+                let _ = timeout(Duration::from_millis(200), h.closed).await;
+            }
+        }
+        self.state.lock().unwrap().forward_states.clear();
+        self.forwards_shutdown.cancel();
+    }
+
+    async fn reconcile_forwards(self: &Arc<Self>) {
+        let mut listeners = self.forwards_lock.lock().await;
+        let (online, configured, view) = {
+            let state = self.state.lock().unwrap();
+            let online = !self.quit.is_cancelled()
+                && state.wanted
+                && state
+                    .link
+                    .as_ref()
+                    .is_some_and(|l| l.direct.membership.is_fresh());
+            (
+                online,
+                state.local.forwards().to_vec(),
+                state.view.clone(),
+            )
+        };
+        if !online {
+            let drained: Vec<_> = listeners.drain().map(|(_, h)| h).collect();
+            for h in &drained {
+                h.cancel.cancel();
+            }
+            for h in drained {
+                let _ = timeout(Duration::from_millis(200), h.closed).await;
+            }
+            self.state.lock().unwrap().forward_states.clear();
+            return;
+        }
+        let mut desired: HashMap<ForwardKey, (String, u16)> = HashMap::new();
+        let mut used_ports: HashSet<u16> = HashSet::new();
+        for m in &configured {
+            used_ports.insert(m.local_port);
+            if let Some(o) = view
+                .iter()
+                .find(|o| o.service.id == m.service && o.service.rules.allows(m.target_ip, m.target_port))
+            {
+                desired.insert(
+                    (m.service.clone(), m.target_ip, m.target_port),
+                    (o.owner.clone(), m.local_port),
+                );
+            }
+        }
+        let stale: Vec<ForwardKey> = listeners
+            .iter()
+            .filter(|(k, h)| {
+                desired
+                    .get(*k)
+                    .is_none_or(|(owner, port)| &h.owner != owner || h.local_port != *port)
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut removed = Vec::with_capacity(stale.len());
+        for k in stale {
+            if let Some(handle) = listeners.remove(&k) {
+                handle.cancel.cancel();
+                removed.push(handle);
+            }
+        }
+        for handle in removed {
+            let _ = timeout(Duration::from_millis(200), handle.closed).await;
+        }
+        let mut states = HashMap::new();
+        for m in configured {
+            let key = (m.service.clone(), m.target_ip, m.target_port);
+            let Some((owner, local_port)) = desired.get(&key).cloned() else {
+                states.insert(
+                    key,
+                    LocalForwardStatus {
+                        service: m.service,
+                        target_ip: m.target_ip,
+                        target_port: m.target_port,
+                        local_port: m.local_port,
+                        active: false,
+                        error: Some(Code::Offline),
+                        suggested_port: None,
+                    },
+                );
+                continue;
+            };
+            if listeners.contains_key(&key) {
+                states.insert(
+                    key,
+                    LocalForwardStatus {
+                        service: m.service,
+                        target_ip: m.target_ip,
+                        target_port: m.target_port,
+                        local_port,
+                        active: true,
+                        error: None,
+                        suggested_port: None,
+                    },
+                );
+                continue;
+            }
+            match std::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, local_port)) {
+                Ok(std_listener)
+                    if std_listener.set_nonblocking(true).is_ok() =>
+                {
+                    if let Ok(listener) = TcpListener::from_std(std_listener) {
+                        let cancel = self.quit.child_token();
+                        let (closed_tx, closed) = tokio::sync::oneshot::channel();
+                        let core = self.clone();
+                        let svc = m.service.clone();
+                        let target = SocketAddrV4::new(m.target_ip, m.target_port);
+                        let own = owner.clone();
+                        let tok = cancel.clone();
+                        tokio::spawn(async move {
+                            core.accept_forward_loop(listener, own, svc, target, tok, closed_tx)
+                                .await;
+                        });
+                        listeners.insert(
+                            key.clone(),
+                            ForwardHandle {
+                                owner,
+                                local_port,
+                                cancel,
+                                closed,
+                            },
+                        );
+                        states.insert(
+                            key,
+                            LocalForwardStatus {
+                                service: m.service,
+                                target_ip: m.target_ip,
+                                target_port: m.target_port,
+                                local_port,
+                                active: true,
+                                error: None,
+                                suggested_port: None,
+                            },
+                        );
+                    } else {
+                        let suggested = suggest_free_port(Some(local_port), &used_ports);
+                        states.insert(
+                            key,
+                            LocalForwardStatus {
+                                service: m.service,
+                                target_ip: m.target_ip,
+                                target_port: m.target_port,
+                                local_port,
+                                active: false,
+                                error: Some(Code::Conflict),
+                                suggested_port: suggested,
+                            },
+                        );
+                    }
+                }
+                _ => {
+                    let suggested = suggest_free_port(Some(local_port), &used_ports);
+                    states.insert(
+                        key,
+                        LocalForwardStatus {
+                            service: m.service,
+                            target_ip: m.target_ip,
+                            target_port: m.target_port,
+                            local_port,
+                            active: false,
+                            error: Some(Code::Conflict),
+                            suggested_port: suggested,
+                        },
+                    );
+                }
+            }
+        }
+        self.state.lock().unwrap().forward_states = states;
+    }
+
+    async fn accept_forward_loop(
+        self: Arc<Self>,
+        listener: TcpListener,
+        owner: String,
+        service: String,
+        target: SocketAddrV4,
+        cancel: CancellationToken,
+        closed_tx: tokio::sync::oneshot::Sender<()>,
+    ) {
+        let slots = Arc::new(tokio::sync::Semaphore::new(64));
+        loop {
+            let conn = tokio::select! {
+                _ = cancel.cancelled() => break,
+                res = listener.accept() => res,
+            };
+            let Ok((mut client, _)) = conn else { break };
+            let Ok(permit) = slots.clone().try_acquire_owned() else {
+                continue;
+            };
+            let _ = client.set_nodelay(true);
+            let core = self.clone();
+            let owner = owner.clone();
+            let service = service.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                let _flow = Flow::new(&core.flows);
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {},
+                    _ = core.with_peer(&owner, Open { service, target }, async |tx, rx, _| {
+                        let mut remote = tokio::io::join(rx, tx);
+                        let _ = copy_bidirectional_with_sizes(&mut client, &mut remote, 16384, 16384).await;
+                        Ok(())
+                    }) => {},
+                }
+            });
+        }
+        drop(listener);
+        let _ = closed_tx.send(());
+    }
+
     pub fn stop(&self) {
         self.quit.cancel();
         self.disconnect(false);
@@ -1286,6 +2058,7 @@ impl Core {
     pub async fn wait_stopped(&self) {
         self.quit.cancelled().await;
         self.applied_shutdown.cancelled().await;
+        self.forwards_shutdown.cancelled().await;
     }
 
     async fn incoming(self: Arc<Self>, link: Arc<Link>) {
@@ -1461,18 +2234,46 @@ impl Core {
         ip: Ipv4Addr,
         extra_ports: &[u16],
         ports: &[u16],
+        deep: bool,
     ) -> Result<probe::HostProbe, Code> {
-        if self.state.lock().unwrap().local.session.is_none() {
-            return Err(Code::NotConnected);
-        }
+        let is_local_ip = {
+            let state = self.state.lock().unwrap();
+            if state.local.session.is_none() {
+                return Err(Code::NotConnected);
+            }
+            state.network.addresses.contains(&ip)
+        };
         let Ok(_guard) = self.host_probe_lock.try_lock() else {
             return Err(Code::Busy);
         };
+        struct ProbeCancelGuard<'a>(&'a Mutex<Option<CancellationToken>>);
+        impl Drop for ProbeCancelGuard<'_> {
+            fn drop(&mut self) {
+                *self.0.lock().unwrap() = None;
+            }
+        }
+        let cancel = self.quit.child_token();
+        *self.probe_cancel.lock().unwrap() = Some(cancel.clone());
+        let _cancel_guard = ProbeCancelGuard(&self.probe_cancel);
         let _flow = Flow::new(&self.flows);
-        if ports.is_empty() {
-            probe::host(&*self.platform, ip, extra_ports).await
-        } else {
-            probe::ports(&*self.platform, ip, ports).await
+        let started = Instant::now();
+        let fut = async {
+            if ports.is_empty() {
+                probe::host_with_mode(&*self.platform, ip, extra_ports, deep, is_local_ip).await
+            } else {
+                probe::ports(&*self.platform, ip, ports).await
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Ok(probe::HostProbe {
+                ip,
+                host_os: None,
+                ports: Vec::new(),
+                duration_ms: started.elapsed().as_millis().min(u32::MAX as u128) as u32,
+                cancelled: true,
+            }),
+            res = fut => res,
         }
     }
 
@@ -1496,7 +2297,7 @@ impl Core {
             }
             let access = if self.platform.system_routing() {
                 let routes = self.routes.read().unwrap();
-                let access = SocketAddrV4::new(routes.access_ip(*address.ip()), address.port());
+                let access = SocketAddrV4::new(routes.access_ip_for(id, *address.ip()), address.port());
                 if !matches!(
                     routes.destination(access),
                     Destination::Peer { owner, service, target }
@@ -1629,6 +2430,43 @@ impl Drop for Flow<'_> {
     }
 }
 
+fn suggest_free_port(preferred: Option<u16>, used: &HashSet<u16>) -> Option<u16> {
+    let is_free = |port: u16| {
+        port != 0
+            && !used.contains(&port)
+            && std::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).is_ok()
+    };
+    if let Some(p) = preferred {
+        let base = if p < 1024 {
+            10000u16.saturating_add(p).max(1024)
+        } else {
+            p
+        };
+        for offset in 0..=40u16 {
+            if let Some(candidate) = base.checked_add(offset)
+                && is_free(candidate)
+            {
+                return Some(candidate);
+            }
+        }
+    }
+    for candidate in 18000..=18060u16 {
+        if is_free(candidate) {
+            return Some(candidate);
+        }
+    }
+    for _ in 0..16 {
+        if let Ok(listener) =
+            std::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            && let Ok(addr) = listener.local_addr()
+            && !used.contains(&addr.port())
+        {
+            return Some(addr.port());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1691,6 +2529,7 @@ mod tests {
                 owner: "peer".into(),
                 member: "member".into(),
                 device: None,
+                device_os: None,
                 service: Publication {
                     id: "fixture".into(),
                     name: "Site".into(),
@@ -1852,6 +2691,7 @@ mod tests {
                 ip: Ipv4Addr::new(198, 51, 100, 35),
                 extra_ports: vec![],
                 ports: vec![],
+                deep: false,
             })
             .await
             .err(),
@@ -2041,6 +2881,53 @@ mod tests {
             .unwrap();
         assert_eq!(app.read(&mut data).await.unwrap(), 0);
         assert!(!core.status().background);
+        core.stop();
+        core.wait_stopped().await;
+    }
+
+    #[tokio::test]
+    async fn probe_host_can_be_cancelled_and_immediately_releases_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::new(dir.path().to_path_buf(), Arc::new(LocalPlatform), false).unwrap();
+        core.state.lock().unwrap().local.session = Some(Login {
+            member: "alice".into(),
+            token: "t".repeat(64),
+        });
+
+        let task = tokio::spawn({
+            let core = core.clone();
+            async move {
+                core.execute(Command::ProbeHost {
+                    ip: Ipv4Addr::new(198, 51, 100, 99),
+                    extra_ports: vec![],
+                    ports: vec![],
+                    deep: true,
+                })
+                .await
+            }
+        });
+        while core.probe_cancel.lock().unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        core.execute(Command::CancelProbeHost).await.unwrap();
+        let res = timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(res.host_probe.unwrap().cancelled);
+
+        // Lock is already free right after CancelProbeHost completes.
+        let quick = core
+            .execute(Command::ProbeHost {
+                ip: Ipv4Addr::new(198, 51, 100, 99),
+                extra_ports: vec![],
+                ports: [80].into(),
+                deep: false,
+            })
+            .await;
+        assert!(quick.is_ok());
+
         core.stop();
         core.wait_stopped().await;
     }

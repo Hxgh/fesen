@@ -35,7 +35,6 @@ export const SHARED_COPY = {
   members: ["成员", "Members"],
   devices: ["设备", "Devices"],
   services: ["服务", "Services"],
-  conflicts: ["冲突", "Conflicts"],
   devices_empty: ["暂无设备接入", "No devices yet"],
   services_empty: ["暂无广播服务", "No active services"],
   login: ["登录", "Sign in"],

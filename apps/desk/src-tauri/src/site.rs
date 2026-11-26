@@ -23,7 +23,7 @@ fn address(
     if state.member.is_none() {
         return Err("not_connected");
     }
-    let (site, target) = if let Some(owner) = owner {
+    let (site, target, port) = if let Some(owner) = owner {
         if !state.online || !state.running {
             return Err("not_connected");
         }
@@ -33,21 +33,39 @@ fn address(
             .find(|s| s.owner == owner && s.service.id == id)
             .ok_or("offline")?
             .service;
-        if !state.system_routing {
-            return Err("routing_unavailable");
+        if !site.rules.allows(ip, port) {
+            return Err("unauthorized");
         }
-        if !state.routes_ready {
-            return Err("route_missing");
+        if let Some(fwd) = state
+            .forwards
+            .iter()
+            .find(|f| f.service == id && f.target_ip == ip && f.target_port == port)
+        {
+            if !fwd.active {
+                return Err("local_port_conflict");
+            }
+            (site, Ipv4Addr::LOCALHOST, fwd.local_port)
+        } else {
+            if !state.system_routing {
+                return Err("routing_unavailable");
+            }
+            if !state.routes_ready {
+                return Err("route_missing");
+            }
+            let mapped = state
+                .service_virtual_ips
+                .get(id)
+                .map(|m| fesen_core::routing::access_ip(m, ip))
+                .filter(|&v| v != ip)
+                .unwrap_or_else(|| fesen_core::routing::access_ip(&state.virtual_ips, ip));
+            (site, mapped, port)
         }
-        (
-            site,
-            fesen_core::routing::access_ip(&state.virtual_ips, ip),
-        )
     } else {
-        (
-            state.shares.iter().find(|s| s.id == id).ok_or("offline")?,
-            ip,
-        )
+        let site = state.shares.iter().find(|s| s.id == id).ok_or("offline")?;
+        if !site.rules.allows(ip, port) {
+            return Err("unauthorized");
+        }
+        (site, ip, port)
     };
     let kind = site.effective_kind();
     let allowed = match action {
@@ -55,7 +73,7 @@ fn address(
         Action::Browser => matches!(kind, ServiceKind::Http | ServiceKind::Https),
         Action::Site => kind == ServiceKind::Http,
     };
-    if !site.rules.allows(ip, port) || !allowed {
+    if !allowed {
         return Err("unauthorized");
     }
     Ok(match action {
@@ -90,7 +108,11 @@ fn address(
                 }
                 #[cfg(not(windows))]
                 {
-                    format!("smb://{target}")
+                    if port == 445 {
+                        format!("smb://{target}")
+                    } else {
+                        format!("smb://{target}:{port}")
+                    }
                 }
             }
             ServiceKind::Http => format!("http://{target}:{port}/"),
@@ -208,7 +230,7 @@ pub async fn open_site(
         tauri_plugin_fesen::site(
             app,
             serde_json::json!({"op":"open","attempt":attempt,
-            "bounds":bounds,"url":url,"group":owner.is_some()}),
+            "bounds":bounds,"url":url,"group":owner.is_some() && !url.starts_with("http://127.0.0.1:")}),
         )
         .await?;
         #[cfg(any(windows, target_os = "macos"))]

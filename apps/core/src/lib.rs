@@ -10,5 +10,8 @@ mod probe;
 pub mod routing;
 mod stun;
 
-pub use fesen_proto::{HostOs, ServiceKind};
+pub use fesen_proto::{
+    DeviceOs, DeviceProfile, HostOs, LocalForwardStatus, LocalMapping, ServiceKind,
+};
 pub use node::{Command, Core, HostServiceInput, Status};
+pub use platform::DeviceInfo;

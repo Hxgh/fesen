@@ -295,10 +295,12 @@ async fn control(mut socket: WebSocket, app: App) {
                 None => {}
             }
         }
-        let (id, member, label) = store::authorize_device(
+        let (id, member, label, os) = store::authorize_device(
             &g.db,
             cert,
             login.as_ref().map(|(u, l, _)| (u.as_str(), l.as_str())),
+            hello.machine_id.as_deref(),
+            hello.os,
             &token,
         )?;
         let is_admin = store::is_admin(&g.db, &member);
@@ -309,11 +311,13 @@ async fn control(mut socket: WebSocket, app: App) {
         } else {
             None
         };
-        let session = g.connect(&id, member.clone(), label, cert.clone(), tx)?;
-        Ok((id, member, login.map(|_| token), is_admin, admin_token, session))
+        let prefs = store::list_prefs(&g.db, &member)?;
+        let profiles = store::list_profiles(&g.db, &member)?;
+        let session = g.connect(&id, member.clone(), label, os, cert.clone(), tx)?;
+        Ok((id, member, login.map(|_| token), is_admin, admin_token, prefs, profiles, session))
     }
     .await;
-    let (id, member, token, is_admin, admin_token, session) = match authorized {
+    let (id, member, token, is_admin, admin_token, prefs, profiles, session) = match authorized {
         Ok(v) => v,
         Err(error) => {
             let _ = send(&mut socket, Event::Rejected { error }).await;
@@ -326,6 +330,7 @@ async fn control(mut socket: WebSocket, app: App) {
             device: id.clone(), member, token, probe: session.probe.clone(),
             udp_port: app.udp_port, stun: app.stun.clone(), is_admin, admin_token,
         }).await?;
+        send(&mut socket, Event::Sync { prefs, profiles }).await?;
         let mut tick = interval(HEARTBEAT);
         let mut last = Instant::now();
         let mut allowance = 128u16;

@@ -225,6 +225,32 @@ class FesenVpn : VpnService() {
         .mapNotNull { it.hostAddress?.substringBefore('%') }.sorted()
 
     @Suppress("unused")
+    fun deviceJson(): String = runCatching {
+        val androidId = android.provider.Settings.Secure.getString(
+            contentResolver,
+            android.provider.Settings.Secure.ANDROID_ID
+        ).orEmpty()
+        val custom = runCatching {
+            android.provider.Settings.Global.getString(
+                contentResolver,
+                android.provider.Settings.Global.DEVICE_NAME
+            )
+        }.getOrNull()?.trim().orEmpty()
+        val model = android.os.Build.MODEL.orEmpty().trim()
+        val brand = android.os.Build.MANUFACTURER.orEmpty().trim()
+        val fallback = when {
+            model.isEmpty() -> "Android"
+            brand.isEmpty() || model.startsWith(brand, ignoreCase = true) -> model
+            else -> "$brand $model"
+        }
+        val name = custom.ifEmpty { fallback }.take(64)
+        JSONObject()
+            .put("machine_id", androidId)
+            .put("name", name)
+            .toString()
+    }.getOrElse { """{"machine_id":"","name":"Android"}""" }
+
+    @Suppress("unused")
     fun networkJson(): String = runCatching {
         val list = underlying()
         val active = list.firstOrNull()

@@ -1,8 +1,8 @@
 use crate::store;
 use fesen_acl::{MAX_ADDRESSES, count, union};
 use fesen_proto::{
-    Call, Code, Event, MAX_CANDIDATES, MAX_DEVICES, MAX_IPV6_CANDIDATES, MAX_PUBLICATIONS,
-    Offering, Peer, Publication, View, candidate, candidate6,
+    Call, Code, DeviceOs, Event, MAX_CANDIDATES, MAX_DEVICES, MAX_IPV6_CANDIDATES,
+    MAX_PUBLICATIONS, Offering, Peer, Publication, View, candidate, candidate6,
 };
 use rusqlite::Connection;
 use std::{
@@ -110,6 +110,7 @@ pub struct Session {
 pub struct Device {
     member: String,
     label: String,
+    os: Option<DeviceOs>,
     cert: Vec<u8>,
     local: Vec<SocketAddrV4>,
     ipv6: Vec<SocketAddrV6>,
@@ -135,6 +136,7 @@ impl Group {
         id: &str,
         member: String,
         label: String,
+        os: Option<DeviceOs>,
         cert: Vec<u8>,
         outgoing: mpsc::Sender<Event>,
     ) -> Result<Arc<Session>, Code> {
@@ -159,6 +161,7 @@ impl Group {
             Device {
                 member,
                 label,
+                os,
                 cert,
                 outgoing,
                 session: session.clone(),
@@ -224,6 +227,7 @@ impl Group {
                 owner: id.clone(),
                 member: d.member.clone(),
                 device: Some(d.label.clone()),
+                device_os: d.os,
                 service: s.clone(),
             }));
         }
@@ -250,13 +254,13 @@ impl Group {
                 let mut publications = 0;
                 for (other_id, other) in &self.online {
                     for existing in &other.publications {
-                        if existing.id == service.id && other_id == id {
-                            if existing == &service {
+                        if existing.id == service.id {
+                            if other_id == id && existing == &service {
                                 return Ok(false);
                             }
                             return Err(Code::Conflict);
                         }
-                        if existing.id == service.id || existing.rules.conflicts(&service.rules) {
+                        if other_id == id && existing.rules.conflicts(&service.rules) {
                             return Err(Code::Conflict);
                         }
                         publications += 1;
@@ -351,6 +355,48 @@ impl Group {
                 self.remove(id, false);
                 Ok(true)
             }
+            Call::RenameDevice { label } => {
+                let label = store::rename_device(&self.db, id, &label)?;
+                let device = self.online.get_mut(id).unwrap();
+                if device.label == label {
+                    return Ok(false);
+                }
+                device.label = label;
+                Ok(true)
+            }
+            Call::SavePref { pref } => {
+                let member = self.online[id].member.clone();
+                store::save_pref(&self.db, &member, &pref)?;
+                self.sync_member(&member);
+                Ok(false)
+            }
+            Call::SaveProfile { profile } => {
+                let member = self.online[id].member.clone();
+                store::save_profile(&self.db, &member, &profile)?;
+                self.sync_member(&member);
+                Ok(false)
+            }
+            Call::DeleteProfile { machine_id } => {
+                let member = self.online[id].member.clone();
+                store::delete_profile(&self.db, &member, &machine_id)?;
+                self.sync_member(&member);
+                Ok(false)
+            }
+        }
+    }
+
+    pub fn sync_member(&self, member: &str) {
+        let Ok(prefs) = store::list_prefs(&self.db, member) else {
+            return;
+        };
+        let Ok(profiles) = store::list_profiles(&self.db, member) else {
+            return;
+        };
+        for d in self.online.values().filter(|d| d.member == member) {
+            let _ = d.outgoing.try_send(Event::Sync {
+                prefs: prefs.clone(),
+                profiles: profiles.clone(),
+            });
         }
     }
 }

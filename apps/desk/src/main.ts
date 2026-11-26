@@ -11,6 +11,7 @@ import { closePopoverMenu, openPopoverMenu } from "../../../packages/ui/popover.
 import { openSettingsModal } from "../../../packages/ui/settings.js";
 import { createAdminWorkspace } from "../../../packages/ui/admin-view.js";
 import {
+  deviceOsLabel,
   effectiveKind as rawEffectiveKind,
   formatEndpoint,
   formatRanges,
@@ -27,6 +28,7 @@ import "./style.css";
 type Span<T> = { start: T; end: T };
 type ServiceKind = "tcp" | "http" | "https" | "ssh" | "rdp" | "smb";
 type HostOs = "linux" | "windows";
+type DeviceOs = "macos" | "windows" | "android" | "linux";
 type Share = {
   id: string;
   name: string;
@@ -35,9 +37,19 @@ type Share = {
   host_os?: HostOs;
   rules: { ips: Span<string>[]; ports: Span<number>[] };
 };
-type Offering = Share & { owner: string; member: string; device?: string };
+type Offering = Share & { owner: string; member: string; device?: string; device_os?: DeviceOs };
 type Label = { service: string; remark: string; alias: string | null; ip: string | null };
 type Mapping = { original: Span<string>; virtual_ip: Span<string> };
+type LocalMapping = { service: string; target_ip: string; target_port: number; local_port: number };
+type LocalForwardStatus = LocalMapping & { active: boolean; error?: string; suggested_port?: number };
+type DeviceProfile = {
+  machine_id: string;
+  name: string;
+  os: DeviceOs;
+  shares: Share[];
+  forwards: LocalMapping[];
+  updated_at: number;
+};
 type ProbeOutcome = {
   kind: ServiceKind;
   rtt_ms: number;
@@ -61,10 +73,14 @@ type HostProbe = {
   host_os?: HostOs;
   ports: HostPortProbe[];
   duration_ms: number;
+  cancelled?: boolean;
 };
 type Status = {
   server: string;
   member: string | null;
+  machine_id?: string;
+  device_os?: DeviceOs;
+  device_name?: string;
   online: boolean;
   running: boolean;
   background: boolean;
@@ -77,11 +93,17 @@ type Status = {
   services: Offering[];
   labels: Label[];
   virtual_ips: Mapping[];
+  service_virtual_ips?: Record<string, Mapping[]>;
   aliases: Record<string, string>;
+  forwards?: LocalForwardStatus[];
+  cloud_profiles?: DeviceProfile[];
+  restore_prompt?: DeviceProfile | null;
   error: string | null;
   auto_connect?: boolean;
   auto_share?: boolean;
+  cloud_backup?: boolean;
   auto_share_blocked?: boolean;
+  suggested_port?: number;
   http_status?: number;
   probe?: ProbeOutcome;
   host_probe?: HostProbe;
@@ -494,6 +516,20 @@ function addresses(ips: Span<string>[], maps: Mapping[]) {
 const accessIp = (ip: string, maps: Mapping[]) =>
   addresses([{ start: ip, end: ip }], maps).virtual[0]?.start ?? ip;
 
+const mapsForService = (serviceId: string, data?: Status): Mapping[] => {
+  const per = data?.service_virtual_ips?.[serviceId];
+  return per && per.length ? per : (data?.virtual_ips ?? []);
+};
+
+const accessIpFor = (serviceId: string, ip: string, data?: Status) =>
+  accessIp(ip, mapsForService(serviceId, data));
+
+const forwardFor = (serviceId: string, ip: string, port: number, data?: Status): LocalForwardStatus | undefined =>
+  data?.forwards?.find(f => f.service === serviceId && f.target_ip === ip && f.target_port === port);
+
+const forwardsOfService = (serviceId: string, data?: Status): LocalForwardStatus[] =>
+  data?.forwards?.filter(f => f.service === serviceId) ?? [];
+
 const kindBadgeText = (kind: ServiceKind) => kind.toUpperCase();
 
 function inferDefaultKind(port: number): ServiceKind {
@@ -563,17 +599,255 @@ function edit(title: string, save: HTMLButtonElement, handler: (data: FormData) 
   return footer;
 }
 
-function customize(service: Offering, label: Label | undefined, routing: boolean) {
-  edit(t("access_settings"), submit(t("save")), (data) => {
-    const alias = routing ? str(data, "alias").trim() : label?.alias ?? "";
-    const ip = routing ? str(data, "ip").trim() : label?.ip ?? null;
-    void act({ op: "customize", id: service.id, remark: str(data, "remark").trim(),
-      alias, ip: alias ? ip : null }, () => editor.close());
-  }, field(t("remark"), "remark", label?.remark ?? "", { maxLength: 64 }),
-  ...(routing ? [
-    field(t("alias"), "alias", label?.alias ?? "", { placeholder: "app.fesen", maxLength: 72 }),
-    field(t("alias_ip"), "ip", label?.ip ?? service.rules.ips[0]?.start ?? "", { maxLength: 15 }),
-  ] : []));
+async function switchForwardPort(service: string, target_ip: string, target_port: number, local_port: number) {
+  if (busy) return;
+  busy = true;
+  message = "";
+  showError();
+  try {
+    status = await request({ op: "set_local_forward", service, target_ip, target_port, local_port }, false);
+    render(true);
+    if (local_port > 0) notify(`127.0.0.1:${local_port}`);
+  } catch (error) {
+    message = typeof error === "string" ? error : "internal";
+    showError();
+  } finally {
+    busy = false;
+  }
+}
+
+function customize(
+  service: Offering,
+  label: Label | undefined,
+  routing: boolean,
+  focusPort = false,
+  onDone?: () => void
+) {
+  const existingFwds = forwardsOfService(service.id, status);
+  const firstFwd = existingFwds[0];
+  const single = singleSpan(service.rules.ips) && singleSpan(service.rules.ports);
+  let remarkVal = label?.remark ?? "";
+  let targetIpVal = firstFwd?.target_ip ?? service.rules.ips[0]?.start ?? "";
+  let targetPortVal = String(firstFwd?.target_port ?? service.rules.ports[0]?.start ?? "");
+  let localPortVal = firstFwd ? String(firstFwd.local_port) : "";
+  let aliasVal = label?.alias ?? "";
+  let aliasIpVal = label?.ip ?? service.rules.ips[0]?.start ?? "";
+  let conflictPort: number | null = firstFwd?.error === "conflict" ? firstFwd.local_port : null;
+  let suggestedPort: number | null = firstFwd?.suggested_port ?? null;
+  let localError = "";
+  let dialogOpen = true;
+  editor.addEventListener("close", () => { dialogOpen = false; }, { once: true });
+
+  const clearPortErr = () => {
+    localError = "";
+    conflictPort = null;
+  };
+
+  async function suggestFree(preferred?: number) {
+    try {
+      const reply = await request({ op: "suggest_local_port", preferred }, false);
+      if (reply.suggested_port) {
+        localPortVal = String(reply.suggested_port);
+        suggestedPort = reply.suggested_port;
+        clearPortErr();
+        if (dialogOpen && editor.open) draw();
+      }
+    } catch {}
+  }
+
+  function draw() {
+    const header = dialogHeader(t("access_settings"), () => { if (!busy) editor.close(); });
+    const body = el("div", "dialog-body");
+    if (focusPort && !routing) {
+      body.append(el("p", "muted", t("need_local_forward")));
+    }
+
+    const remarkInput = el("input");
+    Object.assign(remarkInput, { name: "remark", value: remarkVal, maxLength: 64, spellcheck: false });
+    remarkInput.addEventListener("input", () => { remarkVal = remarkInput.value; });
+    body.append(el("label", "", t("remark"), remarkInput));
+
+    let targetIpInput: HTMLInputElement | null = null;
+    let targetPortInput: HTMLInputElement | null = null;
+    if (!single) {
+      targetIpInput = el("input");
+      Object.assign(targetIpInput, { name: "target_ip", value: targetIpVal, maxLength: 15, spellcheck: false });
+      targetIpInput.addEventListener("input", () => { targetIpVal = targetIpInput!.value; clearPortErr(); });
+      targetPortInput = el("input");
+      Object.assign(targetPortInput, { name: "target_port", value: targetPortVal, type: "number", min: "1", max: "65535" });
+      targetPortInput.addEventListener("input", () => { targetPortVal = targetPortInput!.value; clearPortErr(); });
+      body.append(el("div", "precheck-inputs",
+        el("label", "", t("local_target_ip"), targetIpInput),
+        el("label", "", t("local_target_port"), targetPortInput)
+      ));
+    }
+
+    const localPortInput = el("input");
+    Object.assign(localPortInput, {
+      name: "local_port",
+      value: localPortVal,
+      type: "number",
+      min: "1",
+      max: "65535",
+      placeholder: t("local_port_placeholder"),
+    });
+    localPortInput.addEventListener("input", () => {
+      localPortVal = localPortInput.value;
+      clearPortErr();
+    });
+    const suggestBtn = button(t("local_port_suggest"), () => {
+      const p = Number(localPortVal) || Number(targetPortVal) || undefined;
+      void suggestFree(p);
+    }, "button");
+    const portRow = el("div", "host-ip-row", localPortInput, suggestBtn);
+    if (firstFwd) {
+      const clearBtn = button(t("local_port_clear"), () => {
+        localPortVal = "";
+        clearPortErr();
+        void saveAll(true);
+      }, "button");
+      portRow.append(clearBtn);
+    }
+    body.append(el("div", "field-group", el("span", "field-label", t("local_port_label")), portRow));
+
+    let aliasInput: HTMLInputElement | null = null;
+    let aliasIpInput: HTMLInputElement | null = null;
+    if (routing) {
+      aliasInput = el("input");
+      Object.assign(aliasInput, { name: "alias", value: aliasVal, placeholder: "app.fesen", maxLength: 72, spellcheck: false });
+      aliasInput.addEventListener("input", () => { aliasVal = aliasInput!.value; });
+      aliasIpInput = el("input");
+      Object.assign(aliasIpInput, { name: "ip", value: aliasIpVal, maxLength: 15, spellcheck: false });
+      aliasIpInput.addEventListener("input", () => { aliasIpVal = aliasIpInput!.value; });
+      body.append(
+        el("label", "", t("alias"), aliasInput),
+        el("label", "", t("alias_ip"), aliasIpInput)
+      );
+    }
+
+    const errText = localError || (conflictPort ? t("local_port_occupied").replace("{port}", String(conflictPort)) : "");
+    if (errText) {
+      const box = el("div", "feedback error inline-port-alert", el("span", "", errText));
+      box.setAttribute("role", "alert");
+      if (suggestedPort && suggestedPort !== conflictPort) {
+        const useBtn = button(t("switch_to_port").replace("{port}", String(suggestedPort)), () => {
+          localPortVal = String(suggestedPort);
+          clearPortErr();
+          void saveAll();
+        }, "button primary");
+        box.append(useBtn);
+      }
+      body.append(box);
+    }
+
+    const saveBtn = button(t("save"), () => void saveAll(), "button primary");
+    saveBtn.disabled = busy;
+    const cancelBtn = button(t("cancel"), () => { if (!busy) editor.close(); }, "button");
+    cancelBtn.disabled = busy;
+    const footer = el("div", "dialog-footer", cancelBtn, saveBtn);
+
+    const formEl = el("form", "", header, body, footer);
+    formEl.className = "";
+    formEl.addEventListener("submit", (e) => {
+      e.preventDefault();
+      void saveAll();
+    });
+
+    editor.tabIndex = -1;
+    editor.replaceChildren(formEl);
+    if (!editor.open) {
+      editor.showModal();
+      (focusPort ? localPortInput : remarkInput).focus();
+    }
+  }
+
+  async function saveAll(forceClearForward = false) {
+    if (busy) return;
+    localError = "";
+    const tIp = targetIpVal.trim();
+    const tPort = Number(targetPortVal);
+    const lPortText = forceClearForward ? "" : localPortVal.trim();
+    const lPort = lPortText === "" ? 0 : Number(lPortText);
+
+    if (lPortText !== "" && (!Number.isInteger(lPort) || lPort < 1 || lPort > 65535)) {
+      localError = t("local_port_invalid");
+      draw();
+      return;
+    }
+    if (lPort > 0 || forceClearForward || firstFwd) {
+      if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(tIp) || toIp(toInt(tIp)) !== tIp
+        || !service.rules.ips.some(r => toInt(r.start) <= toInt(tIp) && toInt(tIp) <= toInt(r.end))
+        || !Number.isInteger(tPort) || !service.rules.ports.some(r => r.start <= tPort && tPort <= r.end)) {
+        localError = t("invalid_target");
+        draw();
+        return;
+      }
+    }
+
+    busy = true;
+    draw();
+    try {
+      const needForwardChange = forceClearForward
+        || (lPort > 0 && (!firstFwd || firstFwd.local_port !== lPort || firstFwd.target_ip !== tIp || firstFwd.target_port !== tPort))
+        || (lPort === 0 && !!firstFwd);
+
+      if (needForwardChange) {
+        try {
+          if (firstFwd && (firstFwd.target_ip !== tIp || firstFwd.target_port !== tPort)) {
+            status = await request({
+              op: "set_local_forward",
+              service: service.id,
+              target_ip: firstFwd.target_ip,
+              target_port: firstFwd.target_port,
+              local_port: 0,
+            }, false);
+          }
+          status = await request({
+            op: "set_local_forward",
+            service: service.id,
+            target_ip: tIp,
+            target_port: tPort,
+            local_port: lPort,
+          }, false);
+        } catch (err) {
+          if (err === "conflict" && lPort > 0) {
+            conflictPort = lPort;
+            try {
+              const s = await request({ op: "suggest_local_port", preferred: lPort }, false);
+              suggestedPort = s.suggested_port ?? null;
+            } catch {}
+            return;
+          }
+          localError = failure(typeof err === "string" ? err : "internal");
+          return;
+        }
+      }
+
+      const alias = routing ? aliasVal.trim() : (label?.alias ?? "");
+      const ip = routing ? aliasIpVal.trim() : (label?.ip ?? null);
+      status = await request({
+        op: "customize",
+        id: service.id,
+        remark: remarkVal.trim(),
+        alias,
+        ip: alias ? ip : null,
+      }, false);
+
+      editor.close();
+      render(true);
+      onDone?.();
+    } catch (err) {
+      localError = failure(typeof err === "string" ? err : "internal");
+    } finally {
+      busy = false;
+      if (dialogOpen && editor.open) draw();
+    }
+  }
+
+  draw();
+  if (focusPort && !localPortVal) {
+    void suggestFree(Number(targetPortVal) || undefined);
+  }
 }
 
 async function testConnection(service: Offering, ip: string, port: number) {
@@ -581,7 +855,7 @@ async function testConnection(service: Offering, ip: string, port: number) {
   const previous = probes.get(key);
   if (busy || !status?.online || (previous && previous.result === undefined)) return;
   const kind = effectiveKind(service);
-  const current: Probe = { ip, port, access: accessIp(ip, status.virtual_ips), kind };
+  const current: Probe = { ip, port, access: accessIpFor(service.id, ip, status), kind };
   probes.set(key, current);
   render(true);
   try {
@@ -646,6 +920,19 @@ function chooseTarget(service: Share, title: string, action: (ip: string, port: 
 
 function runServiceAction(service: Share, owner: string | undefined, kind: "copy" | "command" | "browser", label: string) {
   chooseTarget(service, label, (ip, port) => {
+    if (owner && status?.system_routing === false) {
+      const fwd = forwardFor(service.id, ip, port, status);
+      if (!fwd) {
+        const offering = service as Offering;
+        const lbl = status.labels.find(l => l.service === service.id);
+        customize(offering, lbl, false, true, () => runServiceAction(service, owner, kind, label));
+        return;
+      }
+      if (!fwd.active) {
+        notify(t("local_port_conflict"), true);
+        return;
+      }
+    }
     void invoke<string>("service_action", { id: service.id, owner: owner ?? null, ip, port, action: kind })
       .then(value => { if (kind !== "browser") notify(`${t("address_copied")} · ${value}`); })
       .catch(error => notify(failure(typeof error === "string" ? error
@@ -657,15 +944,35 @@ function openWebPreview(service: Share, owner?: string) {
   const title = t(owner ? "web_test" : "local_web_test");
   message = ""; showError();
   chooseTarget(service, title, (ip, port) => {
-    const access = owner ? accessIp(ip, status?.virtual_ips ?? []) : ip;
+    const fwd = owner ? forwardFor(service.id, ip, port, status) : undefined;
+    if (owner && status?.system_routing === false && !fwd) {
+      const lbl = status.labels.find(l => l.service === service.id);
+      customize(service as Offering, lbl, false, true, () => openWebPreview(service, owner));
+      return;
+    }
+    if (fwd && !fwd.active) {
+      notify(t("local_port_conflict"), true);
+      return;
+    }
+    const access = owner ? (fwd ? "127.0.0.1" : accessIpFor(service.id, ip, status)) : ip;
+    const accessPort = fwd ? fwd.local_port : port;
     const session = tabOwner;
     const valid = () => {
       const s = owner ? status?.services.find(s => s.owner === owner && s.id === service.id)
         : status?.shares.find(s => s.id === service.id);
-      return !!status?.member && session === JSON.stringify([status.server, status.member])
-        && !!s && effectiveKind(s) === "http"
-        && (!owner || (status.online && accessIp(ip, status.virtual_ips) === access))
-        && s.rules.ips.some(r => toInt(r.start) <= toInt(ip) && toInt(ip) <= toInt(r.end))
+      if (!status?.member || session !== JSON.stringify([status.server, status.member]) || !s || effectiveKind(s) !== "http") {
+        return false;
+      }
+      if (owner) {
+        if (!status.online) return false;
+        const curFwd = forwardFor(service.id, ip, port, status);
+        if (fwd) {
+          if (!curFwd?.active || curFwd.local_port !== accessPort) return false;
+        } else if (accessIpFor(service.id, ip, status) !== access) {
+          return false;
+        }
+      }
+      return s.rules.ips.some(r => toInt(r.start) <= toInt(ip) && toInt(ip) <= toInt(r.end))
         && s.rules.ports.some(r => r.start <= port && port <= r.end);
     };
     showSiteDialog({ id: service.id, owner: owner ?? null, ip, port }, access, valid, (result) => {
@@ -679,7 +986,7 @@ function openWebPreview(service: Share, owner?: string) {
           : result,
       });
       render(true);
-    });
+    }, accessPort);
   });
 }
 
@@ -687,32 +994,44 @@ function rowActions(service: Share, name: string, owner: string | undefined, rou
   const more = tool("more", `${t("more_actions")} · ${name}`, () => {
     const kind = effectiveKind(service);
     const primary: MenuEntry[] = [];
-    if (kind === "http" && (!owner || routing)) {
+    const conflictFwd = owner ? forwardsOfService(service.id, status).find(f => f.error === "conflict") : undefined;
+    if (conflictFwd?.suggested_port) {
+      primary.push({
+        icon: "alert",
+        label: t("switch_to_port").replace("{port}", String(conflictFwd.suggested_port)),
+        onSelect: () => void switchForwardPort(
+          conflictFwd.service, conflictFwd.target_ip, conflictFwd.target_port, conflictFwd.suggested_port!
+        ),
+      });
+    }
+    if (kind === "http") {
       primary.push({
         icon: "globe",
         label: t(owner ? "web_test" : "local_web_test"),
         onSelect: () => openWebPreview(service, owner),
       });
     }
-    if ((kind === "http" || kind === "https") && (!owner || routing)) {
+    if (kind === "http" || kind === "https") {
       primary.push({
         icon: "external",
         label: t("open_browser"),
         onSelect: () => runServiceAction(service, owner, "browser", t("open_browser")),
       });
     }
-    if (owner && routing && (kind === "ssh" || kind === "rdp" || kind === "smb")) {
+    if (owner && (kind === "ssh" || kind === "rdp" || kind === "smb")) {
       primary.push({
         icon: "terminal",
         label: t("copy_command"),
         onSelect: () => runServiceAction(service, owner, "command", t("copy_command")),
       });
     }
-    primary.push({
-      icon: "copy",
-      label: t("copy_address"),
-      onSelect: () => runServiceAction(service, owner, "copy", t("copy_address")),
-    });
+    if (!owner || routing || forwardsOfService(service.id, status).some(f => f.active)) {
+      primary.push({
+        icon: "copy",
+        label: t("copy_address"),
+        onSelect: () => runServiceAction(service, owner, "copy", t("copy_address")),
+      });
+    }
 
     const secondary: MenuEntry[] = [
       {
@@ -742,9 +1061,11 @@ function endpoint(ips: Span<string>[], ports: Span<number>[]) {
 
 function probeVisual(service: Offering, data: Status, routing: boolean) {
   const kind = effectiveKind(service);
-  const ips = addresses(service.rules.ips, data.virtual_ips);
+  const ips = addresses(service.rules.ips, mapsForService(service.id, data));
   const overlapped = ips.virtual.length > 0;
   const one = singleSpan(service.rules.ips) && singleSpan(service.rules.ports);
+  const fwds = forwardsOfService(service.id, data);
+  const singleFwd = one ? fwds.find(f => f.target_ip === service.rules.ips[0]!.start && f.target_port === service.rules.ports[0]!.start) : undefined;
   const probe = probes.get(serviceKey(service));
   const result = probe?.result;
   const http = result?.httpStatus;
@@ -772,7 +1093,7 @@ function probeVisual(service: Offering, data: Status, routing: boolean) {
     caption = result.rttMs !== undefined
       ? `${result.rttMs}ms`
       : result.visible ? t("page_visible") : t("reachable");
-    tone = routing ? "good" : "";
+    tone = (routing || !!singleFwd?.active) ? "good" : "";
     detailTip = [http !== undefined ? `HTTP ${http}` : "", result.rttMs !== undefined ? `${result.rttMs}ms` : "", t("reprobe")]
       .filter(Boolean).join(" · ");
   }
@@ -799,16 +1120,17 @@ function probeVisual(service: Offering, data: Status, routing: boolean) {
     note = el("p", errCode || httpBad ? "probe-note problem" : "probe-note", `${probe.access}:${probe.port} · ${outcome}`);
     note.setAttribute("role", "status");
   }
-  return { ips, overlapped, badge, httpTag, note, pending, result };
+  return { ips, overlapped, fwds, singleFwd, badge, httpTag, note, pending, result };
 }
 
-function sourceText(service: Offering, currentMember: string | null): { text: string; self: boolean } {
+function sourceText(service: Offering, currentMember: string | null): { text: string; self: boolean; osTag: string } {
   const self = !!currentMember && service.member === currentMember;
   const dev = service.device?.trim() || "";
+  const osTag = deviceOsLabel(service.device_os);
   if (self) {
-    return { text: dev ? `${t("source_self")} · ${dev}` : t("source_self"), self: true };
+    return { text: dev ? `${t("source_self")} · ${dev}` : t("source_self"), self: true, osTag };
   }
-  return { text: dev ? `${service.member} · ${dev}` : service.member, self: false };
+  return { text: dev ? `${service.member} · ${dev}` : service.member, self: false, osTag };
 }
 
 function serviceRow(address: string, metaNodes: (HTMLElement | string)[], tags: HTMLElement[], ...controls: HTMLElement[]) {
@@ -821,11 +1143,23 @@ function serviceRow(address: string, metaNodes: (HTMLElement | string)[], tags: 
   );
 }
 
+function portConflictPill(fwd: LocalForwardStatus): HTMLElement {
+  const label = t("local_port_occupied").replace("{port}", String(fwd.local_port));
+  if (fwd.suggested_port) {
+    const b = button(`${label} · ${t("switch_to_port").replace("{port}", String(fwd.suggested_port))}`, () => {
+      void switchForwardPort(fwd.service, fwd.target_ip, fwd.target_port, fwd.suggested_port!);
+    }, "badge warn");
+    return b;
+  }
+  return el("span", "badge warn", label);
+}
+
 function groupSingleRow(service: Offering, data: Status, routing: boolean, showSource = false) {
   const kind = effectiveKind(service);
   const label = data.labels.find((l) => l.service === service.id);
-  const { ips, overlapped, badge, httpTag, note, result } = probeVisual(service, data, routing);
-  const address = endpoint([...ips.original, ...ips.virtual], service.rules.ports);
+  const { ips, overlapped, fwds, singleFwd, badge, httpTag, note, result } = probeVisual(service, data, routing);
+  const origEndpoint = endpoint(service.rules.ips, service.rules.ports);
+  const address = singleFwd ? `127.0.0.1:${singleFwd.local_port}` : endpoint([...ips.original, ...ips.virtual], service.rules.ports);
   const rawName = label?.remark || service.name;
   const ip = singleIp(service);
   const os = resolveHostOs([service], [result?.hostOs]) as HostOs | null;
@@ -838,8 +1172,13 @@ function groupSingleRow(service: Offering, data: Status, routing: boolean, showS
     const src = sourceText(service, data.member);
     if (metaParts.length) metaParts.push(el("span", "meta-sep", "·"));
     metaParts.push(el("span", src.self ? "source-tag self" : "source-tag", src.text));
+    if (src.osTag) metaParts.push(el("span", "host-os-tag", src.osTag));
   }
-  if (alias) {
+  if (singleFwd) {
+    if (metaParts.length) metaParts.push(el("span", "meta-sep", "·"));
+    metaParts.push(el("span", "mono", `← ${origEndpoint}`));
+  }
+  if (alias && routing) {
     if (metaParts.length) metaParts.push(el("span", "meta-sep", "·"));
     metaParts.push(el("span", "mono", alias));
   }
@@ -848,7 +1187,13 @@ function groupSingleRow(service: Offering, data: Status, routing: boolean, showS
   if (os) tags.push(el("span", "host-os-tag", osLabel(os)));
   if (kind !== "tcp") tags.push(el("span", "proto-tag", kindBadgeText(kind)));
   if (httpTag) tags.push(httpTag);
-  if (overlapped) {
+  if (singleFwd) {
+    if (singleFwd.error === "conflict") {
+      tags.push(portConflictPill(singleFwd));
+    } else {
+      tags.push(el("span", "proto-tag", t("mapped_local")));
+    }
+  } else if (overlapped) {
     const ov = el("span", "badge warn", t("overlap"));
     ov.title = t("local_overlap");
     tags.push(ov);
@@ -857,14 +1202,20 @@ function groupSingleRow(service: Offering, data: Status, routing: boolean, showS
     address, metaParts, tags, badge,
     rowActions(service, rawName, service.owner, routing, () => customize(service, label, routing))
   );
-  if (overlapped) row.append(el("p", "probe-note", `${t("original_ip")} ${ranges(service.rules.ips)}`));
+  if (!singleFwd && overlapped) row.append(el("p", "probe-note", `${t("original_ip")} ${ranges(service.rules.ips)}`));
+  if (!singleFwd && fwds.length) {
+    for (const f of fwds) {
+      if (f.error === "conflict") row.append(el("div", "probe-note", portConflictPill(f)));
+      else row.append(el("p", "probe-note mono", `127.0.0.1:${f.local_port} ← ${f.target_ip}:${f.target_port}`));
+    }
+  }
   if (note) row.append(note);
   return row;
 }
 
 function groupHostCard(ip: string, items: Offering[], data: Status, routing: boolean, showSource = false) {
-  const access = accessIp(ip, data.virtual_ips);
-  const overlapped = access !== ip;
+  const firstAccess = accessIpFor(items[0]!.id, ip, data);
+  const overlapped = items.some(s => accessIpFor(s.id, ip, data) !== ip);
   const labels = items.map(s => data.labels.find(l => l.service === s.id));
   const rawHostName = labels.find(l => l?.remark)?.remark || items[0]!.name;
   const alias = labels.map(l => l?.alias).find((a): a is string => !!a && !!data.aliases[a]) ?? null;
@@ -877,7 +1228,7 @@ function groupHostCard(ip: string, items: Offering[], data: Status, routing: boo
   testAll.disabled = anyPending || !data.online || busy;
   if (anyPending) testAll.classList.add("spinning");
 
-  const titleParts: HTMLElement[] = [el("p", "endpoint", access)];
+  const titleParts: HTMLElement[] = [el("p", "endpoint", firstAccess)];
   if (hostOs) titleParts.push(el("span", "host-os-tag", osLabel(hostOs)));
   if (overlapped) {
     const ov = el("span", "badge warn", t("overlap"));
@@ -891,8 +1242,9 @@ function groupHostCard(ip: string, items: Offering[], data: Status, routing: boo
     const src = sourceText(items[0]!, data.member);
     if (metaParts.length) metaParts.push(el("span", "meta-sep", "·"));
     metaParts.push(el("span", src.self ? "source-tag self" : "source-tag", src.text));
+    if (src.osTag) metaParts.push(el("span", "host-os-tag", src.osTag));
   }
-  if (alias) {
+  if (alias && routing) {
     if (metaParts.length) metaParts.push(el("span", "meta-sep", "·"));
     metaParts.push(el("span", "mono", alias));
   }
@@ -912,16 +1264,25 @@ function groupHostCard(ip: string, items: Offering[], data: Status, routing: boo
   const portsWrap = el("div", "host-ports", ...items.map((service, idx) => {
     const kind = effectiveKind(service);
     const label = labels[idx];
-    const { badge, httpTag, note } = probeVisual(service, data, routing);
+    const { singleFwd, badge, httpTag, note } = probeVisual(service, data, routing);
     const portText = `:${ranges(service.rules.ports)}`;
+    const svcAccess = accessIpFor(service.id, ip, data);
     const rowRawName = label?.remark || service.name;
     const subName = rowRawName !== rawHostName ? meaningfulHostName(rowRawName, ip, hostOs) : "";
     const row = el("div", "port-row",
       el("div", "port-main",
-        el("span", "port-num", portText),
+        el("span", "port-num", singleFwd ? `127.0.0.1:${singleFwd.local_port}` : portText),
         el("span", "proto-tag", kindBadgeText(kind)),
         ...(httpTag ? [httpTag] : []),
-        ...(subName ? [el("span", "port-subname", subName)] : [])
+        ...(singleFwd?.error === "conflict"
+          ? [portConflictPill(singleFwd)]
+          : singleFwd
+            ? [el("span", "port-subname mono", `← ${portText}`)]
+            : svcAccess !== firstAccess
+              ? [el("span", "port-subname mono", svcAccess)]
+              : subName
+                ? [el("span", "port-subname", subName)]
+                : [])
       ),
       el("div", "port-actions",
         badge,
@@ -948,7 +1309,7 @@ function groupDeviceCards(items: Offering[], data: Status, routing: boolean) {
 
 type DeviceBucket = {
   owner: string;
-  src: { text: string; self: boolean };
+  src: { text: string; self: boolean; osTag: string };
   items: Offering[];
 };
 
@@ -989,7 +1350,10 @@ function groupBlocks(data: Status): HTMLElement[] {
     testDevice.disabled = anyPending || !data.online || busy;
     if (anyPending) testDevice.classList.add("spinning");
 
-    const title = el("span", bucket.src.self ? "device-group-title self" : "device-group-title", bucket.src.text);
+    const title = el("span", bucket.src.self ? "device-group-title self" : "device-group-title",
+      bucket.src.text,
+      ...(bucket.src.osTag ? [el("span", "host-os-tag", bucket.src.osTag)] : [])
+    );
     return el("div", "device-group",
       el("div", "device-group-head", title, testDevice),
       groupDeviceCards(bucket.items, data, routing)
@@ -1088,13 +1452,30 @@ function openAddShare(prefill?: { ip?: string; name?: string }) {
   let portDraft = "";
   let nameVal = prefill?.name ?? "";
   let probingAll = false;
+  let probingDeep = false;
+  let probeSeq = 0;
   let localError = "";
   let emptyDetect = false;
   let items: DraftPort[] = [];
   let publishNow = !!status?.online;
   let dialogOpen = true;
   let keepPortFocus = false;
-  editor.addEventListener("close", () => { dialogOpen = false; }, { once: true });
+
+  function cancelHostProbe(redraw = true) {
+    probeSeq += 1;
+    const wasProbing = probingAll;
+    probingAll = false;
+    probingDeep = false;
+    if (wasProbing) {
+      void request({ op: "cancel_probe_host" }, false).catch(() => {});
+      if (redraw && dialogOpen && editor.open) draw();
+    }
+  }
+
+  editor.addEventListener("close", () => {
+    dialogOpen = false;
+    cancelHostProbe(false);
+  }, { once: true });
 
   const existingForIp = (ip: string) =>
     (status?.shares ?? []).filter(s => singleIp(s) === ip && singlePort(s) !== null);
@@ -1183,28 +1564,36 @@ function openAddShare(prefill?: { ip?: string; name?: string }) {
     sortItems();
   }
 
-  async function detectCommonServices() {
+  async function detectCommonServices(deep = false) {
     if (probingAll || busy) return;
     const ip = ipVal.trim();
     if (!isUsableHostIp(ip)) { localError = t("invalid_host_ip"); draw(); return; }
+    const seq = ++probeSeq;
     localError = "";
     message = "";
     emptyDetect = false;
     probingAll = true;
+    probingDeep = deep;
     draw();
     try {
       const extra = items
         .map(i => i.port)
         .filter((p): p is number => p !== undefined && ![22, 3389, 445, 80, 443].includes(p))
         .slice(0, 5);
-      const reply = await request({ op: "probe_host", ip, extra_ports: extra }, true);
+      const reply = await request({ op: "probe_host", ip, extra_ports: extra, deep }, true);
+      if (seq !== probeSeq) return;
       if (!reply.host_probe) throw "internal";
+      if (reply.host_probe.cancelled) return;
       mergeProbeResults(reply.host_probe, false);
     } catch (error) {
+      if (seq !== probeSeq) return;
       localError = failure(typeof error === "string" ? error : "internal");
     } finally {
-      probingAll = false;
-      if (dialogOpen && editor.open) draw();
+      if (seq === probeSeq) {
+        probingAll = false;
+        probingDeep = false;
+        if (dialogOpen && editor.open) draw();
+      }
     }
   }
 
@@ -1222,7 +1611,7 @@ function openAddShare(prefill?: { ip?: string; name?: string }) {
       if (prev) {
         prev.checked = true;
       } else {
-        if (items.length >= 10) { localError = t("invalid_port_input"); draw(); return false; }
+        if (items.length >= 24) { localError = t("invalid_port_input"); draw(); return false; }
         const kind = token.port !== undefined ? inferDefaultKind(token.port) : "tcp";
         items.push({
           spec: token.spec,
@@ -1262,7 +1651,7 @@ function openAddShare(prefill?: { ip?: string; name?: string }) {
     const parts: string[] = [];
     if (item.saved) parts.push(t("already_added"));
     if (item.open === false) parts.push(t("port_offline"));
-    else if (item.kind === "rdp" && item.detail === "NLA") parts.push("NLA");
+    else if (item.detail && item.kind !== "ssh") parts.push(item.detail);
     return parts.join(" · ");
   }
 
@@ -1274,10 +1663,15 @@ function openAddShare(prefill?: { ip?: string; name?: string }) {
     alertBox.setAttribute("role", "alert");
 
     const osTagHost = el("span");
+    const deepBtn = probingAll
+      ? button(t("cancel_scan"), () => cancelHostProbe(true), "deep-scan-btn cancel")
+      : button(t("deep_scan"), () => void detectCommonServices(true), "deep-scan-btn");
     function syncHeaderMeta() {
       const os = effectiveHostOs();
       osTagHost.replaceChildren(...(os ? [el("span", "host-os-tag", osLabel(os))] : []));
-      detectBtn.disabled = probingAll || busy || !isUsableHostIp(ipVal.trim());
+      const validIp = isUsableHostIp(ipVal.trim());
+      detectBtn.disabled = busy || (!probingAll && !validIp);
+      deepBtn.disabled = busy || (!probingAll && !validIp);
     }
 
     const ipInput = el("input");
@@ -1297,15 +1691,17 @@ function openAddShare(prefill?: { ip?: string; name?: string }) {
     ipInput.addEventListener("keydown", (e) => {
       if (e.key === "Enter") {
         e.preventDefault();
-        if (isUsableHostIp(ipVal.trim())) void detectCommonServices();
+        if (isUsableHostIp(ipVal.trim())) void detectCommonServices(false);
         else portInput.focus();
       }
     });
 
-    const detectBtn = button("", () => void detectCommonServices(),
-      probingAll ? "tool-btn icon-only spinning" : "tool-btn icon-only");
-    detectBtn.append(icon("refresh"));
-    detectBtn.title = t(probingAll ? "detecting_host" : "detect_host");
+    const detectBtn = button("", () => {
+      if (probingAll) cancelHostProbe(true);
+      else void detectCommonServices(false);
+    }, "tool-btn icon-only");
+    detectBtn.append(icon(probingAll ? "close" : "refresh"));
+    detectBtn.title = t(probingAll ? "cancel_scan" : "detect_host");
     detectBtn.setAttribute("aria-label", detectBtn.title);
 
     const ipHead = el("div", "host-ip-head", el("span", "field-label", t("host_ip")), osTagHost);
@@ -1376,7 +1772,11 @@ function openAddShare(prefill?: { ip?: string; name?: string }) {
       if (e.key === "Enter") { e.preventDefault(); commitPortInput(true); }
     });
     portsBox.append(portInput);
-    body.append(el("div", "field-group", el("span", "field-label", t("add_ports_label")), portsBox));
+    const portsHead = el("div", "host-ip-head",
+      el("span", "field-label", probingAll ? t(probingDeep ? "deep_scanning" : "detecting_host") : t("add_ports_label")),
+      deepBtn
+    );
+    body.append(el("div", "field-group", portsHead, portsBox));
 
     if (items.length || portDraft.trim()) {
       const nameInput = el("input");
@@ -1648,10 +2048,45 @@ function mineList(data: Status) {
   }));
 }
 
+function restorePromptCard(profile: DeviceProfile) {
+  const bodyText = t("restore_banner_body")
+    .replace("{shares}", String(profile.shares.length))
+    .replace("{forwards}", String(profile.forwards.length));
+  const osTag = deviceOsLabel(profile.os);
+  return el("div", "restore-card",
+    el("div", "restore-info",
+      el("div", "host-title-line",
+        el("span", "restore-title", t("restore_banner_title")),
+        ...(osTag ? [el("span", "host-os-tag", osTag)] : []),
+        el("span", "mono muted", `#${profile.machine_id.slice(0, 6)}`)
+      ),
+      el("p", "muted", bodyText)
+    ),
+    el("div", "restore-actions",
+      button(t("dismiss"), () => void act({ op: "dismiss_restore" }), "button"),
+      button(t("restore_now"), () => void act({
+        op: "import_profile",
+        machine_id: profile.machine_id,
+        import_shares: true,
+        import_forwards: true,
+      }, () => notify(t("profile_imported"))), "button primary")
+    )
+  );
+}
+
 function servicesView(data: Status) {
   const hasRemote = data.services.length > 0;
   const hasLocal = data.shares.length > 0;
+  const prompt = data.restore_prompt ?? null;
   if (!hasRemote && !hasLocal) {
+    if (prompt) {
+      return el("div", "service-flow",
+        restorePromptCard(prompt),
+        !data.online
+          ? empty(t("group_disconnected"), button(t("connect_now"), () => void act({ op: "start" }), "button primary"), button(t("new_share"), () => openAddShare(), "button"))
+          : empty(t("no_services"), addShare(true))
+      );
+    }
     if (data.running && !data.online) return empty(t("connecting_now"));
     if (!data.online) {
       return empty(
@@ -1673,6 +2108,7 @@ function servicesView(data: Status) {
       ...(singleSource ? [
         el("span", "meta-sep", "·"),
         el("span", singleSource.self ? "source-tag self" : "source-tag", singleSource.text),
+        ...(singleSource.osTag ? [el("span", "host-os-tag", singleSource.osTag)] : []),
       ] : [])
     ),
     ...groupBlocks(data),
@@ -1683,13 +2119,14 @@ function servicesView(data: Status) {
     mineList(data)
   );
 
+  const flowBlocks: HTMLElement[] = [];
+  if (prompt) flowBlocks.push(restorePromptCard(prompt));
   if (hasRemote && hasLocal) {
-    const blocks = routing
-      ? [makeRemoteBlock(), makeLocalBlock()]
-      : [makeLocalBlock(), makeRemoteBlock()];
-    return el("div", "service-flow", ...blocks);
+    flowBlocks.push(...(routing ? [makeRemoteBlock(), makeLocalBlock()] : [makeLocalBlock(), makeRemoteBlock()]));
+  } else {
+    flowBlocks.push(hasRemote ? makeRemoteBlock() : makeLocalBlock());
   }
-  return el("div", "service-flow", hasRemote ? makeRemoteBlock() : makeLocalBlock());
+  return el("div", "service-flow", ...flowBlocks);
 }
 
 function addShare(emptyState = false) {
@@ -1701,11 +2138,19 @@ function addShare(emptyState = false) {
   return b;
 }
 
+function openRenameDevice(currentName: string) {
+  settingsDialog.close();
+  edit(t("current_device"), submit(t("save")), (values) => {
+    void act({ op: "rename_device", label: str(values, "label").trim() }, () => editor.close());
+  }, field(t("device"), "label", currentName, { required: true, maxLength: 64 }));
+}
+
 function openSettings() {
   let currentBehavior = getCloseBehavior();
   let saveError = false;
   let prefAutoConnect = status?.auto_connect ?? true;
   let prefAutoShare = status?.auto_share ?? true;
+  let prefCloudBackup = status?.cloud_backup ?? true;
 
   openSettingsModal(settingsDialog, {
     t: (k) => t(k as Parameters<typeof t>[0]),
@@ -1794,6 +2239,79 @@ function openSettings() {
           shareSeg.append(btn);
         }
         nodes.push(el("div", "settings-row", el("span", "settings-label", t("restore_shares")), shareSeg));
+
+        const backupSeg = el("div", "segmented");
+        for (const [val, key] of [[true, "backup_on"], [false, "backup_off"]] as const) {
+          const btn = button(t(key), () => {
+            if (prefCloudBackup === val) return;
+            const prev = prefCloudBackup;
+            prefCloudBackup = val;
+            redraw();
+            void request({ op: "set_preferences", cloud_backup: val }, false)
+              .then((next) => { status = next; render(); })
+              .catch(() => {
+                prefCloudBackup = prev;
+                if (settingsDialog.open) redraw();
+              });
+          }, val === prefCloudBackup ? "active" : "");
+          btn.setAttribute("aria-pressed", String(val === prefCloudBackup));
+          backupSeg.append(btn);
+        }
+        nodes.push(el("div", "settings-row", el("span", "settings-label", t("cloud_backup")), backupSeg));
+      }
+
+      if (status?.device_name) {
+        nodes.push(el("div", "settings-divider"));
+        const devOs = deviceOsLabel(status.device_os);
+        const shortId = status.machine_id ? `#${status.machine_id.slice(0, 6)}` : "";
+        const devVal = el("div", "settings-window",
+          el("span", "settings-device-val",
+            ...(devOs ? [el("span", "host-os-tag", devOs)] : []),
+            el("span", "settings-device-name", status.device_name),
+            ...(shortId ? [el("span", "mono muted", shortId)] : [])
+          ),
+          button(t("rename_device"), () => openRenameDevice(status?.device_name ?? ""), "button")
+        );
+        nodes.push(el("div", "settings-row", el("span", "settings-label", t("current_device")), devVal));
+      }
+
+      const profiles = (status?.cloud_profiles ?? []).filter(p => p.shares.length > 0 || p.forwards.length > 0);
+      if (status?.member && profiles.length) {
+        const list = el("div", "settings-profile-list", ...profiles.map((p) => {
+          const osTag = deviceOsLabel(p.os);
+          const counts = `${p.shares.length}/${p.forwards.length}`;
+          const impBtn = button(t("import_profile"), () => {
+            void request({
+              op: "import_profile",
+              machine_id: p.machine_id,
+              import_shares: true,
+              import_forwards: true,
+            }, false).then((next) => {
+              status = next;
+              render(true);
+              notify(t("profile_imported"));
+              if (settingsDialog.open) redraw();
+            }).catch((err) => notify(failure(err), true));
+          }, "button");
+          const delBtn = tool("close", t("delete_backup"), () => {
+            void request({ op: "delete_profile", machine_id: p.machine_id }, false)
+              .then((next) => {
+                status = next;
+                render(true);
+                if (settingsDialog.open) redraw();
+              })
+              .catch((err) => notify(failure(err), true));
+          });
+          return el("div", "settings-profile-row",
+            el("div", "settings-profile-meta",
+              ...(osTag ? [el("span", "host-os-tag", osTag)] : []),
+              el("span", "settings-device-name", p.name),
+              el("span", "mono muted", `#${p.machine_id.slice(0, 6)} · ${counts}`)
+            ),
+            el("div", "settings-profile-btns", impBtn, delBtn)
+          );
+        }));
+        nodes.push(el("div", "field-group", el("span", "settings-label", t("cloud_profiles")), list));
       }
 
       if (status?.member && status.server) {
@@ -1859,7 +2377,7 @@ function render(force = false) {
     for (const [key, probe] of probes) {
       const s = listed.get(key);
       const ip = toInt(probe.ip);
-      if (!s || effectiveKind(s) !== probe.kind || accessIp(probe.ip, data.virtual_ips) !== probe.access
+      if (!s || effectiveKind(s) !== probe.kind || accessIpFor(s.id, probe.ip, data) !== probe.access
         || !s.rules.ips.some(r => toInt(r.start) <= ip && ip <= toInt(r.end))
         || !s.rules.ports.some(r => r.start <= probe.port && probe.port <= r.end)) probes.delete(key);
     }
@@ -1917,17 +2435,23 @@ function render(force = false) {
     } else {
       const loginBtn = submit(t("login"));
       loginBtn.dataset.loginBtn = "1";
+      const devOs = deviceOsLabel(data.device_os);
+      const shortId = data.machine_id ? `#${data.machine_id.slice(0, 6)}` : "";
+      const devChip = data.device_name ? el("div", "signin-device",
+        ...(devOs ? [el("span", "host-os-tag", devOs)] : []),
+        el("span", "signin-device-name", data.device_name),
+        ...(shortId ? [el("span", "mono muted", shortId)] : [])
+      ) : null;
       content.replaceChildren(el("section", "signin",
         form((values) => void act({ op: "login", username: str(values, "username").trim(),
-          password: str(values, "password"), label: str(values, "label").trim() }),
+          password: str(values, "password"), label: data.device_name ?? "" }),
         el("h2", "form-title", t("login")),
         el("div", "signin-server",
           el("span", "mono signin-server-host", new URL(data.server).host),
           button(t("change"), () => { joining = true; render(true); }, "button ghost")),
         field(t("username"), "username", "", { required: true, autocomplete: "username", maxLength: 64 }),
         field(t("password"), "password", "", { required: true, type: "password", autocomplete: "current-password" }),
-        field(t("device"), "label", /Android/i.test(navigator.userAgent) ? "Android" : /Windows/i.test(navigator.userAgent) ? "Windows" : "Mac",
-          { required: true, maxLength: 64 }),
+        ...(devChip ? [devChip] : []),
         inlineAlert,
         loginBtn)));
     }

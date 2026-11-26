@@ -1,6 +1,7 @@
-use super::{Network, Platform, Tun, Underlay, datagram6};
+use super::{DeviceInfo, Network, Platform, Tun, Underlay, datagram6, hash_machine_id, unix_hostname};
 use crate::{Core, ipc};
 use fesen_acl::{Cidr, VIRTUAL};
+use fesen_proto::DeviceOs;
 use socket2::Socket;
 use std::{
     ffi::{CStr, c_char},
@@ -34,6 +35,7 @@ struct Apple {
     snapshot: Mutex<()>,
     our_ip: Mutex<Option<Ipv4Addr>>,
     physical_event: AtomicU64,
+    device: OnceLock<DeviceInfo>,
 }
 
 impl Apple {
@@ -44,8 +46,34 @@ impl Apple {
             snapshot: Mutex::new(()),
             our_ip: Mutex::new(None),
             physical_event: AtomicU64::new(0),
+            device: OnceLock::new(),
         }
     }
+}
+
+fn hardware_uuid() -> Option<String> {
+    let mut uuid = [0u8; 16];
+    let ts = libc::timespec {
+        tv_sec: 1,
+        tv_nsec: 0,
+    };
+    let rc = unsafe { libc::gethostuuid(uuid.as_mut_ptr(), &ts) };
+    if rc == 0 && uuid.iter().any(|&b| b != 0) {
+        Some(hex::encode(uuid))
+    } else {
+        None
+    }
+}
+
+fn computer_name() -> String {
+    if let Ok(raw) = command("/usr/sbin/scutil", &["--get", "ComputerName"]) {
+        let name = raw.trim();
+        if !name.is_empty() {
+            return name.chars().take(64).collect();
+        }
+    }
+    let host = unix_hostname();
+    if host.is_empty() { "Mac".into() } else { host }
 }
 
 fn command(program: &str, args: &[&str]) -> io::Result<String> {
@@ -129,6 +157,52 @@ fn bind_interface(socket: &Socket, index: u32, level: i32, option: i32) -> io::R
 impl Platform for Apple {
     fn system_routing(&self) -> bool {
         self.tunnel.is_some()
+    }
+
+    fn device_info(&self) -> DeviceInfo {
+        self.device
+            .get_or_init(|| {
+                let name = computer_name();
+                let seed = hardware_uuid().unwrap_or_else(|| name.clone());
+                DeviceInfo {
+                    machine_id: hash_machine_id(DeviceOs::Macos, &seed),
+                    os: DeviceOs::Macos,
+                    name,
+                }
+            })
+            .clone()
+    }
+
+    fn local_listeners(&self, target_ip: Ipv4Addr) -> Vec<(u16, Option<String>)> {
+        let Ok(out) = command("/usr/sbin/lsof", &["-nP", "+c", "0", "-i4TCP", "-sTCP:LISTEN"])
+        else {
+            return Vec::new();
+        };
+        let target_str = target_ip.to_string();
+        let mut found = std::collections::BTreeMap::<u16, Option<String>>::new();
+        for line in out.lines().skip(1) {
+            let cols: Vec<_> = line.split_whitespace().collect();
+            if cols.len() < 9 {
+                continue;
+            }
+            let proc_name = cols[0].replace("\\x20", " ");
+            let name_col = cols[cols.len() - 2];
+            let Some((host, port_str)) = name_col.rsplit_once(':') else {
+                continue;
+            };
+            if host != "*" && host != target_str {
+                continue;
+            }
+            let Ok(port) = port_str.parse::<u16>() else {
+                continue;
+            };
+            if port > 0 && port < 49152 {
+                found.entry(port).or_insert_with(|| {
+                    (!proc_name.is_empty()).then(|| proc_name.chars().take(24).collect())
+                });
+            }
+        }
+        found.into_iter().take(24).collect()
     }
 
     fn network(&self) -> io::Result<Network> {

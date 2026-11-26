@@ -1,5 +1,5 @@
 use crate::routing::Label;
-use fesen_proto::{CERT_NAME, Code, Publication};
+use fesen_proto::{CERT_NAME, Code, LocalMapping, Publication};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -15,15 +15,35 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Default, Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct AccountConfig {
     pub shares: Vec<Publication>,
     pub labels: Vec<Label>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forwards: Vec<LocalMapping>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_shares: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub share_network: String,
+    #[serde(default = "default_true")]
+    pub cloud_backup: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dirty_prefs: Vec<String>,
+}
+
+impl Default for AccountConfig {
+    fn default() -> Self {
+        Self {
+            shares: Vec::new(),
+            labels: Vec::new(),
+            forwards: Vec::new(),
+            active_shares: Vec::new(),
+            share_network: String::new(),
+            cloud_backup: true,
+            dirty_prefs: Vec::new(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -32,6 +52,8 @@ pub struct Local {
     pub server: String,
     pub identities: BTreeMap<String, Identity>,
     pub session: Option<Login>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
     #[serde(default = "default_true")]
     pub auto_connect: bool,
     #[serde(default = "default_true")]
@@ -50,6 +72,7 @@ impl Default for Local {
             server: String::new(),
             identities: BTreeMap::new(),
             session: None,
+            device_name: None,
             auto_connect: true,
             auto_share: true,
             accounts: BTreeMap::new(),
@@ -232,6 +255,59 @@ impl Local {
             .ok_or(Code::Unauthorized)?
             .to_owned();
         Ok(&mut self.accounts.entry(member).or_default().labels)
+    }
+
+    pub fn forwards(&self) -> &[LocalMapping] {
+        self.active_member()
+            .and_then(|m| self.accounts.get(m))
+            .map_or(&[], |a| a.forwards.as_slice())
+    }
+
+    pub fn forwards_mut(&mut self) -> Result<&mut Vec<LocalMapping>, Code> {
+        let member = self
+            .active_member()
+            .ok_or(Code::Unauthorized)?
+            .to_owned();
+        Ok(&mut self.accounts.entry(member).or_default().forwards)
+    }
+
+    pub fn cloud_backup(&self) -> bool {
+        self.active_member()
+            .and_then(|m| self.accounts.get(m))
+            .is_none_or(|a| a.cloud_backup)
+    }
+
+    pub fn set_cloud_backup(&mut self, enabled: bool) -> Result<(), Code> {
+        let member = self
+            .active_member()
+            .ok_or(Code::Unauthorized)?
+            .to_owned();
+        self.accounts.entry(member).or_default().cloud_backup = enabled;
+        Ok(())
+    }
+
+    pub fn dirty_prefs(&self) -> &[String] {
+        self.active_member()
+            .and_then(|m| self.accounts.get(m))
+            .map_or(&[], |a| a.dirty_prefs.as_slice())
+    }
+
+    pub fn mark_pref_dirty(&mut self, service: &str) {
+        let Some(member) = self.active_member().map(str::to_owned) else {
+            return;
+        };
+        let entry = self.accounts.entry(member).or_default();
+        if !entry.dirty_prefs.iter().any(|s| s == service) && entry.dirty_prefs.len() < 256 {
+            entry.dirty_prefs.push(service.to_owned());
+        }
+    }
+
+    pub fn clear_dirty_prefs(&mut self) {
+        if let Some(member) = self.active_member().map(str::to_owned)
+            && let Some(entry) = self.accounts.get_mut(&member)
+        {
+            entry.dirty_prefs.clear();
+        }
     }
 
     pub fn clear_group(&mut self) {

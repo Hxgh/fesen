@@ -240,6 +240,8 @@ mod tests {
                 password: PASSWORD.into(),
                 label: "TLS Test".into(),
             },
+            machine_id: None,
+            os: None,
         };
         ws.send(Message::Text(serde_json::to_string(&login).unwrap().into()))
             .await

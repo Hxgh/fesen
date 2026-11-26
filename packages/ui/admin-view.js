@@ -1,17 +1,13 @@
 import { icon } from "./icons.js";
 import { closePopoverMenu, openPopoverMenu } from "./popover.js";
 import {
-  checkConflict,
-  detectAllConflicts,
+  deviceOsLabel,
   effectiveKind,
   formatEndpoint,
   formatRanges,
   groupByHost,
   meaningfulHostName,
   osLabel,
-  parseIpRange,
-  parseMultiple,
-  parsePortRange,
   resolveHostOs,
   singleIp,
 } from "./host-card.js";
@@ -42,12 +38,9 @@ function el(tag, cls = "", ...children) {
 export function createAdminWorkspace(opts) {
   const { t, isZh, failure, transport, dialog } = opts;
   let data = null;
-  let tab = 0; // 0=members, 1=devices, 2=services, 3=conflicts
+  let tab = 0; // 0=members, 1=devices, 2=services
   let loading = false;
   let errorText = "";
-  let precheckIp = "";
-  let precheckPort = "";
-  let precheckResult = null; // null | { kind: "invalid" | "safe" | "conflict", items?: any[] }
 
   const onUpdateListeners = new Set();
   const emitUpdate = () => { for (const fn of onUpdateListeners) fn(); };
@@ -241,8 +234,9 @@ export function createAdminWorkspace(opts) {
     }
   }
 
-  function entityRow(name, statusKey, tone, actions, meta) {
+  function entityRow(name, statusKey, tone, actions, meta = "", tagText = "") {
     const main = el("div", "entity-main", el("span", "entity-name", name));
+    if (tagText) main.append(el("span", "host-os-tag", tagText));
     if (meta) main.append(el("span", "entity-meta", meta));
 
     const right = el("div", "entity-actions", el("span", `state-dot${tone ? ` ${tone}` : ""}`, t(statusKey)));
@@ -274,7 +268,9 @@ export function createAdminWorkspace(opts) {
         if (os) title.append(el("span", "host-os-tag", osLabel(os)));
         if (kind !== "tcp") title.append(el("span", "proto-tag", kind.toUpperCase()));
         const clean = ip ? meaningfulHostName(s.name, ip, os) : s.name;
-        const source = [s.device, s.member].filter(Boolean).join(" · ");
+        const devOs = deviceOsLabel(s.device_os);
+        const devTag = [s.device, devOs].filter(Boolean).join(" ");
+        const source = [s.member, devTag].filter(Boolean).join(" · ");
         const sub = [clean, source].filter(Boolean).join(" · ");
         const main = el("div", "service-main", title, ...(sub ? [el("span", "entity-meta", sub)] : []));
         wrap.append(el("article", "service-row", main, el("span", "state-dot good", t("broadcasting"))));
@@ -285,7 +281,9 @@ export function createAdminWorkspace(opts) {
       const title = el("div", "host-title-line", el("p", "endpoint", entry.ip));
       if (os) title.append(el("span", "host-os-tag", osLabel(os)));
       const clean = meaningfulHostName(first.name, entry.ip, os);
-      const source = [first.device, first.member].filter(Boolean).join(" · ");
+      const devOs = deviceOsLabel(first.device_os);
+      const devTag = [first.device, devOs].filter(Boolean).join(" ");
+      const source = [first.member, devTag].filter(Boolean).join(" · ");
       const sub = [clean, source].filter(Boolean).join(" · ");
       const head = el("div", "host-head",
         el("div", "host-info", title, ...(sub ? [el("span", "entity-meta", sub)] : [])),
@@ -306,80 +304,15 @@ export function createAdminWorkspace(opts) {
     return wrap;
   }
 
-  function renderConflicts(services, conflicts) {
-    const ok = conflicts.length === 0;
-    const audit = el("div", `audit-card ${ok ? "ok" : "has-conflict"}`,
-      el("div", "audit-header",
-        el("div", "audit-title-wrap",
-          el("span", "audit-dot"),
-          el("span", "audit-title", ok ? t("audit_ok_title") : t("audit_conflict_title"))
-        ),
-        el("span", "audit-count", `${t("audited_services")}${services.length}`)
-      )
-    );
-    if (!ok) {
-      audit.append(el("div", "conflict-list", ...conflicts.map(({ a, b }) =>
-        el("div", "conflict-item",
-          `${a.name} (${a.member}) × ${b.name} (${b.member}) · ${formatEndpoint(a.rules)} / ${formatEndpoint(b.rules)}`
-        )
-      )));
-    }
-
-    const ipIn = el("input");
-    Object.assign(ipIn, { value: precheckIp, placeholder: "198.51.100.10, 203.0.113.0/24", required: true, spellcheck: false });
-    ipIn.addEventListener("input", () => { precheckIp = ipIn.value; });
-
-    const portIn = el("input");
-    Object.assign(portIn, { value: precheckPort, placeholder: "80, 8000-8080", required: true, spellcheck: false });
-    portIn.addEventListener("input", () => { precheckPort = portIn.value; });
-
-    const runBtn = el("button", "button primary", t("precheck_run"));
-    runBtn.type = "submit";
-
-    const formEl = el("form", "precheck-form",
-      el("div", "precheck-inputs", el("label", "", t("ipv4"), ipIn), el("label", "", t("port"), portIn)),
-      el("div", "", runBtn)
-    );
-    formEl.addEventListener("submit", (e) => {
-      e.preventDefault();
-      const ips = parseMultiple(precheckIp, parseIpRange);
-      const ports = parseMultiple(precheckPort, parsePortRange);
-      if (!ips || !ports) {
-        precheckResult = { kind: "invalid" };
-      } else {
-        const matched = services.filter((s) => checkConflict({ ips, ports }, s.rules));
-        precheckResult = matched.length ? { kind: "conflict", items: matched } : { kind: "safe" };
-      }
-      emitUpdate();
-    });
-
-    const precheck = el("div", "precheck-card", el("h3", "precheck-title", t("precheck_title")), formEl);
-    if (precheckResult) {
-      const box = el("div", precheckResult.kind === "safe" ? "precheck-result" : "precheck-result conflict");
-      if (precheckResult.kind === "invalid") box.textContent = t("invalid_rule_input");
-      else if (precheckResult.kind === "safe") box.textContent = t("precheck_safe");
-      else {
-        box.append(
-          el("div", "precheck-result-title", t("precheck_conflict")),
-          ...precheckResult.items.map((s) => el("div", "precheck-result-line", `${s.name} (${s.member}) · ${formatEndpoint(s.rules)}`))
-        );
-      }
-      precheck.append(box);
-    }
-
-    return el("div", "stack conflicts-stack", audit, precheck);
-  }
-
   function renderTabs(navEl) {
     const services = data?.services || [];
-    const conflicts = detectAllConflicts(services);
     const counts = [
       data?.users?.length ?? 0,
       data?.devices?.length ?? 0,
       services.length,
-      conflicts.length,
     ];
-    const keys = ["members", "devices", "services", "conflicts"];
+    const keys = ["members", "devices", "services"];
+    if (tab >= keys.length) tab = 0;
     navEl.setAttribute("role", "tablist");
     navEl.setAttribute("aria-label", t("workspace"));
     navEl.replaceChildren(...keys.map((key, idx) => {
@@ -388,9 +321,7 @@ export function createAdminWorkspace(opts) {
       b.setAttribute("role", "tab");
       b.setAttribute("aria-selected", String(idx === tab));
       b.setAttribute("aria-current", idx === tab ? "page" : "false");
-      if (idx < 3 || counts[3] > 0) {
-        b.append(el("span", idx === 3 ? "count count-bad" : "count", String(counts[idx])));
-      }
+      b.append(el("span", "count", String(counts[idx])));
       b.addEventListener("click", () => setTabIndex(idx));
       return b;
     }));
@@ -437,7 +368,6 @@ export function createAdminWorkspace(opts) {
     }
 
     const services = data.services || [];
-    const conflicts = detectAllConflicts(services);
 
     if (tab === 0) {
       const list = el("div", "list-card", ...data.users.map((u) => {
@@ -480,21 +410,24 @@ export function createAdminWorkspace(opts) {
       if (!data.devices.length) {
         panel.append(el("p", "empty", t("devices_empty")));
       } else {
-        const list = el("div", "list-card", ...data.devices.map((d) => entityRow(
-          d.label,
-          d.revoked ? "revoked" : d.online ? "online_state" : "offline_state",
-          d.revoked ? "bad" : d.online ? "good" : "",
-          d.revoked ? [] : [
-            { icon: "close", label: t("revoke"), danger: true, onSelect: () => openActionDialog({ op: "revoke", device: d.id }, d.label) },
-          ],
-          d.member
-        )));
+        const list = el("div", "list-card", ...data.devices.map((d) => {
+          const shortId = `#${(d.machine_id || d.id || "").slice(0, 6)}`;
+          const meta = [d.member, shortId].filter(Boolean).join(" · ");
+          return entityRow(
+            d.label,
+            d.revoked ? "revoked" : d.online ? "online_state" : "offline_state",
+            d.revoked ? "bad" : d.online ? "good" : "",
+            d.revoked ? [] : [
+              { icon: "close", label: t("revoke"), danger: true, onSelect: () => openActionDialog({ op: "revoke", device: d.id }, d.label) },
+            ],
+            meta,
+            deviceOsLabel(d.os)
+          );
+        }));
         panel.append(list);
       }
-    } else if (tab === 2) {
-      panel.append(services.length ? renderServices(services) : el("p", "empty", t("services_empty")));
     } else {
-      panel.append(renderConflicts(services, conflicts));
+      panel.append(services.length ? renderServices(services) : el("p", "empty", t("services_empty")));
     }
     return panel;
   }

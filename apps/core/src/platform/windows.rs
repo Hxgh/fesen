@@ -1,6 +1,7 @@
-use super::{Network, Platform, Tun, Underlay};
+use super::{DeviceInfo, Network, Platform, Tun, Underlay, hash_machine_id};
 use crate::{Command as CoreCommand, Core};
 use fesen_acl::{Cidr, VIRTUAL};
+use fesen_proto::DeviceOs;
 use socket2::Socket;
 use std::{
     cell::Cell,
@@ -15,7 +16,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     time::Duration,
 };
 use tokio::{runtime::Handle, sync::mpsc};
@@ -35,8 +36,11 @@ use windows_sys::Win32::{
     System::{
         Com::CoTaskMemFree,
         LibraryLoader::GetModuleHandleW,
-        Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
-        SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW},
+        Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegGetValueW},
+        SystemInformation::{
+            ComputerNameDnsHostname, GetComputerNameExW, GetSystemDirectoryW,
+            GetWindowsDirectoryW,
+        },
         Threading::GetCurrentThreadId,
     },
     UI::{
@@ -219,6 +223,7 @@ pub struct Windows {
     input: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     dll: PathBuf,
     network: RwLock<Network>,
+    device: OnceLock<DeviceInfo>,
 }
 
 impl Windows {
@@ -229,6 +234,7 @@ impl Windows {
             input: Mutex::new(None),
             dll,
             network: RwLock::new(Network::default()),
+            device: OnceLock::new(),
         }
     }
 
@@ -277,7 +283,100 @@ impl Windows {
     }
 }
 
+fn windows_machine_guid() -> Option<String> {
+    let subkey = wide("SOFTWARE\\Microsoft\\Cryptography");
+    let value = wide("MachineGuid");
+    let mut buf = [0u16; 128];
+    let mut size = std::mem::size_of_val(&buf) as u32;
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr().cast(),
+            &mut size,
+        )
+    };
+    if rc == 0 && size >= 2 {
+        let len = (size as usize / 2).saturating_sub(1);
+        let text = String::from_utf16_lossy(&buf[..len]);
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_owned());
+        }
+    }
+    None
+}
+
+fn windows_computer_name() -> String {
+    let mut buf = [0u16; 256];
+    let mut len = buf.len() as u32;
+    let ok = unsafe { GetComputerNameExW(ComputerNameDnsHostname, buf.as_mut_ptr(), &mut len) };
+    if ok != 0 && len > 0 {
+        let s = String::from_utf16_lossy(&buf[..len as usize]);
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return trimmed.chars().take(64).collect();
+        }
+    }
+    "Windows".into()
+}
+
 impl Platform for Windows {
+    fn device_info(&self) -> DeviceInfo {
+        self.device
+            .get_or_init(|| {
+                let name = windows_computer_name();
+                let seed = windows_machine_guid().unwrap_or_else(|| name.clone());
+                DeviceInfo {
+                    machine_id: hash_machine_id(DeviceOs::Windows, &seed),
+                    os: DeviceOs::Windows,
+                    name,
+                }
+            })
+            .clone()
+    }
+
+    fn local_listeners(&self, target_ip: Ipv4Addr) -> Vec<(u16, Option<String>)> {
+        let Ok(sys) = os_dir(GetSystemDirectoryW) else {
+            return Vec::new();
+        };
+        let Ok(output) = Command::new(sys.join("netstat.exe"))
+            .args(["-ano", "-p", "tcp"])
+            .creation_flags(NO_WINDOW)
+            .output()
+        else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        let target_str = target_ip.to_string();
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut found = std::collections::BTreeSet::new();
+        for line in text.lines() {
+            let cols: Vec<_> = line.split_whitespace().collect();
+            if cols.len() < 4 || cols[0] != "TCP" || !cols[3].eq_ignore_ascii_case("LISTENING") {
+                continue;
+            }
+            let Some((host, port_str)) = cols[1].rsplit_once(':') else {
+                continue;
+            };
+            if host != "0.0.0.0" && host != target_str {
+                continue;
+            }
+            let Ok(port) = port_str.parse::<u16>() else {
+                continue;
+            };
+            if port > 0 && port < 49152 && !matches!(port, 135 | 139 | 5040 | 7680) {
+                found.insert(port);
+            }
+        }
+        found.into_iter().take(24).map(|p| (p, None)).collect()
+    }
+
     fn network(&self) -> io::Result<Network> {
         let adapter = self.adapter.lock().unwrap();
         let own = adapter.as_ref().map(|a| a.index);

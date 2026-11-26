@@ -1,5 +1,6 @@
-use super::{Network, Platform, Tun, datagram, datagram6};
+use super::{DeviceInfo, Network, Platform, Tun, datagram, datagram6, hash_machine_id};
 use crate::{Core, ipc, local::Local};
+use fesen_proto::DeviceOs;
 use jni::{
     JNIEnv, JavaVM,
     objects::{GlobalRef, JObject, JString, JValue},
@@ -13,7 +14,7 @@ use std::{
     os::fd::{AsRawFd, FromRawFd},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Mutex, OnceLock, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -41,6 +42,7 @@ struct Phone {
     input: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     device: Mutex<Option<Device>>,
     underlay: RwLock<Underlay>,
+    info: OnceLock<DeviceInfo>,
 }
 
 #[derive(Deserialize, Default)]
@@ -99,6 +101,56 @@ impl Platform for Phone {
     }
     fn access_ready(&self) -> bool {
         self.device.lock().unwrap().is_some()
+    }
+    fn device_info(&self) -> DeviceInfo {
+        self.info
+            .get_or_init(|| {
+                #[derive(Deserialize)]
+                struct RawDevice {
+                    machine_id: String,
+                    name: String,
+                }
+                let parsed = (|| -> io::Result<RawDevice> {
+                    let mut env = self.vm.attach_current_thread().map_err(Self::error)?;
+                    let value = env
+                        .call_method(
+                            self.service.as_obj(),
+                            "deviceJson",
+                            "()Ljava/lang/String;",
+                            &[],
+                        )
+                        .and_then(|r| r.l())
+                        .map_err(Self::error)?;
+                    let string = JString::from(value);
+                    let text: String = env.get_string(&string).map_err(Self::error)?.into();
+                    serde_json::from_str(&text).map_err(Self::error)
+                })();
+                match parsed {
+                    Ok(raw) => {
+                        let name = if raw.name.trim().is_empty() {
+                            "Android".to_owned()
+                        } else {
+                            raw.name.trim().chars().take(64).collect()
+                        };
+                        let seed = if raw.machine_id.trim().is_empty() {
+                            name.as_str()
+                        } else {
+                            raw.machine_id.trim()
+                        };
+                        DeviceInfo {
+                            machine_id: hash_machine_id(DeviceOs::Android, seed),
+                            os: DeviceOs::Android,
+                            name,
+                        }
+                    }
+                    Err(_) => DeviceInfo {
+                        machine_id: hash_machine_id(DeviceOs::Android, "android"),
+                        os: DeviceOs::Android,
+                        name: "Android".into(),
+                    },
+                }
+            })
+            .clone()
     }
     fn network(&self) -> io::Result<Network> {
         let mut env = self.vm.attach_current_thread().map_err(Self::error)?;
@@ -252,6 +304,7 @@ impl Engine {
             input: Mutex::new(None),
             device: Mutex::new(None),
             underlay: RwLock::new(Underlay::default()),
+            info: OnceLock::new(),
         });
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)

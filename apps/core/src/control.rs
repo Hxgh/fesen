@@ -174,12 +174,16 @@ impl Session {
         })
         .await
         .map_err(|_| Code::NotConnected)??;
+        let info = platform.device_info();
         send(
             &mut ws,
             &Hello {
                 version: PROTOCOL,
                 certificate: identity.cert.clone(),
                 credential,
+                machine_id: fesen_proto::valid_machine_id(&info.machine_id)
+                    .then_some(info.machine_id),
+                os: Some(info.os),
             },
         )
         .await?;
@@ -334,6 +338,9 @@ impl Worker {
                                 Event::View { view } => {
                                     expiry = Instant::now() + LEASE;
                                     core.update_view(&link, view);
+                                }
+                                Event::Sync { prefs, profiles } => {
+                                    core.update_sync(&link, prefs, profiles);
                                 }
                                 Event::Result { seq, error } => if let Some((_, ret)) = pending.remove(&seq) {
                                     let _ = ret.send(error.map_or(Ok(()), Err));
