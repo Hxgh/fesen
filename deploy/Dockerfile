@@ -13,8 +13,8 @@ COPY .cargo .cargo
 COPY packages packages
 COPY apps/core apps/core
 COPY apps/server apps/server
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
+RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-git-${TARGETARCH},sharing=locked,target=/usr/local/cargo/git \
     if [ "$TARGETARCH" = "$BUILDARCH" ]; then \
       cargo build --locked --release -p fesen-server && \
       cp target/release/fesen-server /tmp/fesen-server; \
