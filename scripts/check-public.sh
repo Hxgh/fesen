@@ -20,15 +20,33 @@ for path in "${files[@]}"; do
   esac
 done
 
-# 2. Reject embedded private key headers.
+# 2. Reject embedded private key headers and local home paths.
 if [[ ${#files[@]} -gt 0 ]]; then
   if grep -InE -- "-----BEGIN (RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----" "${files[@]}" 2>/dev/null; then
     echo "ERROR: private key material found in repository" >&2
     failed=1
   fi
+  scan_files=()
+  for path in "${files[@]}"; do
+    [[ "$path" == "scripts/check-public.sh" || "$path" == *Cargo.lock || "$path" == *pnpm-lock.yaml ]] && continue
+    scan_files+=("$path")
+  done
+  if [[ ${#scan_files[@]} -gt 0 ]]; then
+    if grep -InE -- "(/Users/|/home/|[A-Za-z]:\\\\Users\\\\)[A-Za-z0-9._-]+" "${scan_files[@]}" 2>/dev/null; then
+      echo "ERROR: local machine home path found in repository" >&2
+      failed=1
+    fi
+  fi
 fi
 
-# 3. If .env.local exists locally, ensure none of its non-placeholder values appear in repo files.
+# 3. If .env.local exists locally, enforce noreply commit email and scan non-placeholder values.
+if [[ -f .env.local ]]; then
+  git_email="$(git config user.email 2>/dev/null || true)"
+  if [[ -n "$git_email" && "$git_email" != *@users.noreply.github.com ]]; then
+    echo "ERROR: git user.email ($git_email) is not a GitHub noreply address" >&2
+    failed=1
+  fi
+fi
 if [[ -f .env.local && ${#files[@]} -gt 0 ]]; then
   while IFS='=' read -r k v; do
     [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
