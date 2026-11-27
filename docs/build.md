@@ -12,7 +12,7 @@
 | 平台 | 基线 | 构建命令与说明 |
 | --- | --- | --- |
 | Windows | Windows 10/11 (x64) | 需 MSVC、Windows SDK、WebView2；运行 `powershell -File scripts/build-windows.ps1` 生成 NSIS 安装包，安装至 Program Files（首次 UAC 提权）。 |
-| macOS | macOS 14+ (Apple Silicon) | 正式签名：配置 `FESEN_TEAM_ID`、`FESEN_SIGN_ID`、`FESEN_HOST_PROFILE`、`FESEN_TUNNEL_PROFILE` 后跑 `bash scripts/build-macos.sh`（加 `--install` 安装到 `/Applications`）。本地测试：`bash scripts/build-macos.sh --unsigned`（ad-hoc 签名，仅可发布）。 |
+| macOS | macOS 15+ (Apple Silicon) | 正式签名：配置 `FESEN_TEAM_ID`、`FESEN_SIGN_ID`、`FESEN_HOST_PROFILE`、`FESEN_TUNNEL_PROFILE` 后跑 `bash scripts/build-macos.sh`（加 `--install` 安装到 `/Applications`）。本地测试：`bash scripts/build-macos.sh --unsigned`（ad-hoc 签名，仅可发布）。 |
 | Android | Android 13+ (ARM64) | 需 JDK 21/17、Android SDK（Platform 36/37.0、Build Tools 36.1、NDK 29）及 `JAVA_HOME`/`ANDROID_HOME`。调试包：`bash scripts/build-android.sh --debug`；签名包配置 `FESEN_ANDROID_KEYSTORE*` 后跑 `bash scripts/build-android.sh`。 |
 | 服务端 | Linux (amd64 / arm64) | Docker：`docker compose -f deploy/compose.yaml build`；原生：`cargo build --locked --release -p fesen-server`。 |
 

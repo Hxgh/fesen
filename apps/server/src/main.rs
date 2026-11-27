@@ -12,7 +12,7 @@ use group::App;
 use std::{
     env,
     net::{SocketAddr, SocketAddrV4},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use tokio::net::{TcpListener, UdpSocket};
 
@@ -48,6 +48,60 @@ impl Discovery {
     }
 }
 
+fn read_password(prompt: &str) -> anyhow::Result<String> {
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        Ok(rpassword::prompt_password(prompt)?)
+    } else {
+        let mut s = String::new();
+        std::io::stdin().read_line(&mut s)?;
+        Ok(s.trim_end_matches(['\r', '\n']).to_owned())
+    }
+}
+
+fn bootstrap_admin(
+    db: &rusqlite::Connection,
+    user_env: Option<&str>,
+    pass_env: Option<&str>,
+    pass_file_env: Option<&Path>,
+) -> anyhow::Result<()> {
+    let pass_env = pass_env.filter(|s| !s.is_empty());
+    let pass_file_env = pass_file_env.filter(|p| !p.as_os_str().is_empty());
+    anyhow::ensure!(
+        !(pass_env.is_some() && pass_file_env.is_some()),
+        "FESEN_ADMIN_PASSWORD 与 FESEN_ADMIN_PASSWORD_FILE 只能设置一种"
+    );
+    let has_bootstrap = pass_env.is_some() || pass_file_env.is_some();
+    if store::has_admin(db)? {
+        if has_bootstrap {
+            println!("提示: 超级管理员已存在，已忽略初始密码环境变量，建议从部署配置中移除");
+        }
+        return Ok(());
+    }
+    let password = match (pass_env, pass_file_env) {
+        (Some(p), None) => p.to_owned(),
+        (None, Some(file)) => std::fs::read_to_string(file)
+            .map_err(|e| anyhow::anyhow!("无法读取 FESEN_ADMIN_PASSWORD_FILE: {e}"))?
+            .trim_end_matches(['\r', '\n'])
+            .to_owned(),
+        _ => {
+            println!(
+                "提示: 尚未创建超级管理员，可设置 FESEN_ADMIN_PASSWORD 启动，或运行 fesen-server admin <账号>"
+            );
+            return Ok(());
+        }
+    };
+    let user = user_env
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("admin");
+    anyhow::ensure!(valid_username(user), "FESEN_ADMIN_USER 账号无效");
+    let hash = store::password_hash(&password)
+        .map_err(|_| anyhow::anyhow!("初始管理员密码无效（长度需 8-256 位）"))?;
+    store::create(db, user, &hash, true)?;
+    println!("已初始化超级管理员: {user}");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let path = PathBuf::from(env::var_os("FESEN_DB").unwrap_or_else(|| "fesen.sqlite".into()));
@@ -58,23 +112,35 @@ async fn main() -> anyhow::Result<()> {
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("用法: fesen-server admin 账号"))?;
             anyhow::ensure!(args.next().is_none() && valid_username(&name), "账号无效");
-            let password = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                rpassword::prompt_password("管理员密码: ")?
-            } else {
-                let mut s = String::new();
-                std::io::stdin().read_line(&mut s)?;
-                s.trim_end_matches(['\r', '\n']).to_owned()
-            };
+            let db = store::db(&path)?;
+            anyhow::ensure!(
+                !store::has_admin(&db)?,
+                "已存在超级管理员；如需重置密码请运行 fesen-server passwd <账号>"
+            );
+            let password = read_password("超级管理员密码: ")?;
             let hash = store::password_hash(&password)?;
-            store::create(&store::db(&path)?, &name, &hash, true)?;
-            println!("管理员账号已创建");
+            store::create(&db, &name, &hash, true)?;
+            println!("超级管理员账号已创建");
+            return Ok(());
+        }
+        Some("passwd") => {
+            let name = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("用法: fesen-server passwd 账号"))?;
+            anyhow::ensure!(args.next().is_none() && valid_username(&name), "账号无效");
+            let mut db = store::db(&path)?;
+            let password = read_password("新密码: ")?;
+            let hash = store::password_hash(&password)?;
+            store::reset_password(&mut db, &name, &hash)
+                .map_err(|_| anyhow::anyhow!("账号不存在或已停用"))?;
+            println!("密码已重置，旧会话与设备令牌已失效");
             return Ok(());
         }
         Some("serve") | None => anyhow::ensure!(
             args.next().is_none(),
-            "用法: fesen-server [serve | admin 账号]"
+            "用法: fesen-server [serve | admin 账号 | passwd 账号]"
         ),
-        _ => anyhow::bail!("用法: fesen-server [serve | admin 账号]"),
+        _ => anyhow::bail!("用法: fesen-server [serve | admin 账号 | passwd 账号]"),
     }
     let origin =
         origin(&env::var("FESEN_ORIGIN").unwrap_or_else(|_| "http://127.0.0.1:8080".into()))?;
@@ -96,6 +162,15 @@ async fn main() -> anyhow::Result<()> {
         origin.scheme() == "https",
     )
     .await?;
+    let db = store::db(&path)?;
+    bootstrap_admin(
+        &db,
+        env::var("FESEN_ADMIN_USER").ok().as_deref(),
+        env::var("FESEN_ADMIN_PASSWORD").ok().as_deref(),
+        env::var_os("FESEN_ADMIN_PASSWORD_FILE")
+            .map(PathBuf::from)
+            .as_deref(),
+    )?;
     let tcp = TcpListener::bind(listen).await?;
     let udp = match config.listen {
         Some(listen) => Some(UdpSocket::bind(listen).await?),
@@ -105,7 +180,7 @@ async fn main() -> anyhow::Result<()> {
         Some(udp) => config.public_port.unwrap_or(udp.local_addr()?.port()),
         None => 0,
     };
-    let app = App::new(store::db(&path)?, origin, port, config.stun)?;
+    let app = App::new(db, origin, port, config.stun)?;
     println!(
         "fesen-server {} {}，探测 {}",
         if tls.is_some() { "HTTPS" } else { "HTTP" },
@@ -120,7 +195,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::select! {
         r = async move { match tls {
             Some(tls) => tls.serve(tcp, web).await,
-            None => axum::serve(tcp, web).await,
+            None => axum::serve(tcp, web.into_make_service_with_connect_info::<SocketAddr>()).await,
         } } => r?,
         r = async move { match udp {
             Some(udp) => control::discovery(udp, app).await,
@@ -143,6 +218,7 @@ async fn shutdown() {
 }
 
 fn router(app: App) -> Router {
+    let https = app.origin.scheme() == "https";
     let admin_entry = get(|| async { axum::response::Redirect::temporary("/admin/") });
     Router::new()
         .route("/", admin_entry.clone())
@@ -150,6 +226,6 @@ fn router(app: App) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .route("/join", get(control::join))
         .route("/control", get(control::upgrade))
-        .nest("/admin/", admin::router())
+        .nest("/admin/", admin::router(https))
         .with_state(app)
 }

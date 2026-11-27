@@ -142,14 +142,11 @@ export function createAdminWorkspace(opts) {
   }
 
   function openActionDialog(command, subject = "") {
-    const key = command.op === "enable" && !command.enabled
-      ? "disable"
-      : command.op === "set_admin"
-        ? (command.admin ? "grant_admin" : "revoke_admin")
-        : command.op;
-    const danger = key === "disable" || key === "revoke" || key === "revoke_admin";
+    const key = command.op === "enable" && !command.enabled ? "disable" : command.op;
+    const danger = key === "disable" || key === "revoke";
     const needsUser = key === "create";
-    const needsPass = key === "create" || key === "reset";
+    const needsCurrent = key === "change_password";
+    const needsPass = key === "create" || key === "reset" || key === "change_password";
 
     let submitting = false;
     const title = el("h2", "", t(key));
@@ -165,7 +162,7 @@ export function createAdminWorkspace(opts) {
 
     const body = el("div", "dialog-body");
     if (subject) body.append(el("p", "subject", subject));
-    if (danger || key === "reset" || key === "grant_admin") body.append(el("p", "muted", t(`confirm_${key}`)));
+    if (danger || key === "reset" || key === "change_password") body.append(el("p", "muted", t(`confirm_${key}`)));
 
     let userInput = null;
     if (needsUser) {
@@ -173,18 +170,17 @@ export function createAdminWorkspace(opts) {
       Object.assign(userInput, { name: "username", required: true, maxLength: 64, autocomplete: "off", pattern: "[A-Za-z0-9._\\-]+" });
       body.append(el("label", "", t("account"), userInput));
     }
+    let currentInput = null;
+    if (needsCurrent) {
+      currentInput = el("input");
+      Object.assign(currentInput, { name: "current", type: "password", required: true, minLength: 8, maxLength: 256, autocomplete: "current-password" });
+      body.append(el("label", "", t("current_password"), currentInput));
+    }
     let passInput = null;
     if (needsPass) {
       passInput = el("input");
       Object.assign(passInput, { name: "password", type: "password", required: true, minLength: 8, maxLength: 256, autocomplete: "new-password" });
       body.append(el("label", "", t("new_password"), passInput));
-    }
-    let adminCheck = null;
-    if (needsUser) {
-      adminCheck = el("input");
-      adminCheck.type = "checkbox";
-      adminCheck.name = "admin";
-      body.append(el("label", "check-row", adminCheck, t("create_as_admin")));
     }
 
     const errBox = el("p", "feedback error");
@@ -205,11 +201,14 @@ export function createAdminWorkspace(opts) {
       if (submitting) return;
       const payload = { ...command };
       if (userInput) payload.username = userInput.value.trim();
+      if (currentInput) {
+        payload.current = currentInput.value;
+        currentInput.value = "";
+      }
       if (passInput) {
         payload.password = passInput.value;
         passInput.value = "";
       }
-      if (adminCheck) payload.admin = adminCheck.checked;
       submitting = true;
       submitBtn.disabled = true;
       cancelBtn.disabled = true;
@@ -238,7 +237,7 @@ export function createAdminWorkspace(opts) {
     dialog.replaceChildren(formEl);
     if (!dialog.open) {
       dialog.showModal();
-      const firstInput = userInput || passInput;
+      const firstInput = userInput || currentInput || passInput;
       if (firstInput) firstInput.focus();
       else dialog.focus();
     }
@@ -453,22 +452,14 @@ export function createAdminWorkspace(opts) {
         const isSelf = u.name === data.admin;
         const menu = [];
         if (u.admin) {
-          if (!isSelf) {
+          if (isSelf) {
             menu.push({
-              icon: "shield",
-              label: t("revoke_admin"),
-              danger: true,
-              onSelect: () => openActionDialog({ op: "set_admin", username: u.name, admin: false }, u.name),
+              icon: "sliders",
+              label: t("change_password"),
+              onSelect: () => openActionDialog({ op: "change_password" }, u.name),
             });
           }
         } else {
-          if (!u.disabled) {
-            menu.push({
-              icon: "shield",
-              label: t("grant_admin"),
-              onSelect: () => openActionDialog({ op: "set_admin", username: u.name, admin: true }, u.name),
-            });
-          }
           menu.push({ icon: "sliders", label: t("reset"), onSelect: () => openActionDialog({ op: "reset", username: u.name }, u.name) });
           menu.push({
             icon: u.disabled ? "check" : "alert",

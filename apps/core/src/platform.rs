@@ -136,7 +136,7 @@ pub trait Platform: Send + Sync + 'static {
         let _ = ip;
         #[cfg(target_os = "linux")]
         {
-            return linux_proc_listeners(ip);
+            linux_proc_listeners(ip)
         }
         #[cfg(not(target_os = "linux"))]
         Vec::new()

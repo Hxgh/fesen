@@ -1,18 +1,32 @@
 services:
   server:
-    image: ${FESEN_IMAGE:-fesen-server:local}
+    image: ${FESEN_IMAGE:-ghcr.io/hxgh/fesen-server:latest}
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+    init: true
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 384m
+    pids_limit: 64
     environment:
       FESEN_ORIGIN: https://${FESEN_DOMAIN:?set FESEN_DOMAIN}
       FESEN_STUN: ${FESEN_STUN:-}
+      FESEN_ADMIN_USER: ${FESEN_ADMIN_USER:-}
+      FESEN_ADMIN_PASSWORD: ${FESEN_ADMIN_PASSWORD:-}
     volumes:
       - state:/state
-    restart: unless-stopped
-    read_only: true
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: "2"
   https:
     image: caddy:2-alpine
+    init: true
+    restart: unless-stopped
     environment:
       FESEN_DOMAIN: ${FESEN_DOMAIN:?set FESEN_DOMAIN}
     ports:
@@ -21,7 +35,11 @@ services:
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - certificates:/data
-    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: "2"
 volumes:
   state:
   certificates:

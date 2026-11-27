@@ -1,17 +1,24 @@
-use crate::{group::App, store};
+use crate::{
+    group::{App, PeerIp},
+    store,
+};
 use axum::{
     extract::{
         State, WebSocketUpgrade,
         ws::{Message, Utf8Bytes, WebSocket},
     },
-    http::{HeaderMap, header},
+    http::{HeaderMap, HeaderValue, header},
     response::{Html, IntoResponse, Response},
 };
 use fesen_proto::{
     Code, Credential, Event, HEARTBEAT, Hello, MAX_REQUEST, PRESENCE_TIMEOUT, PROBE_PREFIX,
     PROTOCOL, Request, valid_label, valid_username,
 };
-use std::{net::SocketAddr, sync::atomic::Ordering, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::atomic::Ordering,
+    time::Duration,
+};
 use tokio::{
     net::UdpSocket,
     sync::mpsc,
@@ -42,7 +49,7 @@ pub async fn join(State(app): State<App>, headers: HeaderMap) -> impl IntoRespon
         };
     let host = &app.origin[url::Position::BeforeHost..url::Position::AfterPort];
     let mark = r#"<svg class="brand-mark" data-state="active" viewBox="0 0 64 64" fill="currentColor" aria-hidden="true"><g class="yao-top"><rect x="4" y="6" width="56" height="12"/></g><g class="yao-mid"><rect x="4" y="26" width="24" height="12"/><rect x="36" y="26" width="24" height="12"/></g><g class="yao-bot"><rect x="4" y="46" width="24" height="12"/><rect x="36" y="46" width="24" height="12"/></g></svg>"#;
-    (
+    let mut res = (
         [
             (header::VARY, "Accept-Language"),
             (header::CONTENT_LANGUAGE, lang),
@@ -65,6 +72,14 @@ pub async fn join(State(app): State<App>, headers: HeaderMap) -> impl IntoRespon
 </section></main></body></html>"#
         )),
     )
+        .into_response();
+    if app.origin.scheme() == "https" {
+        res.headers_mut().insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000"),
+        );
+    }
+    res
 }
 
 pub async fn discovery(socket: UdpSocket, app: App) -> std::io::Result<()> {
@@ -81,10 +96,14 @@ pub async fn discovery(socket: UdpSocket, app: App) -> std::io::Result<()> {
     }
 }
 
-pub async fn upgrade(State(app): State<App>, ws: WebSocketUpgrade) -> Response {
+pub async fn upgrade(
+    State(app): State<App>,
+    PeerIp(ip): PeerIp,
+    ws: WebSocketUpgrade,
+) -> Response {
     ws.max_message_size(MAX_REQUEST)
         .max_frame_size(MAX_REQUEST)
-        .on_upgrade(|socket| session_loop(socket, app))
+        .on_upgrade(move |socket| session_loop(socket, app, ip))
         .into_response()
 }
 
@@ -100,7 +119,7 @@ async fn send(socket: &mut WebSocket, event: Event) -> Result<(), ()> {
     send_raw(socket, text.into()).await
 }
 
-async fn session_loop(mut socket: WebSocket, app: App) {
+async fn session_loop(mut socket: WebSocket, app: App, ip: Option<IpAddr>) {
     let Ok(Some(Ok(Message::Text(data)))) = timeout(HEARTBEAT, socket.recv()).await else {
         return;
     };
@@ -123,7 +142,7 @@ async fn session_loop(mut socket: WebSocket, app: App) {
                 if !valid_username(&username) || !valid_label(&label) {
                     return Err(Code::Invalid);
                 }
-                let hash = app.verify(&username, password, false).await?;
+                let hash = app.verify_limited(ip, &username, password, false).await?;
                 (Some((username, label, hash)), store::secret())
             }
             Credential::Resume { token } if token.len() == 64 => (None, token),

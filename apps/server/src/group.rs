@@ -1,5 +1,8 @@
 use crate::store;
-use axum::extract::ws::Utf8Bytes;
+use axum::{
+    extract::{ConnectInfo, FromRequestParts, ws::Utf8Bytes},
+    http::request::Parts,
+};
 use fesen_acl::{MAX_ADDRESSES, count, union};
 use fesen_proto::{
     Call, Code, DeviceOs, Event, MAX_CANDIDATES, MAX_DEVICES, MAX_IPV6_CANDIDATES,
@@ -8,19 +11,133 @@ use fesen_proto::{
 use rusqlite::Connection;
 use std::{
     collections::HashMap,
-    net::{SocketAddrV4, SocketAddrV6},
+    convert::Infallible,
+    net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
+const AUTH_WINDOW: Duration = Duration::from_secs(300);
+const USER_FREE_ATTEMPTS: u32 = 5;
+const IP_FREE_ATTEMPTS: u32 = 20;
+const AUTH_BASE_LOCK: Duration = Duration::from_secs(60);
+const AUTH_MAX_LOCK: Duration = Duration::from_secs(900);
+const AUTH_MAX_ENTRIES: usize = 4096;
+
+pub struct PeerIp(pub Option<IpAddr>);
+
+impl<S: Send + Sync> FromRequestParts<S> for PeerIp {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|c| c.0.ip()),
+        ))
+    }
+}
+
+struct FailRecord {
+    failures: u32,
+    window_start: Instant,
+    locked_until: Option<Instant>,
+}
+
+impl FailRecord {
+    fn is_locked(&self, now: Instant) -> bool {
+        self.locked_until.is_some_and(|until| until > now)
+    }
+
+    fn is_live(&self, now: Instant) -> bool {
+        self.is_locked(now) || now.duration_since(self.window_start) <= AUTH_WINDOW
+    }
+
+    fn bump(&mut self, now: Instant, free_attempts: u32) {
+        if !self.is_locked(now) && now.duration_since(self.window_start) > AUTH_WINDOW {
+            self.failures = 0;
+            self.window_start = now;
+        }
+        self.failures = self.failures.saturating_add(1);
+        if self.failures >= free_attempts {
+            let shift = (self.failures - free_attempts).min(4);
+            let lock = AUTH_BASE_LOCK
+                .saturating_mul(1u32 << shift)
+                .min(AUTH_MAX_LOCK);
+            self.locked_until = Some(now + lock);
+        }
+    }
+}
+
+#[derive(Default)]
+struct AuthLimiter {
+    by_user: HashMap<String, FailRecord>,
+    by_ip: HashMap<IpAddr, FailRecord>,
+}
+
+impl AuthLimiter {
+    fn check(&self, ip: Option<IpAddr>, user: &str) -> Result<(), Code> {
+        let now = Instant::now();
+        if self.by_user.get(user).is_some_and(|r| r.is_locked(now))
+            || ip.is_some_and(|addr| self.by_ip.get(&addr).is_some_and(|r| r.is_locked(now)))
+        {
+            return Err(Code::Busy);
+        }
+        Ok(())
+    }
+
+    fn record_failure(&mut self, ip: Option<IpAddr>, user: &str) {
+        let now = Instant::now();
+        Self::bump_map(&mut self.by_user, user.to_owned(), now, USER_FREE_ATTEMPTS);
+        if let Some(addr) = ip {
+            Self::bump_map(&mut self.by_ip, addr, now, IP_FREE_ATTEMPTS);
+        }
+    }
+
+    fn record_success(&mut self, ip: Option<IpAddr>, user: &str) {
+        self.by_user.remove(user);
+        if let Some(addr) = ip {
+            self.by_ip.remove(&addr);
+        }
+    }
+
+    fn bump_map<K: Eq + std::hash::Hash>(
+        map: &mut HashMap<K, FailRecord>,
+        key: K,
+        now: Instant,
+        free_attempts: u32,
+    ) {
+        if map.len() >= AUTH_MAX_ENTRIES && !map.contains_key(&key) {
+            map.retain(|_, r| r.is_live(now));
+            if map.len() >= AUTH_MAX_ENTRIES {
+                map.clear();
+            }
+        }
+        map.entry(key)
+            .and_modify(|r| r.bump(now, free_attempts))
+            .or_insert_with(|| {
+                let mut r = FailRecord {
+                    failures: 0,
+                    window_start: now,
+                    locked_until: None,
+                };
+                r.bump(now, free_attempts);
+                r
+            });
+    }
+}
+
 #[derive(Clone)]
 pub struct App {
     pub inner: Arc<Mutex<Group>>,
+    auth_limiter: Arc<Mutex<AuthLimiter>>,
     pub view_frame: watch::Sender<(u64, Utf8Bytes)>,
     pub password_slots: Arc<tokio::sync::Semaphore>,
     pub dummy_hash: Arc<String>,
@@ -63,6 +180,7 @@ impl App {
                 probe_udp: udp_port != 0,
                 view_gen: 0,
             })),
+            auth_limiter: Arc::new(Mutex::new(AuthLimiter::default())),
             view_frame: watch::channel((0u64, initial_frame)).0,
             password_slots: Arc::new(tokio::sync::Semaphore::new(3)),
             dummy_hash: Arc::new(store::password_hash(&store::secret())?),
@@ -90,12 +208,28 @@ impl App {
         }
     }
 
-    pub async fn verify(
+    pub async fn verify_limited(
         &self,
+        ip: Option<IpAddr>,
         member: &str,
         password: String,
         admin: bool,
     ) -> Result<String, Code> {
+        self.auth_limiter.lock().unwrap().check(ip, member)?;
+        match self.verify(member, password, admin).await {
+            Ok(hash) => {
+                self.auth_limiter.lock().unwrap().record_success(ip, member);
+                Ok(hash)
+            }
+            Err(Code::Unauthorized) => {
+                self.auth_limiter.lock().unwrap().record_failure(ip, member);
+                Err(Code::Unauthorized)
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    async fn verify(&self, member: &str, password: String, admin: bool) -> Result<String, Code> {
         let hash = store::login_hash(&self.inner.lock().unwrap().db, member, admin);
         let permit = self
             .password_slots

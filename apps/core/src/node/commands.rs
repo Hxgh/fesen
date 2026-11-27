@@ -121,10 +121,13 @@ impl Core {
                         state.admin_token.clone().ok_or(Code::Unauthorized)?,
                     )
                 };
-                let is_logout = action.get("op").and_then(|v| v.as_str()) == Some("logout");
+                let clears_session = matches!(
+                    action.get("op").and_then(|v| v.as_str()),
+                    Some("logout" | "change_password")
+                );
                 match admin_client::action(&*self.platform, &server, &token, &action).await {
                     Ok(()) => {
-                        if is_logout {
+                        if clears_session {
                             self.state.lock().unwrap().admin_token = None;
                             self.bump_status();
                         }

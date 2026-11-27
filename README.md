@@ -2,7 +2,7 @@
 
 一个自托管服务器就是一个组。成员用接入链接和账号登录，即可在组内发布和访问 IPv4/TCP 服务——无需两两配对，无需为应用配置代理。
 
-支持 **Windows 10/11 (x64)**、**macOS 14+ (Apple Silicon)**、**Android 13+ (ARM64)**；服务端推荐在 **Linux** 上通过 Docker 运行。
+支持 **Windows 10/11 (x64)**、**macOS 15+ (Apple Silicon)**、**Android 13+ (ARM64)**；服务端推荐在 **Linux** 上通过 Docker 运行。
 
 ## 工作方式
 
@@ -15,13 +15,12 @@ Linux 推荐使用 Docker Compose（也支持 GitHub Releases 二进制或 `carg
 
 ```sh
 export FESEN_DOMAIN=group.example.com
-export FESEN_IMAGE=ghcr.io/<owner>/<repo>-server:latest
+export FESEN_ADMIN_PASSWORD='请替换为强密码'   # 仅首次空库生效，初始化后可移除
 docker compose -f deploy/compose.yaml pull
-docker compose -f deploy/compose.yaml run --rm server admin admin
 docker compose -f deploy/compose.yaml up -d
 ```
 
-打开 `https://你的域名/admin/` 创建成员并分发接入链接（无注册入口）；保留 `state` 卷持久化数据。已有证书时可直接设置 `FESEN_TLS_CERT`、`FESEN_TLS_KEY`、`FESEN_ORIGIN`、`FESEN_LISTEN` 启动（支持证书热轮换，证书无效不退回明文），完整变量见 [`.env.example`](.env.example)。
+每组仅允许 **1 个超级管理员**，也可用 `docker compose -f deploy/compose.yaml run --rm server admin <账号>` 初始化、用 `passwd <账号>` 重置密码。打开 `https://你的域名/admin/` 创建成员并分发接入链接（无注册入口）；保留 `state` 卷持久化数据。已有证书时可直接设置 `FESEN_TLS_CERT`、`FESEN_TLS_KEY`、`FESEN_ORIGIN`、`FESEN_LISTEN` 启动（支持证书热轮换，证书无效不退回明文），完整变量见 [`.env.example`](.env.example)。
 
 跨 IPv4 NAT 辅助探测默认关闭（macOS / Android 自动优先尝试公网 IPv6 直连），按需二选一：
 - **外部 STUN**：设 `FESEN_STUN=域名:端口`（中心仍仅开 HTTPS）。

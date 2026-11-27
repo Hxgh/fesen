@@ -1,6 +1,6 @@
 # 飞弦（Fesen）
 
-一台服务器就是一个组。客户端支持 Windows 10/11 (x64)、macOS 14+ (Apple Silicon)、Android 13+ (ARM64)，设备间以双向认证 QUIC 直连共享 IPv4/TCP 服务；服务端推荐在 Linux 上以 Docker 运行。
+一台服务器就是一个组。客户端支持 Windows 10/11 (x64)、macOS 15+ (Apple Silicon)、Android 13+ (ARM64)，设备间以双向认证 QUIC 直连共享 IPv4/TCP 服务；服务端推荐在 Linux 上以 Docker 运行。
 
 ## 目录职责（禁止跨层堆砌）
 

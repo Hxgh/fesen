@@ -35,6 +35,7 @@ custom-protocol = ["tauri/custom-protocol"]
 
 [profile.release]
 lto = "thin"
+codegen-units = 1
 strip = "symbols"
 
 [profile.release.build-override]

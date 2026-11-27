@@ -126,14 +126,34 @@ pub fn db(path: &Path) -> anyhow::Result<Connection> {
     Ok(db)
 }
 
+pub fn has_admin(db: &Connection) -> Result<bool, Code> {
+    db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE admin=1 AND disabled=0)",
+        [],
+        |r| r.get(0),
+    )
+    .map_err(sql_code)
+}
+
 pub fn create(db: &Connection, name: &str, hash: &str, admin: bool) -> Result<(), Code> {
     if !valid_username(name) {
         return Err(Code::Invalid);
     }
-    match db.execute(
-        "INSERT INTO users(name,password,admin) VALUES(?1,?2,?3) ON CONFLICT(name) DO NOTHING",
-        params![name, hash, admin],
-    ) {
+    let changed = if admin {
+        db.execute(
+            "INSERT INTO users(name,password,admin)
+             SELECT ?1,?2,1
+             WHERE NOT EXISTS(SELECT 1 FROM users WHERE admin=1 AND disabled=0)
+               AND NOT EXISTS(SELECT 1 FROM users WHERE name=?1)",
+            params![name, hash],
+        )
+    } else {
+        db.execute(
+            "INSERT INTO users(name,password,admin) VALUES(?1,?2,0) ON CONFLICT(name) DO NOTHING",
+            params![name, hash],
+        )
+    };
+    match changed {
         Ok(1) => Ok(()),
         Ok(_) => Err(Code::Conflict),
         Err(_) => Err(Code::Internal),
@@ -271,6 +291,13 @@ pub fn admin_cookie(db: &Connection, member: &str, token: &str) -> Result<(), Co
         params![hash_secret(token), member],
     )
     .map_err(sql_code)?;
+    db.execute(
+        "DELETE FROM admin_sessions WHERE member=?1 AND token NOT IN (
+           SELECT token FROM admin_sessions WHERE member=?1 ORDER BY expires DESC, rowid DESC LIMIT 16
+         )",
+        [member],
+    )
+    .map_err(sql_code)?;
     Ok(())
 }
 
@@ -363,39 +390,21 @@ pub fn change_user(
     tx.commit().map_err(sql_code)
 }
 
-pub fn set_admin(
-    db: &mut Connection,
-    actor: &str,
-    member: &str,
-    admin: bool,
-) -> Result<(), Code> {
-    if !admin && actor == member {
-        return Err(Code::Invalid);
-    }
+pub fn reset_password(db: &mut Connection, member: &str, hash: &str) -> Result<(), Code> {
     let tx = db.transaction().map_err(sql_code)?;
     let n = tx
         .execute(
-            "UPDATE users SET admin=?2 WHERE name=?1 AND disabled=0",
-            params![member, admin],
+            "UPDATE users SET password=?2 WHERE name=?1 AND disabled=0",
+            params![member, hash],
         )
         .map_err(sql_code)?;
     if n != 1 {
         return Err(Code::Invalid);
     }
-    if !admin {
-        let remaining: i64 = tx
-            .query_row(
-                "SELECT count(*) FROM users WHERE admin=1 AND disabled=0",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(sql_code)?;
-        if remaining < 1 {
-            return Err(Code::Invalid);
-        }
-        tx.execute("DELETE FROM admin_sessions WHERE member=?1", [member])
-            .map_err(sql_code)?;
-    }
+    tx.execute("DELETE FROM admin_sessions WHERE member=?1", [member])
+        .map_err(sql_code)?;
+    tx.execute("UPDATE devices SET token=NULL WHERE member=?1", [member])
+        .map_err(sql_code)?;
     tx.commit().map_err(sql_code)
 }
 

@@ -21,7 +21,7 @@ fn main() {
                 "-swift-version",
                 "5",
                 "-target",
-                "arm64-apple-macos14.0",
+                "arm64-apple-macos15.0",
                 "-O",
                 "-whole-module-optimization",
                 "-parse-as-library",

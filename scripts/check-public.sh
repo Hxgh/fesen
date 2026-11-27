@@ -28,19 +28,19 @@ if [[ ${#files[@]} -gt 0 ]]; then
   fi
 fi
 
-# 3. If .env.local exists locally, ensure its private values do not appear in repo files.
+# 3. If .env.local exists locally, ensure none of its non-placeholder values appear in repo files.
 if [[ -f .env.local && ${#files[@]} -gt 0 ]]; then
   while IFS='=' read -r k v; do
-    case "$k" in
-      FESEN_LAB_TARGET_IP|FESEN_LAB_TARGET_NAME|FESEN_DOMAIN|FESEN_ORIGIN)
-        v="${v%$'\r'}"; v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
-        [[ -z "$v" || "$v" == *example.com* || "$v" == 198.51.100.* || "$v" == lab-http ]] && continue
-        if grep -InF -- "$v" "${files[@]}" 2>/dev/null; then
-          echo "ERROR: local value from .env.local ($k) leaked into repository files" >&2
-          failed=1
-        fi
-        ;;
+    [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    v="${v%$'\r'}"; v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+    [[ ${#v} -lt 5 ]] && continue
+    case "$v" in
+      *example.com*|192.0.2.*|198.51.100.*|203.0.113.*|127.0.0.1*|localhost*|lab-http|admin|true|false) continue ;;
     esac
+    if grep -InF -- "$v" "${files[@]}" 2>/dev/null; then
+      echo "ERROR: local value from .env.local ($k) leaked into repository files" >&2
+      failed=1
+    fi
   done < .env.local
 fi
 

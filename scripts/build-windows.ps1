@@ -15,6 +15,7 @@ try {
     Expand-Archive $Zip $Temp
     Copy-Item (Join-Path $Temp "wintun/bin/amd64/wintun.dll") (Join-Path $Stage "wintun.dll") -Force
     Copy-Item (Join-Path $Temp "wintun/LICENSE.txt") (Join-Path $Stage "Wintun-LICENSE.txt") -Force
+    $env:RUSTFLAGS = "-C target-cpu=x86-64-v2"
     cargo build --locked --release -p fesen-core --bin fesen-core --target $Target
     if ($LASTEXITCODE) { throw "Rust 核心构建失败" }
     Copy-Item "target/$Target/release/fesen-core.exe" (Join-Path $Stage "fesen-core-$Target.exe") -Force

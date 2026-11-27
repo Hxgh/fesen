@@ -1,5 +1,5 @@
 use crate::{
-    group::{App, Group},
+    group::{App, Group, PeerIp},
     store,
 };
 use axum::{
@@ -89,7 +89,7 @@ static ETAG_SETTINGS_JS: OnceLock<HeaderValue> = OnceLock::new();
 static ETAG_ADMIN_VIEW_JS: OnceLock<HeaderValue> = OnceLock::new();
 static ETAG_STYLE_CSS: OnceLock<HeaderValue> = OnceLock::new();
 
-pub fn router() -> Router<App> {
+pub fn router(https: bool) -> Router<App> {
     Router::new()
         .route(
             "/",
@@ -137,10 +137,12 @@ pub fn router() -> Router<App> {
         .route("/session", get(session))
         .route("/action", post(action))
         .layer(DefaultBodyLimit::max(4096))
-        .layer(middleware::from_fn(headers))
+        .layer(middleware::from_fn(move |req, next| {
+            headers(https, req, next)
+        }))
 }
 
-async fn headers(req: axum::extract::Request, next: Next) -> Response {
+async fn headers(https: bool, req: axum::extract::Request, next: Next) -> Response {
     let mut r = next.run(req).await;
     let headers = r.headers_mut();
     headers
@@ -160,6 +162,12 @@ async fn headers(req: axum::extract::Request, next: Next) -> Response {
             "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
         ),
     );
+    if https {
+        headers.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000"),
+        );
+    }
     r
 }
 
@@ -229,11 +237,14 @@ struct Login {
 
 async fn login(
     State(app): State<App>,
+    PeerIp(ip): PeerIp,
     headers: HeaderMap,
     Json(input): Json<Login>,
 ) -> Result<Response, Failure> {
     check(&headers, &app)?;
-    let hash = app.verify(&input.username, input.password, true).await?;
+    let hash = app
+        .verify_limited(ip, &input.username, input.password, true)
+        .await?;
     let g = app.inner.lock().unwrap();
     if store::login_hash(&g.db, &input.username, true).as_ref() != Some(&hash) {
         return Err(Code::Unauthorized.into());
@@ -271,36 +282,28 @@ async fn session(State(app): State<App>, headers: HeaderMap) -> Result<Response,
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Action {
-    Create {
-        username: String,
-        password: String,
-        #[serde(default)]
-        admin: bool,
-    },
+    Create { username: String, password: String },
     Reset { username: String, password: String },
     Enable { username: String, enabled: bool },
-    SetAdmin { username: String, admin: bool },
+    ChangePassword { current: String, password: String },
     Revoke { device: String },
     Logout,
 }
 
 async fn action(
     State(app): State<App>,
+    PeerIp(ip): PeerIp,
     headers: HeaderMap,
     Json(action): Json<Action>,
 ) -> Result<Response, Failure> {
     check(&headers, &app)?;
     let changed = match action {
-        Action::Create {
-            username,
-            password,
-            admin,
-        } => {
+        Action::Create { username, password } => {
             gate(&app.inner.lock().unwrap(), &headers)?;
             let hash = app.hash(password).await?;
             let g = app.inner.lock().unwrap();
             gate(&g, &headers)?;
-            store::create(&g.db, &username, &hash, admin)?;
+            store::create(&g.db, &username, &hash, false)?;
             false
         }
         Action::Reset { username, password } => {
@@ -319,11 +322,27 @@ async fn action(
             g.remove_member(&username);
             true
         }
-        Action::SetAdmin { username, admin } => {
-            let mut g = app.inner.lock().unwrap();
-            let actor = gate(&g, &headers)?;
-            store::set_admin(&mut g.db, &actor, &username, admin)?;
-            false
+        Action::ChangePassword { current, password } => {
+            let actor = gate(&app.inner.lock().unwrap(), &headers)?;
+            app.verify_limited(ip, &actor, current, true).await?;
+            let hash = app.hash(password).await?;
+            let token = {
+                let mut g = app.inner.lock().unwrap();
+                if gate(&g, &headers)? != actor {
+                    return Err(Code::Unauthorized.into());
+                }
+                store::reset_password(&mut g.db, &actor, &hash)?;
+                g.remove_member(&actor);
+                let token = store::secret();
+                store::admin_cookie(&g.db, &actor, &token)?;
+                token
+            };
+            app.changed();
+            return Ok((
+                [(header::SET_COOKIE, cookie(&app, &token, 43200))],
+                StatusCode::NO_CONTENT,
+            )
+                .into_response());
         }
         Action::Revoke { device } => {
             let mut g = app.inner.lock().unwrap();

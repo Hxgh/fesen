@@ -39,8 +39,10 @@ pnpm install --frozen-lockfile
 if [[ ! -x src-tauri/gen/android/gradlew ]]; then
   pnpm exec tauri android init --ci
 fi
-pnpm exec tauri icon native/mark.svg --output src-tauri/icons
-cp -R src-tauri/icons/android/. src-tauri/gen/android/app/src/main/res/
+icon_tmp="$(mktemp -d)"
+trap 'rm -rf "$icon_tmp"' EXIT
+pnpm exec tauri icon native/mark.svg --output "$icon_tmp"
+cp -R "$icon_tmp/android/." src-tauri/gen/android/app/src/main/res/
 rm -f src-tauri/gen/android/app/src/main/res/mipmap-*/ic_launcher_foreground.png \
   src-tauri/gen/android/app/src/main/res/drawable-v24/ic_launcher_foreground.xml \
   src-tauri/gen/android/app/src/main/res/drawable/ic_launcher_background.xml

@@ -2,6 +2,7 @@ use axum::Router;
 use axum_server::tls_rustls::{RustlsConfig, from_tcp_rustls};
 use std::{
     io,
+    net::SocketAddr,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
@@ -99,7 +100,7 @@ impl Tls {
     pub(super) async fn serve(self, listener: TcpListener, app: Router) -> io::Result<()> {
         let server = from_tcp_rustls(listener.into_std()?, self.config.clone())?;
         tokio::select! {
-            result = server.serve(app.into_make_service()) => result,
+            result = server.serve(app.into_make_service_with_connect_info::<SocketAddr>()) => result,
             () = self.watch() => unreachable!(),
         }
     }
@@ -206,6 +207,19 @@ mod tests {
         assert_eq!(
             client(&first).get(&health).send().await.unwrap().status(),
             StatusCode::OK
+        );
+        let admin_res = client(&first)
+            .get(format!("https://{address}/admin/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(admin_res.status(), StatusCode::OK);
+        assert_eq!(
+            admin_res
+                .headers()
+                .get(reqwest::header::STRICT_TRANSPORT_SECURITY)
+                .and_then(|v| v.to_str().ok()),
+            Some("max-age=31536000")
         );
         let stray = Client::builder()
             .no_proxy()

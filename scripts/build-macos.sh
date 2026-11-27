@@ -46,7 +46,7 @@ if ! $unsigned; then
   : "${FESEN_TUNNEL_PROFILE:?需要系统扩展的 Developer ID provisioning profile}"
 fi
 
-export MACOSX_DEPLOYMENT_TARGET=14.0
+export MACOSX_DEPLOYMENT_TARGET=15.0
 pnpm -C "$desk" install --frozen-lockfile
 "${build[@]}"
 CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP=none cargo build --locked -p fesen-core --lib --target "$t" --profile "$cargo_profile"
@@ -55,11 +55,11 @@ extension="$app/Contents/Library/SystemExtensions/io.fesen.client.tunnel.systeme
 mkdir -p "$extension/MacOS"
 cp "$tunnel/Info.plist" "$extension/Info.plist"
 plutil -replace NetworkExtension.NEMachServiceName -string "${FESEN_TEAM_ID:-UNSIGNED}.io.fesen.client.tunnel" "$extension/Info.plist"
-swiftc -target arm64-apple-macos14.0 -swift-version 5 -O -module-name FesenTunnel \
+swiftc -target arm64-apple-macos15.0 -swift-version 5 -O -module-name FesenTunnel \
   -import-objc-header "$tunnel/Core.h" "$tunnel/PhysicalNetwork.swift" "$tunnel/Tunnel.swift" "$tunnel/main.swift" \
   "$root/target/$t/$profile/libfesen_core.a" -framework NetworkExtension -framework Security \
   -framework SystemConfiguration -o "$extension/MacOS/FesenTunnel"
-swiftc -target arm64-apple-macos14.0 -swift-version 5 -O \
+swiftc -target arm64-apple-macos15.0 -swift-version 5 -O \
   "$desk/native/macos/Accessory.swift" "$desk/native/macos/MenuBarPreference.swift" "$desk/native/macos/Menu.swift" \
   -o "$app/Contents/MacOS/fesen-menu"
 mkdir -p "$app/Contents/Resources"
