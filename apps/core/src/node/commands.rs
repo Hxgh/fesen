@@ -29,17 +29,12 @@ impl Core {
         match command {
             Command::Status { ui } => {
                 if ui {
-                    let mut state = self.state.lock().unwrap();
-                    // An in-flight WebView poll cannot reattach a closed window.
-                    if state.ui_until.is_some() {
-                        state.ui_until = Some(Instant::now() + Duration::from_secs(16));
-                    }
+                    self.touch_ui();
                 }
                 return Ok(self.status());
             }
             Command::Attach => {
-                self.state.lock().unwrap().ui_until =
-                    Some(Instant::now() + Duration::from_secs(16));
+                self.state.lock().unwrap().ui_until = Some(Instant::now() + super::UI_LEASE);
                 return Ok(self.status());
             }
             Command::Detach => {
@@ -51,9 +46,12 @@ impl Core {
                 return Ok(self.status());
             }
             Command::TestConnection { id, ip, port } => {
+                self.touch_ui();
                 let outcome = self
                     .test_connection(&id, SocketAddrV4::new(ip, port))
-                    .await?;
+                    .await;
+                self.touch_ui();
+                let outcome = outcome?;
                 return Ok(Status {
                     http_status: outcome.http_status,
                     probe: Some(outcome),
@@ -61,9 +59,12 @@ impl Core {
                 });
             }
             Command::TestLocalSite { id, ip, port } => {
+                self.touch_ui();
                 let code = self
                     .test_local_site(&id, SocketAddrV4::new(ip, port))
-                    .await?;
+                    .await;
+                self.touch_ui();
+                let code = code?;
                 return Ok(Status {
                     http_status: Some(code),
                     ..self.status()
@@ -75,13 +76,17 @@ impl Core {
                 ports,
                 deep,
             } => {
-                let host_probe = self.probe_host(ip, &extra_ports, &ports, deep).await?;
+                self.touch_ui();
+                let host_probe = self.probe_host(ip, &extra_ports, &ports, deep).await;
+                self.touch_ui();
+                let host_probe = host_probe?;
                 return Ok(Status {
                     host_probe: Some(host_probe),
                     ..self.status()
                 });
             }
             Command::CancelProbeHost => {
+                self.touch_ui();
                 let token = self.probe_cancel.lock().unwrap().take();
                 if let Some(tok) = token {
                     tok.cancel();
@@ -90,6 +95,7 @@ impl Core {
                 return Ok(self.status());
             }
             Command::AdminSession => {
+                self.touch_ui();
                 let (server, token) = {
                     let state = self.state.lock().unwrap();
                     (
@@ -99,12 +105,14 @@ impl Core {
                 };
                 match admin_client::session(&*self.platform, &server, &token).await {
                     Ok(data) => {
+                        self.touch_ui();
                         return Ok(Status {
                             admin_data: Some(data),
                             ..self.status()
                         });
                     }
                     Err(e) => {
+                        self.touch_ui();
                         if e == Code::Unauthorized {
                             self.state.lock().unwrap().admin_token = None;
                             self.bump_status();
@@ -114,6 +122,7 @@ impl Core {
                 }
             }
             Command::AdminAction { action } => {
+                self.touch_ui();
                 let (server, token) = {
                     let state = self.state.lock().unwrap();
                     (
@@ -127,6 +136,7 @@ impl Core {
                 );
                 match admin_client::action(&*self.platform, &server, &token, &action).await {
                     Ok(()) => {
+                        self.touch_ui();
                         if clears_session {
                             self.state.lock().unwrap().admin_token = None;
                             self.bump_status();
@@ -134,6 +144,7 @@ impl Core {
                         return Ok(self.status());
                     }
                     Err(e) => {
+                        self.touch_ui();
                         if e == Code::Unauthorized {
                             self.state.lock().unwrap().admin_token = None;
                             self.bump_status();
@@ -147,6 +158,7 @@ impl Core {
                 auto_share,
                 cloud_backup,
             } => {
+                self.touch_ui();
                 self.edit(|local| {
                     if let Some(v) = auto_connect {
                         local.auto_connect = v;
@@ -169,6 +181,7 @@ impl Core {
                 return Ok(self.status());
             }
             Command::SuggestLocalPort { preferred } => {
+                self.touch_ui();
                 let used: HashSet<u16> = {
                     let state = self.state.lock().unwrap();
                     state.local.forwards().iter().map(|f| f.local_port).collect()
@@ -180,17 +193,20 @@ impl Core {
                 });
             }
             Command::DismissRestore => {
+                self.touch_ui();
                 self.state.lock().unwrap().dismissed_restore = true;
                 self.bump_status();
                 return Ok(self.status());
             }
             _ => {}
         }
+        self.touch_ui();
         let _lock = self.operations.lock().await;
         if self.quit.is_cancelled() {
             return Err(Code::NotConnected);
         }
         let result = self.change(command).await;
+        self.touch_ui();
         if let Err(code) = result {
             self.report(code);
             return Err(code);

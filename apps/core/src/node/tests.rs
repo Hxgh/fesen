@@ -227,6 +227,23 @@ async fn detached_idle_core_shuts_down_and_releases_loopback_ipc() {
 }
 
 #[tokio::test]
+async fn connected_keep_access_core_survives_detach_and_stops_after_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::new(dir.path().to_path_buf(), Arc::new(LocalPlatform), true).unwrap();
+    core.state.lock().unwrap().wanted = true;
+    core.execute(Command::Detach).await.unwrap();
+    assert!(core.status().background);
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    assert!(!core.quit.is_cancelled());
+
+    core.execute(Command::Stop).await.unwrap();
+    assert!(!core.status().background);
+    timeout(Duration::from_secs(4), core.wait_stopped())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn save_host_merges_ports_propagates_os_and_enforces_boundaries() {
     let dir = tempfile::tempdir().unwrap();
     let core = Core::new(dir.path().to_path_buf(), Arc::new(LocalPlatform), false).unwrap();

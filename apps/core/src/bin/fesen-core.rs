@@ -19,7 +19,7 @@ async fn main() -> anyhow::Result<()> {
     let dir = data_dir()?;
     let endpoint = Endpoint::bind(&dir).await?;
     let p = Windows::new(dll);
-    let core = Core::new(dir, Arc::new(p), false)?;
+    let core = Core::new(dir, Arc::new(p), true)?;
     tokio::join!(
         endpoint.serve(core.clone()),
         tray(core, binary.with_file_name("fesen.exe"))

@@ -1260,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "fesen"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fesen-core",
  "jni",
@@ -1277,14 +1277,14 @@ dependencies = [
 
 [[package]]
 name = "fesen-acl"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "fesen-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "fesen-acl",
@@ -1318,7 +1318,7 @@ dependencies = [
 
 [[package]]
 name = "fesen-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fesen-acl",
  "serde",

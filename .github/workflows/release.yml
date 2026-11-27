@@ -186,18 +186,25 @@ jobs:
             export FESEN_HOST_PROFILE="$host_profile"
             export FESEN_TUNNEL_PROFILE="$tunnel_profile"
             bash scripts/build-macos.sh
-            out_zip="dist-release/${REPO}_${VERSION}_macos-arm64.zip"
-            ditto -c -k --sequesterRsrc --keepParent "$app_path" "$out_zip"
             if [[ -n "$APPLE_ID" && -n "$APPLE_APP_PASSWORD" ]]; then
-              xcrun notarytool submit "$out_zip" --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+              notary_zip="$RUNNER_TEMP/fesen-notary.zip"
+              ditto -c -k --sequesterRsrc --keepParent "$app_path" "$notary_zip"
+              xcrun notarytool submit "$notary_zip" --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
               xcrun stapler staple "$app_path"
-              rm -f "$out_zip"
-              ditto -c -k --sequesterRsrc --keepParent "$app_path" "$out_zip"
+              rm -f "$notary_zip"
             fi
+            dmg_out="dist-release/${REPO}_${VERSION}_macos-arm64.dmg"
           else
             bash scripts/build-macos.sh --unsigned
-            ditto -c -k --sequesterRsrc --keepParent "$app_path" "dist-release/${REPO}_${VERSION}_macos-arm64-unsigned.zip"
+            dmg_out="dist-release/${REPO}_${VERSION}_macos-arm64-unsigned.dmg"
           fi
+          dmg_stage="$RUNNER_TEMP/dmg-stage"
+          rm -rf "$dmg_stage" "$dmg_out"
+          mkdir -p "$dmg_stage"
+          ditto "$app_path" "$dmg_stage/Fesen.app"
+          ln -s /Applications "$dmg_stage/Applications"
+          hdiutil create -volname "Fesen" -srcfolder "$dmg_stage" -ov -format UDZO "$dmg_out"
+          rm -rf "$dmg_stage"
       - name: Cleanup temporary keychain
         if: always()
         run: |
@@ -296,6 +303,8 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build & push multi-arch server image
         uses: docker/build-push-action@v7
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
         with:
           context: .
           file: deploy/Dockerfile
@@ -322,6 +331,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
+          pattern: release-*
           path: release-assets
           merge-multiple: true
       - name: Generate checksums & release body
@@ -346,7 +356,7 @@ jobs:
             "### Downloads" \
             "" \
             "- **Windows 10/11 (x64)**: \`*-windows-x64-setup.exe\`" \
-            "- **macOS 15+ (Apple Silicon)**: \`*-macos-arm64*.zip\`" \
+            "- **macOS 15+ (Apple Silicon)**: \`*-macos-arm64*.dmg\`" \
             "- **Android 13+ (ARM64)**: \`*-android-arm64*.apk\`" \
             "" \
             "Verify checksums against \`SHA256SUMS.txt\`." \

@@ -39,7 +39,7 @@ fn serve_publisher() -> io::Result<()> {
     let result = runtime.block_on(async {
         let endpoint = ipc::Endpoint::bind(&dir).await?;
         let host = Arc::new(Apple::new(None));
-        let core = Core::new(dir, host.clone(), false)?;
+        let core = Core::new(dir, host.clone(), true)?;
         PUBLISHER
             .set(Publisher {
                 host,
@@ -109,7 +109,7 @@ pub unsafe extern "C" fn ph_core_start(
     };
     let core = {
         let _enter = runtime.enter();
-        match Core::new(PathBuf::from(path), host.clone(), false) {
+        match Core::new(PathBuf::from(path), host.clone(), true) {
             Ok(core) => core,
             Err(_) => return std::ptr::null_mut(),
         }

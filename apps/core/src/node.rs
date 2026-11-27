@@ -34,6 +34,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use types::{ForwardHandle, ForwardKey, State};
 
+pub(super) const UI_LEASE: Duration = Duration::from_secs(60);
+
 pub struct Core {
     dir: PathBuf,
     device_info: DeviceInfo,
@@ -86,7 +88,7 @@ impl Core {
                 wanted: false,
                 restore_pending: false,
                 auto_share_blocked: false,
-                ui_until: Some(Instant::now() + Duration::from_secs(20)),
+                ui_until: Some(Instant::now() + UI_LEASE),
                 error: None,
                 is_admin: false,
                 admin_token: None,
@@ -174,13 +176,20 @@ impl Core {
         (tag, online, background)
     }
 
+    pub(super) fn touch_ui(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.ui_until.is_some() {
+            state.ui_until = Some(Instant::now() + UI_LEASE);
+        }
+    }
+
     pub(crate) fn poll_status(&self, ui: bool, since: u64) -> Result<Option<Status>, Code> {
         if self.quit.is_cancelled() {
             return Err(Code::NotConnected);
         }
         let mut state = self.state.lock().unwrap();
         if ui && state.ui_until.is_some() {
-            state.ui_until = Some(Instant::now() + Duration::from_secs(16));
+            state.ui_until = Some(Instant::now() + UI_LEASE);
         }
         let (tag, online, background) = self.status_tag(&state);
         if since != 0 && since == tag {

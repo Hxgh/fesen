@@ -74,7 +74,9 @@ fn notify_menu_status(reply: &Result<Value, String>) {
             if val.get("unchanged").and_then(Value::as_bool) == Some(true) {
                 return;
             }
-            let data = &val["data"];
+            let Some(data) = val.get("data").filter(|v| v.is_object()) else {
+                return;
+            };
             if data["online"].as_bool() == Some(true) {
                 2
             } else if data["running"].as_bool() == Some(true) {

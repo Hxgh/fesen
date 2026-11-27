@@ -53,7 +53,7 @@ if [[ -f .env.local && ${#files[@]} -gt 0 ]]; then
     v="${v%$'\r'}"; v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
     [[ ${#v} -lt 5 ]] && continue
     case "$v" in
-      *example.com*|192.0.2.*|198.51.100.*|203.0.113.*|127.0.0.1*|localhost*|lab-http|admin|true|false) continue ;;
+      *example.com*|192.0.2.*|198.51.100.*|203.0.113.*|127.0.0.1*|localhost*|lab-http|admin|fesen|true|false) continue ;;
     esac
     if grep -InF -- "$v" "${files[@]}" 2>/dev/null; then
       echo "ERROR: local value from .env.local ($k) leaked into repository files" >&2
