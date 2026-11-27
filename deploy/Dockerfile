@@ -4,7 +4,7 @@ ARG BUILDARCH
 WORKDIR /src
 RUN if [ "$TARGETARCH" != "$BUILDARCH" ]; then \
       apt-get update && apt-get install -y --no-install-recommends \
-        $([ "$TARGETARCH" = "arm64" ] && echo "gcc-aarch64-linux-gnu" || echo "gcc-x86-64-linux-gnu") \
+        $([ "$TARGETARCH" = "arm64" ] && echo "gcc-aarch64-linux-gnu libc6-dev-arm64-cross" || echo "gcc-x86-64-linux-gnu libc6-dev-amd64-cross") \
       && rm -rf /var/lib/apt/lists/*; \
       rustup target add $([ "$TARGETARCH" = "arm64" ] && echo "aarch64-unknown-linux-gnu" || echo "x86_64-unknown-linux-gnu"); \
     fi
