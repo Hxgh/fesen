@@ -60,6 +60,15 @@ async fn call(_app: &tauri::AppHandle, request: Value, launch: bool) -> Result<V
 }
 
 #[cfg(target_os = "android")]
+#[tauri::command]
+async fn add_quick_tile(window: tauri::Webview, app: tauri::AppHandle) -> Result<String, String> {
+    if window.label() != "main" {
+        return Err("unauthorized".into());
+    }
+    tauri_plugin_fesen::add_tile(&app).await
+}
+
+#[cfg(target_os = "android")]
 async fn call(app: &tauri::AppHandle, request: Value, launch: bool) -> Result<Value, String> {
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -151,7 +160,15 @@ pub fn run() {
         open_extension_settings,
         menu_bar_setting
     ]);
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "android")]
+    let app = app.invoke_handler(tauri::generate_handler![
+        core_command,
+        site::open_site,
+        site::site_view,
+        site::service_action,
+        add_quick_tile
+    ]);
+    #[cfg(not(any(target_os = "macos", target_os = "android")))]
     let app = app.invoke_handler(tauri::generate_handler![
         core_command,
         site::open_site,
@@ -160,9 +177,10 @@ pub fn run() {
     ]);
     #[cfg(target_os = "macos")]
     let app = app.setup(|app| {
-        macos::close_tray();
         if macos::menu_bar_setting(None).unwrap_or(true) {
             macos::tray();
+        } else {
+            macos::close_tray();
         }
         if let Some(window) = app.get_webview_window("main") {
             macos::configure_window(&window);

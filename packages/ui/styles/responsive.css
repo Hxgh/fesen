@@ -19,14 +19,13 @@
 }
 
 @media (max-width: 640px) {
-  :root { --pad-card-x: 12px; }
+  :root { --pad-card-x: 12px; --gutter: 12px; }
   :root[data-scale="sm"] { --pad-card-x: 10px; }
   :root[data-scale="lg"] { --pad-card-x: 14px; }
   .wrap { width: calc(100% - 24px); }
   .topbar-inner { min-height: 50px; }
   .topbar .button { height: var(--btn-lg); }
   .host { display: none; }
-  .workspace { padding-top: 14px; }
   .panel-bar { gap: 8px; }
   .tabs { gap: 12px; }
   .tabs button { min-height: calc(var(--ctl-input) - 2px); font-size: var(--fs-md); }

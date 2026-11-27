@@ -235,24 +235,18 @@ export function updateServicesFlow(data: Status) {
 
   // Build collapse targets (device & host cards; keep account headers expanded during batch collapse)
   const itemKeys: string[] = [];
-  if (localShares.length >= 2) {
+  if (localShares.length >= 1) {
     itemKeys.push("dev:local");
-    const singleLocalIp = localEntries.length === 1 && localEntries[0]!.grouped && localEntries[0]!.items.length >= 2;
-    if (!singleLocalIp) {
-      for (const entry of localEntries) {
-        if (entry.grouped && entry.items.length >= 2) itemKeys.push(`lhost:${entry.ip}`);
-      }
+    for (const entry of localEntries) {
+      if (entry.grouped && entry.items.length >= 2) itemKeys.push(`lhost:${entry.ip}`);
     }
   }
   for (const acct of remoteAccounts) {
     for (const bucket of acct.buckets) {
-      if (bucket.items.length >= 2) {
+      if (bucket.items.length >= 1) {
         itemKeys.push(`dev:${bucket.owner}`);
-        const isSingleIpCard = bucket.entries.length === 1 && bucket.entries[0]!.grouped && bucket.entries[0]!.items.length >= 2;
-        if (!isSingleIpCard) {
-          for (const entry of bucket.entries) {
-            if (entry.grouped && entry.items.length >= 2) itemKeys.push(`rhost:${bucket.owner}:${entry.ip}`);
-          }
+        for (const entry of bucket.entries) {
+          if (entry.grouped && entry.items.length >= 2) itemKeys.push(`rhost:${bucket.owner}:${entry.ip}`);
         }
       }
     }
@@ -351,10 +345,12 @@ export function updateServicesFlow(data: Status) {
         el("span", "count", String(totalSelfServices)),
       ),
     );
-    const bodyChildren: HTMLElement[] = [
-      ...(hasLocal ? [renderLocalBucket(localShares, localEntries, data, false, searching)] : []),
-      ...selfRemoteBuckets.map((bucket) => renderDeviceBucket(bucket, data, routing, false, searching)),
-    ];
+    const localActive = localShares.some((s) => data.active.includes(s.id));
+    const localBucket = hasLocal ? [renderLocalBucket(localShares, localEntries, data, false, searching)] : [];
+    const remoteBuckets = selfRemoteBuckets.map((bucket) => renderDeviceBucket(bucket, data, routing, false, searching));
+    const bodyChildren: HTMLElement[] = localActive
+      ? [...localBucket, ...remoteBuckets]
+      : [...remoteBuckets, ...localBucket];
     const body = el("div", "account-body", ...bodyChildren);
     body.hidden = !acctExpanded;
     listNodes.push(el("div", "account-group", head, body));

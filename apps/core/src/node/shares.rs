@@ -298,6 +298,7 @@ impl Core {
     pub(super) async fn save_host(&self, update: HostUpdate) -> Result<(), Code> {
         let HostUpdate {
             ip,
+            old_ip,
             name,
             host_os,
             services,
@@ -310,6 +311,9 @@ impl Core {
         }
         let ip_text = ip.to_string();
         Rules::parse(&ip_text, "80").map_err(|_| Code::Invalid)?;
+        let source_ip = old_ip.unwrap_or(ip);
+        let migrating_ip = source_ip != ip;
+        let source_ip_text = source_ip.to_string();
         let label = {
             let trimmed = name.trim();
             if trimmed.is_empty() {
@@ -340,10 +344,19 @@ impl Core {
 
         let (remove_ids, stop_before_update_ids) = {
             let state = self.state.lock().unwrap();
+            if migrating_ip
+                && state
+                    .local
+                    .shares()
+                    .iter()
+                    .any(|s| s.single_ip() == Some(ip))
+            {
+                return Err(Code::Conflict);
+            }
             let mut remove_ids = Vec::new();
             let mut stop_ids = Vec::new();
             for share in state.local.shares() {
-                if share.single_ip() != Some(ip) {
+                if share.single_ip() != Some(source_ip) {
                     continue;
                 }
                 let [port] = share.rules.ports.as_slice() else {
@@ -357,6 +370,7 @@ impl Core {
                     None if replace => remove_ids.push(share.id.clone()),
                     Some(svc) if state.sharing.contains_key(&share.id) => {
                         let rename = !replace
+                            || share.name == source_ip_text
                             || share.name == ip_text
                             || old_name_cmp.as_ref().is_some_and(|old| &share.name == old);
                         let next_name = if rename { &label } else { &share.name };
@@ -365,7 +379,8 @@ impl Core {
                         } else {
                             None
                         };
-                        if next_name != &share.name
+                        if migrating_ip
+                            || next_name != &share.name
                             || share.effective_kind() != svc.kind
                             || share.host_os != next_os
                         {
@@ -385,6 +400,15 @@ impl Core {
 
         let (publish_ids, republish_ids) = {
             let mut state = self.state.lock().unwrap();
+            if migrating_ip
+                && state
+                    .local
+                    .shares()
+                    .iter()
+                    .any(|s| s.single_ip() == Some(ip))
+            {
+                return Err(Code::Conflict);
+            }
             let remove_set: HashSet<&str> = remove_ids.iter().map(String::as_str).collect();
             let stop_set: HashSet<&str> =
                 stop_before_update_ids.iter().map(String::as_str).collect();
@@ -402,14 +426,19 @@ impl Core {
                 }
                 for svc in &services {
                     let existing = shares.iter_mut().find(|s| {
-                        s.single_ip() == Some(ip)
+                        s.single_ip() == Some(source_ip)
                             && matches!(
                                 s.rules.ports.as_slice(),
                                 [p] if p.start == svc.port && p.end == svc.port
                             )
                     });
                     if let Some(share) = existing {
+                        if migrating_ip {
+                            share.rules = Rules::parse(&ip_text, &svc.port.to_string())
+                                .map_err(|_| Code::Invalid)?;
+                        }
                         let rename = !replace
+                            || share.name == source_ip_text
                             || share.name == ip_text
                             || old_name_cmp.as_ref().is_some_and(|old| &share.name == old);
                         if rename {
@@ -451,6 +480,9 @@ impl Core {
                     return Err(Code::Limit);
                 }
                 shares.extend(new_entries);
+                if migrating_ip {
+                    normalize_ip_host_os(shares, source_ip);
+                }
                 normalize_ip_host_os(shares, ip);
             }
             next.save(&self.dir)?;

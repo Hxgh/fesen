@@ -59,9 +59,11 @@ swiftc -target arm64-apple-macos15.0 -swift-version 5 -O -module-name FesenTunne
   -import-objc-header "$tunnel/Core.h" "$tunnel/PhysicalNetwork.swift" "$tunnel/Tunnel.swift" "$tunnel/main.swift" \
   "$root/target/$t/$profile/libfesen_core.a" -framework NetworkExtension -framework Security \
   -framework SystemConfiguration -o "$extension/MacOS/FesenTunnel"
-swiftc -target arm64-apple-macos15.0 -swift-version 5 -O \
+swiftc -target arm64-apple-macos15.0 -swift-version 5 -O -module-name FesenMenu \
+  -import-objc-header "$tunnel/Core.h" "$tunnel/PhysicalNetwork.swift" \
   "$desk/native/macos/Accessory.swift" "$desk/native/macos/MenuBarPreference.swift" "$desk/native/macos/Menu.swift" \
-  -o "$app/Contents/MacOS/fesen-menu"
+  "$root/target/$t/$profile/libfesen_core.a" -framework Network -framework Security \
+  -framework SystemConfiguration -o "$app/Contents/MacOS/fesen-menu"
 mkdir -p "$app/Contents/Resources"
 cp -R "$desk/native/macos/zh-Hans.lproj" "$desk/native/macos/en.lproj" "$app/Contents/Resources/"
 plutil -replace LSHasLocalizedDisplayName -bool true "$app/Contents/Info.plist"

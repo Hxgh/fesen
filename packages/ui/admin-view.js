@@ -1,13 +1,11 @@
-import { createIconButton, osBadge } from "./icons.js";
+import { createIconButton, osBadge, targetOsPill } from "./icons.js";
 import { closePopoverMenu, openPopoverMenu } from "./popover.js";
 import {
-  deviceOsLabel,
   effectiveKind,
   formatEndpoint,
   formatRanges,
   groupByHost,
   meaningfulHostName,
-  osLabel,
   resolveHostOs,
   singleIp,
 } from "./host-card.js";
@@ -143,7 +141,7 @@ export function createAdminWorkspace(opts) {
 
   function openActionDialog(command, subject = "") {
     const key = command.op === "enable" && !command.enabled ? "disable" : command.op;
-    const danger = key === "disable" || key === "revoke";
+    const danger = key === "disable" || key === "revoke" || key === "remove_device";
     const needsUser = key === "create";
     const needsCurrent = key === "change_password";
     const needsPass = key === "create" || key === "reset" || key === "change_password";
@@ -284,14 +282,14 @@ export function createAdminWorkspace(opts) {
     const isSelfAccount = !!(currentMember && s.member === currentMember);
     const parts = [];
     if (clean) parts.push(el("span", "service-name", clean));
-    if (isLocal) {
-      parts.push(el("span", "source-tag self", t("badge_local")));
-    }
     if (s.member) {
       parts.push(el("span", isSelfAccount ? "source-tag self" : "source-tag", s.member));
     }
     if (s.device) {
       parts.push(el("span", "service-name", s.device));
+    }
+    if (isLocal) {
+      parts.push(el("span", "local-tag", t("badge_local")));
     }
     return { isLocal, isSelfAccount, parts };
   }
@@ -313,19 +311,15 @@ export function createAdminWorkspace(opts) {
         const kind = effectiveKind(s);
         const os = resolveHostOs([s]);
         const ip = singleIp(s);
-        const leadOs = os || s.device_os || null;
         const clean = ip ? meaningfulHostName(s.name, ip, os) : s.name;
-        const { isLocal, isSelfAccount, parts } = buildServiceMeta(s, clean, ctx);
-        const localPrefix = isLocal ? (isSelfAccount ? `${t("badge_local")} · ${t("source_self")}` : t("badge_local")) : "";
-        const osTag = osBadge(leadOs, { fallback: "server", local: isLocal, prefix: localPrefix });
-        const title = el("div", "host-title-line", ...(osTag ? [osTag] : []), el("p", "endpoint", formatEndpoint(s.rules, isZh())));
+        const { parts } = buildServiceMeta(s, clean, ctx);
+        const hostOsTag = targetOsPill(os);
+        const title = el("div", "host-title-line", el("p", "endpoint", formatEndpoint(s.rules, isZh())));
+        if (hostOsTag) title.append(hostOsTag);
         if (kind !== "tcp") title.append(el("span", "proto-tag", kind.toUpperCase()));
-        const devTag = os && s.device_os && deviceOsLabel(s.device_os) !== osLabel(os) ? osBadge(s.device_os) : null;
         const metaNodes = [];
-        if (parts.length || devTag) {
-          const metaLine = appendMetaWithSeps(el("div", "service-meta"), parts);
-          if (devTag) metaLine.append(devTag);
-          metaNodes.push(metaLine);
+        if (parts.length) {
+          metaNodes.push(appendMetaWithSeps(el("div", "service-meta"), parts));
         }
         const main = el("div", "service-main", title, ...metaNodes);
         wrap.append(el("article", "service-row", main, el("span", "state-dot good", t("broadcasting"))));
@@ -333,18 +327,13 @@ export function createAdminWorkspace(opts) {
       }
       const os = resolveHostOs(entry.items);
       const first = entry.items[0];
-      const leadOs = os || first.device_os || null;
       const clean = meaningfulHostName(first.name, entry.ip, os);
-      const { isLocal, isSelfAccount, parts } = buildServiceMeta(first, clean, ctx);
-      const localPrefix = isLocal ? (isSelfAccount ? `${t("badge_local")} · ${t("source_self")}` : t("badge_local")) : "";
-      const osTag = osBadge(leadOs, { fallback: "server", local: isLocal, prefix: localPrefix });
-      const title = el("div", "host-title-line", ...(osTag ? [osTag] : []), el("p", "endpoint", entry.ip));
-      const devTag = os && first.device_os && deviceOsLabel(first.device_os) !== osLabel(os) ? osBadge(first.device_os) : null;
+      const { parts } = buildServiceMeta(first, clean, ctx);
+      const hostOsTag = targetOsPill(os);
+      const title = el("div", "host-title-line", el("p", "endpoint", entry.ip), ...(hostOsTag ? [hostOsTag] : []));
       const subNodes = [];
-      if (parts.length || devTag) {
-        const metaLine = appendMetaWithSeps(el("div", "service-meta"), parts);
-        if (devTag) metaLine.append(devTag);
-        subNodes.push(metaLine);
+      if (parts.length) {
+        subNodes.push(appendMetaWithSeps(el("div", "service-meta"), parts));
       }
       const head = el("div", "host-head",
         el("div", "host-info", title, ...subNodes),
@@ -505,9 +494,11 @@ export function createAdminWorkspace(opts) {
             d.label,
             d.revoked ? "revoked" : d.online ? "online_state" : "offline_state",
             d.revoked ? "bad" : d.online ? "good" : "",
-            d.revoked || local ? [] : [
-              { icon: "close", label: t("revoke"), danger: true, onSelect: () => openActionDialog({ op: "revoke", device: d.id }, d.label) },
-            ],
+            d.revoked
+              ? [{ icon: "close", label: t("remove_device"), danger: true, onSelect: () => openActionDialog({ op: "remove_device", device: d.id }, d.label) }]
+              : local
+                ? []
+                : [{ icon: "close", label: t("revoke"), danger: true, onSelect: () => openActionDialog({ op: "revoke", device: d.id }, d.label) }],
             {
               metaNodes,
               osType: d.os || null,

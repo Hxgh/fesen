@@ -349,9 +349,14 @@ impl Core {
                 &session.member,
             )
             .await;
-        if res == Err(Code::Unauthorized) {
+        if matches!(res, Err(Code::Unauthorized | Code::DeviceRevoked)) {
+            let member = session.member.clone();
+            let drop_identity = res == Err(Code::DeviceRevoked);
             self.edit(|l| {
                 l.session = None;
+                if drop_identity {
+                    l.identities.remove(&member);
+                }
                 Ok(())
             })?;
             self.disconnect(false);
@@ -360,7 +365,7 @@ impl Core {
     }
 
     async fn connect(self: &Arc<Self>, credential: Credential, member: &str) -> Result<(), Code> {
-        let (address, identity, net) = {
+        let (address, existing_identity, net) = {
             let s = self.state.lock().unwrap();
             (
                 origin(&s.local.server)?,
@@ -368,10 +373,25 @@ impl Core {
                 s.network.clone(),
             )
         };
-        let identity = identity.map_or_else(Identity::new, Ok)?;
-        let session = tokio::select! {
+        let had_existing = existing_identity.is_some();
+        let mut identity = existing_identity.map_or_else(Identity::new, Ok)?;
+        let session = match tokio::select! {
             _ = self.quit.cancelled() => return Err(Code::NotConnected),
-            res = Session::connect(&*self.platform, &address, identity.clone(), credential, self.quit.child_token()) => res?,
+            res = Session::connect(&*self.platform, &address, identity.clone(), credential.clone(), self.quit.child_token()) => res,
+        } {
+            Ok(session) => session,
+            Err(Code::DeviceRevoked)
+                if had_existing && matches!(credential, Credential::Password { .. }) =>
+            {
+                // Password verified on server, only the old stored device cert was revoked:
+                // rotate to a fresh device certificate automatically instead of stranding the user.
+                identity = Identity::new()?;
+                tokio::select! {
+                    _ = self.quit.cancelled() => return Err(Code::NotConnected),
+                    res = Session::connect(&*self.platform, &address, identity.clone(), credential, self.quit.child_token()) => res?,
+                }
+            }
+            Err(err) => return Err(err),
         };
         {
             let mut state = self.state.lock().unwrap();
@@ -443,9 +463,13 @@ impl Core {
         for (_, r) in state.sharing.drain() {
             r.cancel.cancel();
         }
-        if error == Some(Code::Unauthorized) {
+        if matches!(error, Some(Code::Unauthorized | Code::DeviceRevoked)) {
             state.wanted = false;
-            state.local.session = None;
+            if let Some(session) = state.local.session.take()
+                && error == Some(Code::DeviceRevoked)
+            {
+                state.local.identities.remove(&session.member);
+            }
             let _ = state.local.save(&self.dir);
         }
         drop(state);
@@ -498,7 +522,7 @@ impl Core {
         let mut rx = self.changes.subscribe();
         let mut applied = Tun::default();
         loop {
-            let (network, view, labels, control, wanted) = {
+            let (network, view, labels, control, wanted, local_shares) = {
                 let s = self.state.lock().unwrap();
                 (
                     s.network.clone(),
@@ -506,6 +530,10 @@ impl Core {
                     s.local.labels().to_vec(),
                     s.link.as_ref().map(|l| l.server_ip),
                     s.wanted,
+                    s.sharing
+                        .values()
+                        .flat_map(|sh| sh.publication.rules.ips.iter().copied())
+                        .collect::<Vec<_>>(),
                 )
             };
             if self.quit.is_cancelled() {
@@ -520,6 +548,7 @@ impl Core {
                     &labels,
                     control,
                     wanted && self.platform.keep_empty_tun(),
+                    &local_shares,
                 )
             };
             let mut next = match result {

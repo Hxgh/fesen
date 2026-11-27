@@ -46,25 +46,46 @@
 }
 .feedback.error { color: var(--bad); background: var(--bad-bg); border-color: var(--bad); }
 
+html:has(dialog[open]),
+body:has(dialog[open]),
+body:has(dialog[open]) .service-flow,
+body:has(dialog[open]) .panel-body,
+body:has(dialog[open]) #content {
+  overflow: hidden;
+}
 dialog {
   width: min(calc(100% - 32px), 420px);
   max-height: calc(100dvh - 32px);
   margin: auto;
   padding: 0;
-  overflow: auto;
+  overflow: hidden;
+  overscroll-behavior: contain;
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
   background: var(--surface);
   color: var(--ink);
   box-shadow: var(--shadow-lg);
 }
-dialog[open] { animation: fesen-dialog-in 160ms var(--ease) both; }
+dialog[open] {
+  display: flex;
+  flex-direction: column;
+  animation: fesen-dialog-in 160ms var(--ease) both;
+}
+dialog > form {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
 dialog::backdrop {
   background: var(--scrim);
-  backdrop-filter: blur(4px);
-  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  touch-action: none;
 }
 .dialog-header {
+  flex: none;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -80,11 +101,61 @@ dialog::backdrop {
   overflow-wrap: anywhere;
 }
 .dialog-body {
+  flex: 1;
+  min-height: 0;
   display: grid;
+  align-content: start;
   min-width: 0;
-  gap: 14px;
+  gap: 12px;
   padding: 16px 18px;
   overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.confirm-card {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--track);
+}
+.confirm-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+.confirm-addr {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-base);
+  font-weight: 600;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.confirm-name {
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.confirm-ports {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.confirm-port {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: 5px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-sm);
+  font-weight: 560;
+  color: var(--ink);
 }
 .check-row {
   display: flex;
@@ -102,6 +173,7 @@ dialog::backdrop {
   accent-color: var(--action);
 }
 .dialog-footer {
+  flex: none;
   display: flex;
   align-items: center;
   justify-content: flex-end;
@@ -377,6 +449,42 @@ dialog::backdrop {
   width: var(--os-ico);
   height: var(--os-ico);
   display: block;
+}
+.target-os-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: calc(var(--count-h) - 1px);
+  padding: 0 6px;
+  border-radius: 4px;
+  background: var(--soft);
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  font-weight: 540;
+  line-height: 1;
+  white-space: nowrap;
+  flex: none;
+}
+.target-os-pill .os-icon {
+  width: 11px;
+  height: 11px;
+  display: block;
+  flex: none;
+}
+.local-tag {
+  display: inline-flex;
+  align-items: center;
+  height: calc(var(--count-h) - 1px);
+  padding: 0 6px;
+  border-radius: 4px;
+  border: 1px solid color-mix(in srgb, var(--accent) 36%, var(--line));
+  background: var(--tint);
+  color: var(--accent-ink);
+  font-size: var(--fs-xs);
+  font-weight: 560;
+  line-height: 1;
+  white-space: nowrap;
+  flex: none;
 }
 .proto-tag {
   display: inline-flex;

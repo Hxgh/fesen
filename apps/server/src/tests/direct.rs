@@ -708,18 +708,30 @@ async fn http_admin_direct_tcp_and_revocation() {
     closed(b).await;
     eventually(|| {
         bob.status().member.is_none()
+            && bob.status().error == Some(Code::DeviceRevoked)
             && !reader.status().services.iter().any(|s| s.service.id == id2)
     })
     .await;
+    // Wrong password still rejected; valid password automatically rotates to a new cert.
     assert!(matches!(
         bob.execute(Command::Login {
             username: "bob".into(),
-            password: PASSWORD.into(),
+            password: "wrong-password-1".into(),
             label: "bob".into()
         })
         .await,
         Err(Code::Unauthorized)
     ));
+    let relogged = bob
+        .execute(Command::Login {
+            username: "bob".into(),
+            password: PASSWORD.into(),
+            label: "bob".into(),
+        })
+        .await
+        .unwrap();
+    assert_ne!(relogged.device_id.as_deref(), bob_id.as_str());
+    bob.execute(Command::Logout).await.unwrap();
 
     alice
         .execute(Command::Share {
@@ -999,6 +1011,7 @@ async fn lab_host_discovery_and_quic_tunnel() {
     let saved = publisher
         .execute(Command::SaveHost {
             ip: target_ip,
+            old_ip: None,
             name: "LabHost".into(),
             host_os: probed.host_os,
             services: chosen,

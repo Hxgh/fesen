@@ -28,6 +28,7 @@ pub enum Code {
     DirectFailed,
     Conflict,
     Unauthorized,
+    DeviceRevoked,
     TargetTimeout,
     TargetUnavailable,
     HttpInvalid,
@@ -47,6 +48,7 @@ impl fmt::Display for Code {
             Self::DirectFailed => "无法直连",
             Self::Conflict => "地址冲突",
             Self::Unauthorized => "未授权",
+            Self::DeviceRevoked => "此设备已被撤销，请重新登录",
             Self::TargetTimeout => "目标超时",
             Self::TargetUnavailable => "目标不可达",
             Self::HttpInvalid => "HTTP 响应无效或不完整",
@@ -239,7 +241,7 @@ pub struct View {
     pub services: Vec<Offering>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum Credential {
     Password {

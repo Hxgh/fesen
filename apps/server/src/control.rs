@@ -48,7 +48,7 @@ pub async fn join(State(app): State<App>, headers: HeaderMap) -> impl IntoRespon
             )
         };
     let host = &app.origin[url::Position::BeforeHost..url::Position::AfterPort];
-    let mark = r#"<svg class="brand-mark" data-state="active" viewBox="0 0 64 64" fill="currentColor" aria-hidden="true"><g class="yao-top"><rect x="4" y="6" width="56" height="12"/></g><g class="yao-mid"><rect x="4" y="26" width="24" height="12"/><rect x="36" y="26" width="24" height="12"/></g><g class="yao-bot"><rect x="4" y="46" width="24" height="12"/><rect x="36" y="46" width="24" height="12"/></g></svg>"#;
+    let mark = r#"<svg class="brand-mark" data-state="active" viewBox="0 0 64 64" fill="currentColor" aria-hidden="true"><g class="yao-top"><rect x="6" y="8" width="52" height="8"/></g><g class="yao-mid"><rect x="6" y="28" width="21" height="8"/><rect x="37" y="28" width="21" height="8"/></g><g class="yao-bot"><rect x="6" y="48" width="21" height="8"/><rect x="37" y="48" width="21" height="8"/></g></svg>"#;
     let mut res = (
         [
             (header::VARY, "Accept-Language"),
@@ -155,6 +155,7 @@ async fn session_loop(mut socket: WebSocket, app: App, ip: Option<IpAddr>) {
             }
             match store::device_owner(&g.db, cert)? {
                 Some((member, false)) if &member == username => {}
+                Some((_, true)) => return Err(Code::DeviceRevoked),
                 Some(_) => return Err(Code::Unauthorized),
                 None => {}
             }

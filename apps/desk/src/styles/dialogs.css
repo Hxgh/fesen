@@ -236,29 +236,14 @@
   color: var(--ink);
   font-weight: 540;
 }
-.settings-profile-list {
-  display: grid;
-  gap: 6px;
-}
-.settings-profile-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 6px 8px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  background: var(--track);
-}
-.settings-profile-meta {
+.backup-card-title {
   display: flex;
   align-items: center;
   gap: 6px;
   min-width: 0;
   flex: 1;
-  font-size: var(--fs-sm);
 }
-.settings-profile-btns {
+.backup-card-actions {
   display: flex;
   align-items: center;
   gap: 4px;

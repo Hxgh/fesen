@@ -445,6 +445,7 @@ impl Core {
             }
             Command::SaveHost {
                 ip,
+                old_ip,
                 name,
                 host_os,
                 services,
@@ -454,6 +455,7 @@ impl Core {
             } => {
                 self.save_host(HostUpdate {
                     ip,
+                    old_ip,
                     name,
                     host_os,
                     services,

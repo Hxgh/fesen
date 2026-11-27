@@ -5,7 +5,7 @@ use std::{
     io,
     path::PathBuf,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -30,22 +30,34 @@ struct Publisher {
     core: Arc<Core>,
 }
 
-static PUBLISHER: OnceLock<Publisher> = OnceLock::new();
+static PUBLISHER: Mutex<Option<Publisher>> = Mutex::new(None);
+static PUBLISHER_ACTIVE: AtomicBool = AtomicBool::new(false);
 static STOP_PUBLISHER: AtomicBool = AtomicBool::new(false);
 
 fn serve_publisher() -> io::Result<()> {
+    if PUBLISHER_ACTIVE.swap(true, Ordering::AcqRel) {
+        return Err(io::Error::other("publisher already started"));
+    }
+    struct ActiveGuard;
+    impl Drop for ActiveGuard {
+        fn drop(&mut self) {
+            *PUBLISHER.lock().unwrap() = None;
+            PUBLISHER_ACTIVE.store(false, Ordering::Release);
+        }
+    }
+    let _active_guard = ActiveGuard;
+    STOP_PUBLISHER.store(false, Ordering::Release);
+
     let dir = publisher_dir()?;
     let runtime = runtime()?;
     let result = runtime.block_on(async {
         let endpoint = ipc::Endpoint::bind(&dir).await?;
         let host = Arc::new(Apple::new(None));
         let core = Core::new(dir, host.clone(), true)?;
-        PUBLISHER
-            .set(Publisher {
-                host,
-                core: core.clone(),
-            })
-            .map_err(|_| io::Error::other("publisher already started"))?;
+        *PUBLISHER.lock().unwrap() = Some(Publisher {
+            host,
+            core: core.clone(),
+        });
         if STOP_PUBLISHER.load(Ordering::Acquire) {
             core.stop();
         }
@@ -63,16 +75,18 @@ pub extern "C" fn ph_publisher_run() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ph_publisher_changed() {
-    if let Some(p) = PUBLISHER.get() {
-        p.host.physical_event.fetch_add(1, Ordering::Release);
+    let host = PUBLISHER.lock().unwrap().as_ref().map(|p| p.host.clone());
+    if let Some(host) = host {
+        host.physical_event.fetch_add(1, Ordering::Release);
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ph_publisher_stop() {
     STOP_PUBLISHER.store(true, Ordering::Release);
-    if let Some(p) = PUBLISHER.get() {
-        p.core.stop();
+    let core = PUBLISHER.lock().unwrap().as_ref().map(|p| p.core.clone());
+    if let Some(core) = core {
+        core.stop();
     }
 }
 

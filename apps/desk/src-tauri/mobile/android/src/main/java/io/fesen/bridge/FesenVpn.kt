@@ -50,6 +50,7 @@ class FesenVpn : VpnService() {
     private lateinit var ipc: Messenger
     private lateinit var background: Handler
     private val engineLock = Any()
+    private val coreLifecycleLock = Any()
     private val ipcPool = java.util.concurrent.Executors.newFixedThreadPool(4)
     @Volatile private var engine = 0L
     @Volatile private var stopping = false
@@ -99,12 +100,14 @@ class FesenVpn : VpnService() {
     }
 
     private fun execute(body: String): String {
-        val currentEngine = synchronized(engineLock) {
-            if (!stopping && engine == 0L) {
-                engine = nativeStart(filesDir.resolve("core").absolutePath)
-                if (stopping && engine != 0L) nativeHalt(engine)
+        val currentEngine = synchronized(coreLifecycleLock) {
+            synchronized(engineLock) {
+                if (!stopping && engine == 0L) {
+                    engine = nativeStart(filesDir.resolve("core").absolutePath)
+                    if (stopping && engine != 0L) nativeHalt(engine)
+                }
+                engine
             }
-            engine
         }
         val reply = if (stopping || currentEngine == 0L) """{"error":"not_connected"}""" else nativeRequest(currentEngine, body)
         val op = runCatching { JSONObject(body).optString("op") }.getOrNull()
@@ -132,8 +135,13 @@ class FesenVpn : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == STOP) { halt(); return START_NOT_STICKY }
         val ready = intent?.getParcelableExtra<ResultReceiver>("ready")
-        if (intent?.action !in listOf(ARM, START) || prepare(this) != null || stopping) {
+        if (intent?.action !in listOf(ARM, START) || prepare(this) != null) {
             ready?.send(Activity.RESULT_CANCELED, null); stopSelf(startId); return START_NOT_STICKY
+        }
+        if (stopping) {
+            stopping = false
+            tunnel = false
+            running = false
         }
         val wasBusy = starting || running
         starting = true
@@ -189,8 +197,19 @@ class FesenVpn : VpnService() {
     internal fun halt() {
         if (stopping) return
         stopping = true
+        starting = false
+        running = false
+        tunnel = false
         FesenTile.refresh()
-        if (engine != 0L) nativeHalt(engine)
+        val toDrop = synchronized(engineLock) {
+            val e = engine
+            engine = 0L
+            e
+        }
+        if (toDrop != 0L) {
+            nativeHalt(toDrop)
+            background.post { synchronized(coreLifecycleLock) { nativeDrop(toDrop) } }
+        }
         callbacks.values.forEach { runCatching { it.send(Message.obtain(null, 2)) } }
         callbacks.clear()
         standDown()
@@ -201,16 +220,10 @@ class FesenVpn : VpnService() {
         networks.unregisterNetworkCallback(physicalChanges)
         cachedUnderlying = null
         if (current === this) current = null
-        FesenTile.refresh()
+        FesenTile.refresh(this)
         ipcPool.shutdown()
         background.post {
             runCatching { ipcPool.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS) }
-            val toDrop = synchronized(engineLock) {
-                val e = engine
-                engine = 0L
-                e
-            }
-            if (toDrop != 0L) nativeDrop(toDrop)
             worker.quitSafely()
         }
         super.onDestroy()
@@ -325,7 +338,7 @@ class FesenVpn : VpnService() {
     fun configureTun(json: String): Int = runCatching {
         val config = JSONObject(json)
         if (config.isNull("address") || stopping) {
-            tunnel = false; display.post { FesenTile.refresh() }; return -1
+            tunnel = false; refreshAccess(); display.post { FesenTile.refresh() }; return -1
         }
         check(prepare(this) == null)
         val builder = Builder().setSession("Fesen").setMtu(1500).setBlocking(false)

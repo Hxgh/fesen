@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import NetworkExtension
 import Security
@@ -164,8 +165,8 @@ final class AppleHost {
         }
     }
 
-    func openTray() {
-        guard MenuBarPreference.local.enabled else { closeTray(); return }
+    func openTray(force: Bool = false) {
+        guard force || MenuBarPreference.local.enabled else { closeTray(); return }
         for app in NSWorkspace.shared.runningApplications where MenuBarPreference.isMenu(app.executableURL, in: bundleURLIfAny()) {
             if !app.isTerminated { return }
         }
@@ -213,30 +214,6 @@ final class AppleHost {
             sub.isHidden = true
         }
     }
-}
-
-@_cdecl("ph_host_publisher_main")
-func hostPublisherMain() {
-    guard Bundle.main.bundleIdentifier == "io.fesen.client" else { return }
-    // Keep the background publisher off AppKit: a windowless .prohibited NSApplication
-    // is terminated by macOS loginwindow (~30s) via kAEQuitApplication + SIGTERM.
-    let queue = DispatchQueue(label: "io.fesen.client.publisher", qos: .utility)
-    let physical = PhysicalNetwork()
-    physical.start(on: queue) { ph_publisher_changed() }
-    signal(SIGTERM, SIG_IGN)
-    signal(SIGINT, SIG_IGN)
-    let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: queue)
-    term.setEventHandler { ph_publisher_stop() }
-    term.resume()
-    let intr = DispatchSource.makeSignalSource(signal: SIGINT, queue: queue)
-    intr.setEventHandler { ph_publisher_stop() }
-    intr.resume()
-    defer {
-        term.cancel()
-        intr.cancel()
-        physical.stop()
-    }
-    ph_publisher_run()
 }
 
 @MainActor
@@ -306,23 +283,18 @@ func hostLaunchPublisher(_ context: UInt, _ done: @escaping @convention(c) (UInt
     DispatchQueue.main.async {
         let bundle = Bundle.main
         guard bundle.bundleIdentifier == "io.fesen.client",
-              bundle.bundleURL.pathExtension == "app",
-              let executable = bundle.executableURL
+              bundle.bundleURL.pathExtension == "app"
         else {
             done(context, 0); return
         }
-        let process = Process()
-        process.executableURL = executable
-        process.arguments = ["--publisher"]
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-            done(context, 1)
-        } catch {
-            done(context, 0)
-        }
+        AppleHost.shared.openTray(force: true)
+        DistributedNotificationCenter.default().postNotificationName(
+            MenuBarPreference.ensurePublisher,
+            object: bundle.bundleURL.standardizedFileURL.path,
+            userInfo: nil,
+            deliverImmediately: true
+        )
+        done(context, 1)
     }
 }
 
@@ -362,8 +334,26 @@ func hostOpenSettings() -> Int32 {
     let preference = MenuBarPreference.local
     if value != -1 {
         guard (value == 0 || value == 1), preference.set(value == 1) else { return -1 }
-        if value == 0 { AppleHost.shared.closeTray() }
-        else { AppleHost.shared.openTray() }
+        if value == 0 {
+            if invalidPackage == nil {
+                AppleHost.shared.closeTray()
+            } else {
+                DistributedNotificationCenter.default().postNotificationName(
+                    MenuBarPreference.changed,
+                    object: Bundle.main.bundleURL.standardizedFileURL.path,
+                    userInfo: nil,
+                    deliverImmediately: true
+                )
+            }
+        } else {
+            AppleHost.shared.openTray()
+            DistributedNotificationCenter.default().postNotificationName(
+                MenuBarPreference.changed,
+                object: Bundle.main.bundleURL.standardizedFileURL.path,
+                userInfo: nil,
+                deliverImmediately: true
+            )
+        }
     }
     return preference.enabled ? 1 : 0
 }

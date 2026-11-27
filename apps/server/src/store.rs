@@ -208,7 +208,10 @@ pub fn authorize_device(
             .optional()
             .map_err(sql_code)?;
         if let Some((existing_id, existing_member, revoked)) = existing_cert {
-            if revoked || existing_member != member {
+            if revoked {
+                return Err(Code::DeviceRevoked);
+            }
+            if existing_member != member {
                 return Err(Code::Unauthorized);
             }
             return db
@@ -411,6 +414,17 @@ pub fn reset_password(db: &mut Connection, member: &str, hash: &str) -> Result<(
 pub fn revoke(db: &Connection, id: &str) -> Result<(), Code> {
     if db
         .execute("UPDATE devices SET revoked=1,token=NULL WHERE id=?1", [id])
+        .map_err(sql_code)?
+        != 1
+    {
+        return Err(Code::Invalid);
+    }
+    Ok(())
+}
+
+pub fn remove_revoked_device(db: &Connection, id: &str) -> Result<(), Code> {
+    if db
+        .execute("DELETE FROM devices WHERE id=?1 AND revoked=1", [id])
         .map_err(sql_code)?
         != 1
     {

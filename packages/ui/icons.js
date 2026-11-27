@@ -123,6 +123,22 @@ export function osBadge(os, opts = false, fallbackTitle = "") {
   return tag;
 }
 
+/**
+ * Target-host OS pill (shown only when a remote/LAN target host OS is genuinely detected).
+ * @param {"windows" | "linux" | "macos" | "android" | null | undefined} os
+ * @param {string} [prefix]
+ */
+export function targetOsPill(os, prefix = "") {
+  if (!os || !osTitles[os]) return null;
+  const pill = document.createElement("span");
+  pill.className = "target-os-pill";
+  const label = prefix ? `${prefix} · ${osTitles[os]}` : osTitles[os];
+  pill.title = label;
+  pill.setAttribute("aria-label", label);
+  pill.append(osIcon(os), document.createTextNode(osTitles[os]));
+  return pill;
+}
+
 /** @param {keyof typeof paths | "more"} name */
 export function icon(name) {
   const key = name === "more" || paths[name] ? name : "server";
@@ -225,9 +241,9 @@ const TRIGRAM_PATHS = [
 ];
 
 const YAO_ROWS = [
-  { cls: "yao-top", bit: 4, y: 6 },
-  { cls: "yao-mid", bit: 2, y: 26 },
-  { cls: "yao-bot", bit: 1, y: 46 },
+  { cls: "yao-top", bit: 4, y: 8 },
+  { cls: "yao-mid", bit: 2, y: 28 },
+  { cls: "yao-bot", bit: 1, y: 48 },
 ];
 
 function buildTrigramSvg(mask, state) {
@@ -245,12 +261,12 @@ function buildTrigramSvg(mask, state) {
     g.setAttribute("class", row.cls);
     g.setAttribute("data-yang", (mask & row.bit) ? "1" : "0");
     g.setAttribute("data-hot", "0");
-    for (const [x, cls] of [["4", "yao-l"], ["32", "yao-r"]]) {
+    for (const [x, cls] of [["6", "yao-l"], ["32", "yao-r"]]) {
       const rect = document.createElementNS(NS, "rect");
       rect.setAttribute("x", x);
       rect.setAttribute("y", String(row.y));
-      rect.setAttribute("width", "28");
-      rect.setAttribute("height", "12");
+      rect.setAttribute("width", "26");
+      rect.setAttribute("height", "8");
       rect.setAttribute("class", cls);
       g.append(rect);
     }

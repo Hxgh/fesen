@@ -658,12 +658,12 @@ unsafe fn gen_tray_icon(visual: u8, light: bool) -> (HICON, bool) {
             }
         }
     };
-    for (bit, y0, y1) in [(4u8, 3usize, 9usize), (2, 13, 19), (1, 23, 29)] {
+    for (bit, y0, y1) in [(4u8, 4usize, 8usize), (2, 14, 18), (1, 24, 28)] {
         if (mask & bit) != 0 {
-            fill_rect(2, y0, 30, y1, alpha);
+            fill_rect(3, y0, 29, y1, alpha);
         } else {
-            fill_rect(2, y0, 14, y1, alpha);
-            fill_rect(18, y0, 30, y1, alpha);
+            fill_rect(3, y0, 13, y1, alpha);
+            fill_rect(19, y0, 29, y1, alpha);
         }
     }
     let mask_bits = [0u8; 32 * 4];

@@ -72,6 +72,8 @@ pub enum Command {
     },
     SaveHost {
         ip: Ipv4Addr,
+        #[serde(default)]
+        old_ip: Option<Ipv4Addr>,
         name: String,
         #[serde(default)]
         host_os: Option<HostOs>,
@@ -278,6 +280,7 @@ impl Drop for Flow<'_> {
 
 pub(super) struct HostUpdate {
     pub(super) ip: Ipv4Addr,
+    pub(super) old_ip: Option<Ipv4Addr>,
     pub(super) name: String,
     pub(super) host_os: Option<HostOs>,
     pub(super) services: Vec<HostServiceInput>,

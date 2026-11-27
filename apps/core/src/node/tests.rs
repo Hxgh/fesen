@@ -268,6 +268,7 @@ async fn save_host_merges_ports_propagates_os_and_enforces_boundaries() {
     assert_eq!(
         core.execute(Command::SaveHost {
             ip: Ipv4Addr::LOCALHOST,
+            old_ip: None,
             name: "bad".into(),
             host_os: Some(HostOs::Windows),
             services: vec![HostServiceInput {
@@ -285,6 +286,7 @@ async fn save_host_merges_ports_propagates_os_and_enforces_boundaries() {
     assert_eq!(
         core.execute(Command::SaveHost {
             ip: Ipv4Addr::new(198, 51, 100, 35),
+            old_ip: None,
             name: "dup".into(),
             host_os: None,
             services: vec![
@@ -325,6 +327,7 @@ async fn save_host_merges_ports_propagates_os_and_enforces_boundaries() {
     let s2 = core
         .execute(Command::SaveHost {
             ip: Ipv4Addr::new(198, 51, 100, 35),
+            old_ip: None,
             name: "WinHost".into(),
             host_os: Some(HostOs::Windows),
             services: vec![
@@ -514,6 +517,7 @@ async fn host_replace_edit_and_remove_many_manage_full_lifecycle() {
     let s1 = core
         .execute(Command::SaveHost {
             ip: host_ip,
+            old_ip: None,
             name: "Server-A".into(),
             host_os: Some(HostOs::Linux),
             services: vec![
@@ -569,6 +573,7 @@ async fn host_replace_edit_and_remove_many_manage_full_lifecycle() {
     let s3 = core
         .execute(Command::SaveHost {
             ip: host_ip,
+            old_ip: Some(host_ip),
             name: "Server-B".into(),
             host_os: None,
             services: vec![
@@ -607,8 +612,43 @@ async fn host_replace_edit_and_remove_many_manage_full_lifecycle() {
     // Since SSH was removed, host_os is cleared across remaining ports.
     assert!(s3.shares.iter().all(|s| s.host_os.is_none()));
 
+    // Migrating host IP preserves existing share IDs and updates target IPv4.
+    let next_ip = Ipv4Addr::new(198, 51, 100, 51);
+    let s_migrated = core
+        .execute(Command::SaveHost {
+            ip: next_ip,
+            old_ip: Some(host_ip),
+            name: "Server-B".into(),
+            host_os: None,
+            services: vec![
+                HostServiceInput {
+                    port: 80,
+                    kind: ServiceKind::Http,
+                },
+                HostServiceInput {
+                    port: 8080,
+                    kind: ServiceKind::Https,
+                },
+                HostServiceInput {
+                    port: 443,
+                    kind: ServiceKind::Https,
+                },
+            ],
+            publish: false,
+            replace: true,
+            old_host_name: Some("Server-B".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(s_migrated.shares.len(), 3);
+    assert!(s_migrated.shares.iter().all(|s| s.single_ip() == Some(next_ip)));
+    assert_eq!(
+        s_migrated.shares.iter().find(|s| s.id == id_80).unwrap().name,
+        "Web Gateway"
+    );
+
     // RemoveMany removes the entire host atomically.
-    let all_ids: Vec<String> = s3.shares.iter().map(|s| s.id.clone()).collect();
+    let all_ids: Vec<String> = s_migrated.shares.iter().map(|s| s.id.clone()).collect();
     let s4 = core
         .execute(Command::RemoveMany { ids: all_ids })
         .await

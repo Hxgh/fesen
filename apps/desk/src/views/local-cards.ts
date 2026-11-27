@@ -1,5 +1,5 @@
 import { t } from "../i18n";
-import { osBadge } from "../../../../packages/ui/icons.js";
+import { targetOsPill } from "../../../../packages/ui/icons.js";
 import { meaningfulHostName, resolveHostOs, singleIp } from "../../../../packages/ui/host-card.js";
 import { openPopoverMenu } from "../../../../packages/ui/popover.js";
 import { act, toggleCollapsed } from "../app/runtime";
@@ -8,54 +8,14 @@ import { effectiveKind, endpoint, kindBadgeText, ranges } from "../model/net";
 import { isActiveShare, isCollapsed } from "../model/state";
 import type { HostOs, Share, Status } from "../model/types";
 import { collapseToggle, el, makeToggle, tool } from "../ui/dom";
-import { rowActions, serviceRow } from "./service-actions";
+import { rowActions } from "./service-actions";
 
 export type LocalEntry =
   | { grouped: true; ip: string; items: Share[] }
   | { grouped: false; item: Share };
 
-function mineSingleRow(s: Share, data: Status, showDevice = false, includeMember = true) {
-  const kind = effectiveKind(s);
-  const active = isActiveShare(s.id, data);
-  const ip = singleIp(s);
-  const targetLabel = ip ? `${ip}:${ranges(s.rules.ports)}` : s.name;
-  const publish = makeToggle(
-    active,
-    `${t("publish")} · ${s.name}`,
-    !data.online && !active ? () => confirmConnectAndShare(targetLabel, { op: "share", id: s.id, enabled: true }) : null,
-    () => void act({ op: "share", id: s.id, enabled: !active }),
-  );
-  const address = endpoint(s.rules.ips, s.rules.ports);
-  const os = resolveHostOs([s]) as HostOs | null;
-  const subtitle = ip ? meaningfulHostName(s.name, ip, os) : s.name;
-  const tags: HTMLElement[] = [];
-  if (kind !== "tcp") tags.push(el("span", "proto-tag", kindBadgeText(kind)));
-  const metaNodes: (HTMLElement | string)[] = [];
-  if (subtitle) metaNodes.push(el("span", "service-name", subtitle));
-  if (showDevice) {
-    const dev = data.device_name?.trim() || "";
-    const devText = dev || t("badge_local");
-    if (metaNodes.length) metaNodes.push(el("span", "meta-sep", "·"));
-    metaNodes.push(el("span", includeMember ? "source-tag self" : "source-tag", devText));
-    if (data.device_os && os && data.device_os !== os) {
-      const devOsEl = osBadge(data.device_os);
-      if (devOsEl) metaNodes.push(devOsEl);
-    }
-  }
-  const localPrefix = includeMember ? `${t("badge_local")} · ${t("source_self")}` : t("badge_local");
-  const leadOsEl = osBadge(os ?? (showDevice ? data.device_os : null), {
-    fallback: "server",
-    local: true,
-    prefix: localPrefix,
-  });
-  return serviceRow(
-    address,
-    metaNodes,
-    tags,
-    leadOsEl,
-    publish,
-    rowActions(s, s.name, undefined, true, shareEditAction(s)),
-  );
+function localDeviceName(data: Status): string {
+  return data.device_name?.trim() || t("badge_local");
 }
 
 function buildLocalHostMore(ip: string, cleanName: string, items: Share[]) {
@@ -71,7 +31,7 @@ function buildLocalHostMore(ip: string, cleanName: string, items: Share[]) {
         icon: "close",
         label: t("remove_host"),
         danger: true,
-        onSelect: () => confirmRemoveHost(ip, cleanName ? `${cleanName} (${ip})` : ip, items),
+        onSelect: () => confirmRemoveHost(ip, cleanName, items),
       },
     ]);
   });
@@ -108,79 +68,6 @@ function buildLocalHostPorts(ip: string, items: Share[], data: Status, rawHostNa
   });
 }
 
-function mineHostCard(
-  collapseKey: string,
-  ip: string,
-  items: Share[],
-  data: Status,
-  forceExpand = false,
-  showDevice = false,
-  includeMember = true,
-) {
-  const expanded = forceExpand || !isCollapsed(collapseKey);
-  const rawHostName = items[0]!.name;
-  const hostOs = resolveHostOs(items) as HostOs | null;
-  const cleanName = meaningfulHostName(rawHostName, ip, hostOs);
-  const activeCount = items.filter((s) => isActiveShare(s.id, data)).length;
-  const allActive = activeCount === items.length;
-  const partial = activeCount > 0 && activeCount < items.length;
-
-  const hostMore = buildLocalHostMore(ip, cleanName, items);
-  const master = makeToggle(
-    allActive,
-    `${t("publish")} · ${cleanName || ip}`,
-    !data.online && activeCount === 0
-      ? () => confirmConnectAndShare(cleanName ? `${cleanName} (${ip})` : ip, { op: "share_many", ids: items.map((s) => s.id), enabled: true })
-      : null,
-    () => void act({ op: "share_many", ids: items.map((s) => s.id), enabled: !allActive }),
-    partial ? `${activeCount}/${items.length}` : undefined,
-  );
-
-  const localPrefix = includeMember ? `${t("badge_local")} · ${t("source_self")}` : t("badge_local");
-  const hostOsEl = osBadge(hostOs ?? (showDevice ? data.device_os : null), {
-    fallback: "server",
-    local: true,
-    prefix: localPrefix,
-  });
-  const titleParts: HTMLElement[] = [
-    ...(hostOsEl ? [hostOsEl] : []),
-    el("p", "endpoint", ip),
-    el("span", "count", String(items.length)),
-  ];
-  const metaParts: (HTMLElement | string)[] = [];
-  if (cleanName) metaParts.push(el("span", "service-name", cleanName));
-  if (showDevice) {
-    const dev = data.device_name?.trim() || "";
-    const devText = dev || t("badge_local");
-    if (metaParts.length) metaParts.push(el("span", "meta-sep", "·"));
-    metaParts.push(el("span", includeMember ? "source-tag self" : "source-tag", devText));
-    if (data.device_os && hostOs && data.device_os !== hostOs) {
-      const devOsEl = osBadge(data.device_os);
-      if (devOsEl) metaParts.push(devOsEl);
-    }
-  }
-
-  const info = el(
-    "div",
-    "host-info",
-    el("div", "host-title-line", ...titleParts),
-    ...(metaParts.length ? [el("div", "service-meta", ...metaParts)] : []),
-  );
-  const head = el(
-    "div",
-    "host-head",
-    collapseToggle(collapseKey, expanded, "", toggleCollapsed, info),
-    el("div", "host-controls", master, hostMore),
-  );
-
-  const portsWrap = el("div", "host-ports", ...buildLocalHostPorts(ip, items, data, rawHostName, hostOs));
-  portsWrap.dataset.ports = String(items.length);
-  if (items.length >= 9) portsWrap.dataset.many = "1";
-  portsWrap.hidden = !expanded;
-
-  return el("article", expanded ? "host-card collapsible" : "host-card collapsible is-collapsed", head, portsWrap);
-}
-
 function mineSubSingleRow(s: Share, data: Status) {
   const kind = effectiveKind(s);
   const active = isActiveShare(s.id, data);
@@ -195,8 +82,9 @@ function mineSubSingleRow(s: Share, data: Status) {
   const address = endpoint(s.rules.ips, s.rules.ports);
   const os = resolveHostOs([s]) as HostOs | null;
   const subtitle = ip ? meaningfulHostName(s.name, ip, os) : s.name;
-  const leadOsEl = osBadge(os, "server");
+  const hostOsPill = targetOsPill(os);
   const tags: HTMLElement[] = [];
+  if (hostOsPill) tags.push(hostOsPill);
   if (kind !== "tcp") tags.push(el("span", "proto-tag", kindBadgeText(kind)));
   const row = el(
     "div",
@@ -204,7 +92,7 @@ function mineSubSingleRow(s: Share, data: Status) {
     el(
       "div",
       "service-main",
-      el("div", "host-title-line", ...(leadOsEl ? [leadOsEl] : []), el("p", "endpoint", address), ...tags),
+      el("div", "host-title-line", el("p", "endpoint", address), ...tags),
       ...(subtitle ? [el("div", "service-meta", el("span", "service-name", subtitle))] : []),
     ),
     el("div", "service-actions", publish, rowActions(s, s.name, undefined, true, shareEditAction(s))),
@@ -232,10 +120,10 @@ function mineSubHostBlock(ip: string, items: Share[], data: Status, forceExpand 
     () => void act({ op: "share_many", ids: items.map((s) => s.id), enabled: !allActive }),
     partial ? `${activeCount}/${items.length}` : undefined,
   );
-  const hostOsEl = osBadge(hostOs, "server");
+  const hostOsPill = targetOsPill(hostOs);
   const titleParts: HTMLElement[] = [
-    ...(hostOsEl ? [hostOsEl] : []),
     el("p", "endpoint", ip),
+    ...(hostOsPill ? [hostOsPill] : []),
     el("span", "count", String(items.length)),
   ];
   const info = el(
@@ -261,23 +149,12 @@ export function renderLocalBucket(
   shares: Share[],
   entries: LocalEntry[],
   data: Status,
-  includeMember: boolean,
+  _includeMember: boolean,
   forceExpand = false,
 ): HTMLElement {
-  if (shares.length === 1) {
-    return mineSingleRow(shares[0]!, data, true, includeMember);
-  }
-  const firstEntry = entries[0];
-  if (entries.length === 1 && firstEntry?.grouped && firstEntry.items.length >= 2) {
-    return mineHostCard("dev:local", firstEntry.ip, firstEntry.items, data, forceExpand, true, includeMember);
-  }
-
   const key = "dev:local";
   const expanded = forceExpand || !isCollapsed(key);
-  const devName = data.device_name?.trim() || "";
-  const label = devName || t("badge_local");
-  const localTip = includeMember ? `${t("badge_local")} · ${t("source_self")}` : t("badge_local");
-  const devOsEl = osBadge(data.device_os, { fallback: "device", local: true, prefix: localTip });
+  const label = localDeviceName(data);
   const activeCount = shares.filter((s) => isActiveShare(s.id, data)).length;
   const allActive = activeCount === shares.length;
   const partial = activeCount > 0 && activeCount < shares.length;
@@ -294,8 +171,8 @@ export function renderLocalBucket(
   const titleLine = el(
     "div",
     "host-title-line",
-    ...(devOsEl ? [devOsEl] : []),
-    el("span", includeMember ? "device-card-title self" : "device-card-title", label),
+    el("span", "device-card-title", label),
+    el("span", "local-tag", t("badge_local")),
     el("span", "count", String(shares.length)),
   );
   const head = el(
@@ -329,17 +206,25 @@ export function flatMineRow(s: Share, data: Status, localIpOs?: Map<string, Host
   const address = endpoint(s.rules.ips, s.rules.ports);
   const os = ((ip ? localIpOs?.get(ip) : null) ?? resolveHostOs([s])) as HostOs | null;
   const subtitle = ip ? meaningfulHostName(s.name, ip, os) : s.name;
-  const osEl = osBadge(os, { fallback: "server", local: true, prefix: t("badge_local") });
+  const hostOsPill = targetOsPill(os);
+  const devName = data.device_name?.trim() || "";
+  const subParts: (HTMLElement | string)[] = [];
+  if (subtitle) subParts.push(el("span", "flat-sub-name", subtitle));
+  if (devName) {
+    if (subParts.length) subParts.push(el("span", "meta-sep", "·"));
+    subParts.push(el("span", "flat-sub-src", devName));
+  }
   const row = el(
     "div",
     "flat-row",
     el(
       "div",
       "flat-main",
-      ...(osEl ? [osEl] : []),
       el("span", "flat-addr", address),
+      el("span", "local-tag", t("badge_local")),
+      ...(hostOsPill ? [hostOsPill] : []),
       ...(kind !== "tcp" ? [el("span", "proto-tag", kindBadgeText(kind))] : []),
-      ...(subtitle ? [el("span", "flat-sub", el("span", "flat-sub-text", subtitle))] : []),
+      ...(subParts.length ? [el("span", "flat-sub", ...subParts)] : []),
     ),
     el("div", "service-actions", publish, rowActions(s, s.name, undefined, true, shareEditAction(s))),
   );

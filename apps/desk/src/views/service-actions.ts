@@ -9,7 +9,8 @@ import { showSiteDialog } from "../dialogs/site-dialog";
 import { accessIpFor, addresses, effectiveKind, kindBadgeText, mapsForService, toInt, toIp } from "../model/net";
 import { forwardFor, forwardsOfService, labelFor, probes, serviceKey, state } from "../model/state";
 import type { LocalForwardStatus, MenuEntry, Offering, Probe, Share, Status } from "../model/types";
-import { button, el, field, notify, str, submit, tool } from "../ui/dom";
+import { button, el, field, notify, str, submit } from "../ui/dom";
+import { tool } from "../ui/dom";
 
 export async function testConnection(service: Offering, ip: string, port: number) {
   const key = serviceKey(service);
@@ -55,6 +56,73 @@ export function testHostServices(items: Offering[]) {
       }
     })();
   }
+}
+
+export function hostProbeBadge(items: Offering[], data: Status, routing: boolean): HTMLElement | null {
+  const testable = items.filter((s) => singleIp(s) !== null && singlePort(s) !== null);
+  if (!testable.length) return null;
+
+  let pendingCount = 0;
+  let okCount = 0;
+  let badCount = 0;
+  let firstOkRtt: number | undefined;
+  let firstErr: string | undefined;
+  for (const s of testable) {
+    const res = probes.get(serviceKey(s))?.result;
+    if (!res) {
+      if (probes.has(serviceKey(s))) pendingCount += 1;
+      continue;
+    }
+    const httpBad = res.httpStatus !== undefined && (res.httpStatus < 200 || res.httpStatus >= 400);
+    if (res.error || httpBad) {
+      badCount += 1;
+      firstErr ??= res.error ? failure(res.error) : `HTTP ${res.httpStatus}`;
+    } else {
+      okCount += 1;
+      firstOkRtt ??= res.rttMs;
+    }
+  }
+
+  const doneCount = okCount + badCount;
+  const pending = pendingCount > 0;
+  let caption: string;
+  let tone = "";
+
+  if (pending) {
+    caption = t("testing");
+  } else if (doneCount === 0) {
+    caption = t("unchecked");
+  } else if (testable.length === 1) {
+    if (badCount === 1) {
+      caption = firstErr ?? t("unavailable");
+      tone = "bad";
+    } else {
+      caption = firstOkRtt !== undefined ? `${firstOkRtt}ms` : t("reachable");
+      const s = testable[0]!;
+      const ip = singleIp(s)!;
+      const port = singlePort(s)!;
+      const fwd = forwardFor(s.id, ip, port, data);
+      tone = (routing || !!fwd?.active) ? "good" : "";
+    }
+  } else if (badCount === testable.length) {
+    caption = t("unavailable");
+    tone = "bad";
+  } else if (badCount > 0) {
+    caption = `${okCount}/${testable.length}`;
+    tone = "warn";
+  } else if (okCount === testable.length) {
+    caption = `${okCount}/${testable.length}`;
+    tone = "good";
+  } else {
+    caption = `${okCount}/${testable.length}`;
+  }
+
+  const badge = button(caption, () => testHostServices(items), `probe-badge badge ${tone}`);
+  badge.title = `${t("test_host")} · ${caption}`;
+  badge.setAttribute("aria-label", `${t("test_host")}：${caption}`);
+  badge.setAttribute("data-pending", String(pending));
+  badge.disabled = pending || !data.online || state.busy;
+  return badge;
 }
 
 export function chooseTarget(
@@ -127,53 +195,78 @@ export function openWebPreview(service: Share, owner?: string) {
   state.message = "";
   showError();
   chooseTarget(service, title, (ip, port) => {
-    const fwd = owner ? forwardFor(service.id, ip, port, state.status) : undefined;
-    if (owner && state.status?.system_routing === false && !fwd) {
-      const lbl = labelFor(service.id, state.status);
-      customize(service as Offering, lbl, false, true, () => openWebPreview(service, owner));
-      return;
-    }
-    if (fwd && !fwd.active) {
-      notify(t("local_port_conflict"), true);
-      return;
-    }
-    const access = owner ? (fwd ? "127.0.0.1" : accessIpFor(service.id, ip, state.status)) : ip;
-    const accessPort = fwd ? fwd.local_port : port;
-    const session = state.tabOwner;
-    const valid = () => {
-      const s = owner
-        ? state.status?.services.find((svc) => svc.owner === owner && svc.id === service.id)
-        : state.status?.shares.find((svc) => svc.id === service.id);
-      if (!state.status?.member || session !== JSON.stringify([state.status.server, state.status.member]) || !s || effectiveKind(s) !== "http") {
-        return false;
+    const launchPreview = (fwd = owner ? forwardFor(service.id, ip, port, state.status) : undefined) => {
+      if (fwd && !fwd.active) {
+        notify(t("local_port_conflict"), true);
+        return;
       }
-      if (owner) {
-        if (!state.status.online) return false;
-        const curFwd = forwardFor(service.id, ip, port, state.status);
-        if (fwd) {
-          if (!curFwd?.active || curFwd.local_port !== accessPort) return false;
-        } else if (accessIpFor(service.id, ip, state.status) !== access) {
+      const access = owner ? (fwd ? "127.0.0.1" : accessIpFor(service.id, ip, state.status)) : ip;
+      const accessPort = fwd ? fwd.local_port : port;
+      const session = state.tabOwner;
+      const valid = () => {
+        const s = owner
+          ? state.status?.services.find((svc) => svc.owner === owner && svc.id === service.id)
+          : state.status?.shares.find((svc) => svc.id === service.id);
+        if (!state.status?.member || session !== JSON.stringify([state.status.server, state.status.member]) || !s || effectiveKind(s) !== "http") {
           return false;
         }
-      }
-      return s.rules.ips.some((r) => toInt(r.start) <= toInt(ip) && toInt(ip) <= toInt(r.end))
-        && s.rules.ports.some((r) => r.start <= port && port <= r.end);
+        if (owner) {
+          if (!state.status.online) return false;
+          const curFwd = forwardFor(service.id, ip, port, state.status);
+          if (fwd) {
+            if (!curFwd?.active || curFwd.local_port !== accessPort) return false;
+          } else if (accessIpFor(service.id, ip, state.status) !== access) {
+            return false;
+          }
+        }
+        return s.rules.ips.some((r) => toInt(r.start) <= toInt(ip) && toInt(ip) <= toInt(r.end))
+          && s.rules.ports.some((r) => r.start <= port && port <= r.end);
+      };
+      showSiteDialog({ id: service.id, owner: owner ?? null, ip, port }, access, valid, (result) => {
+        if (!owner) return;
+        const key = `${owner}:${service.id}`;
+        const prev = probes.get(key)?.result;
+        probes.set(key, {
+          ip,
+          port,
+          access,
+          kind: "http",
+          result: result === "visible"
+            ? { visible: true, rttMs: prev?.rttMs, httpStatus: prev?.httpStatus }
+            : result,
+        });
+        render(true);
+      }, accessPort);
     };
-    showSiteDialog({ id: service.id, owner: owner ?? null, ip, port }, access, valid, (result) => {
-      if (!owner) return;
-      const key = `${owner}:${service.id}`;
-      const prev = probes.get(key)?.result;
-      probes.set(key, {
-        ip,
-        port,
-        access,
-        kind: "http",
-        result: result === "visible"
-          ? { visible: true, rttMs: prev?.rttMs, httpStatus: prev?.httpStatus }
-          : result,
-      });
-      render(true);
-    }, accessPort);
+
+    const existing = owner ? forwardFor(service.id, ip, port, state.status) : undefined;
+    if (owner && state.status?.system_routing === false && !existing) {
+      if (state.busy) return;
+      state.busy = true;
+      void (async () => {
+        try {
+          const suggested = await request({ op: "suggest_local_port", preferred: port }, false);
+          if (!suggested.suggested_port) throw "conflict";
+          state.status = await request({
+            op: "set_local_forward",
+            service: service.id,
+            target_ip: ip,
+            target_port: port,
+            local_port: suggested.suggested_port,
+          }, false);
+          render(true);
+          notify(`127.0.0.1:${suggested.suggested_port}`);
+          state.busy = false;
+          launchPreview(forwardFor(service.id, ip, port, state.status));
+        } catch {
+          state.busy = false;
+          const lbl = labelFor(service.id, state.status);
+          customize(service as Offering, lbl, false, true, () => openWebPreview(service, owner));
+        }
+      })();
+      return;
+    }
+    launchPreview(existing);
   });
 }
 
@@ -326,26 +419,6 @@ export function probeVisual(service: Offering, data: Status, routing: boolean) {
     note.setAttribute("role", "status");
   }
   return { ips, overlapped, fwds, singleFwd, badge, httpTag, note, pending, result };
-}
-
-export function serviceRow(
-  address: string,
-  metaNodes: (HTMLElement | string)[],
-  tags: HTMLElement[],
-  leadIcon: HTMLElement | null,
-  ...controls: HTMLElement[]
-) {
-  return el(
-    "article",
-    "service-row",
-    el(
-      "div",
-      "service-main",
-      el("div", "host-title-line", ...(leadIcon ? [leadIcon] : []), el("p", "endpoint", address), ...tags),
-      ...(metaNodes.length ? [el("div", "service-meta", ...metaNodes)] : []),
-    ),
-    el("div", "service-actions", ...controls),
-  );
 }
 
 export function portConflictPill(fwd: LocalForwardStatus): HTMLElement {

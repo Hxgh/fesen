@@ -1,6 +1,8 @@
 package io.fesen.bridge
 
 import android.app.PendingIntent
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
@@ -10,7 +12,11 @@ import android.service.quicksettings.TileService
 class FesenTile : TileService() {
     companion object {
         private var listening: FesenTile? = null
-        internal fun refresh() { listening?.render() }
+        internal fun refresh(context: Context? = FesenVpn.current) {
+            listening?.render()
+            val ctx = context?.applicationContext ?: return
+            runCatching { requestListeningState(ctx, ComponentName(ctx, FesenTile::class.java)) }
+        }
         init { System.loadLibrary("fesen_lib") }
     }
 
@@ -32,8 +38,18 @@ class FesenTile : TileService() {
     }
 
     private fun render() {
+        val service = FesenVpn.current
+        val engaged = service?.engaged == true
+        val pending = !engaged && service?.pending == true && service.shuttingDown == false
         qsTile?.apply {
-            state = if (FesenVpn.current?.engaged == true) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
+            state = if (engaged || pending) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
+            subtitle = getString(
+                when {
+                    engaged -> R.string.fesen_tile_on
+                    pending -> R.string.fesen_tile_connecting
+                    else -> R.string.fesen_tile_off
+                }
+            )
             updateTile()
         }
     }
@@ -44,8 +60,7 @@ class FesenTile : TileService() {
 
     private fun toggle() {
         val service = FesenVpn.current
-        if (service?.shuttingDown == true) return
-        if (service != null && (service.engaged || service.pending)) {
+        if (service != null && !service.shuttingDown && (service.engaged || service.pending)) {
             service.halt()
             return
         }

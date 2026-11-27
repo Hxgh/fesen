@@ -4,6 +4,7 @@ struct MenuBarPreference {
     static let local = MenuBarPreference(domain: "io.fesen.client")
     static let changed = Notification.Name("io.fesen.client.menuBarOnCloseChanged")
     static let statusChanged = Notification.Name("io.fesen.client.statusChanged")
+    static let ensurePublisher = Notification.Name("io.fesen.client.ensurePublisher")
     private let domain: CFString
     private let key = "menuBarOnClose" as CFString
 

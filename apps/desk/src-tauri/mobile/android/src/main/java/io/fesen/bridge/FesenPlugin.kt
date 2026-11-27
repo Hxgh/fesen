@@ -1,11 +1,13 @@
 package io.fesen.bridge
 
 import android.app.Activity
+import android.app.StatusBarManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.res.Configuration
+import android.graphics.drawable.Icon
 import android.net.VpnService
 import android.os.Bundle
 import android.os.Handler
@@ -53,6 +55,7 @@ class FesenPlugin(private val activity: Activity) : Plugin(activity) {
 
     override fun load(webView: WebView) {
         activity.runOnUiThread {
+            webView.overScrollMode = View.OVER_SCROLL_NEVER
             preview = SiteView(activity, webView)
             val root = activity.findViewById<View>(android.R.id.content)
             activity.window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
@@ -79,6 +82,30 @@ class FesenPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun siteView(invoke: Invoke) { main.post { preview?.command(invoke) ?: invoke.reject("browser_failed") } }
+
+    @Command
+    fun addTile(invoke: Invoke) {
+        main.post {
+            val sbm = activity.getSystemService(StatusBarManager::class.java)
+            if (sbm == null) {
+                invoke.reject("internal")
+                return@post
+            }
+            val component = ComponentName(activity, FesenTile::class.java)
+            val label = activity.getString(R.string.fesen_tile_label)
+            val icon = Icon.createWithResource(activity, R.drawable.fesen_tile)
+            runCatching {
+                sbm.requestAddTileService(component, label, icon, activity.mainExecutor) { result ->
+                    val status = when (result) {
+                        StatusBarManager.TILE_ADD_REQUEST_RESULT_TILE_ADDED -> "added"
+                        StatusBarManager.TILE_ADD_REQUEST_RESULT_TILE_ALREADY_ADDED -> "already_added"
+                        else -> "dismissed"
+                    }
+                    invoke.resolve(JSObject().put("status", status))
+                }
+            }.onFailure { invoke.reject("internal") }
+        }
+    }
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {

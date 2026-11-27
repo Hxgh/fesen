@@ -371,7 +371,8 @@ impl Worker {
                                         let _ = link.signals.send((peer, addresses));
                                     }
                                 },
-                                Event::Revoked | Event::Rejected { error: Code::Unauthorized } => return Err(Code::Unauthorized),
+                                Event::Revoked | Event::Rejected { error: Code::DeviceRevoked } => return Err(Code::DeviceRevoked),
+                                Event::Rejected { error: Code::Unauthorized } => return Err(Code::Unauthorized),
                                 _ => return Err(Code::Invalid),
                             },
                             Message::Ping(_) | Message::Pong(_) => {},

@@ -373,3 +373,165 @@ async fn admin_change_password_rotates_cookie_and_rate_limits_bruteforce() {
     );
     web.abort();
 }
+
+#[tokio::test]
+async fn revoked_device_rotates_cert_on_password_relogin_and_can_be_removed_from_admin() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = store::db(&dir.path().join("db")).unwrap();
+    let hash = store::password_hash(PASSWORD).unwrap();
+    store::create(&db, "admin", &hash, true).unwrap();
+    store::create(&db, "bob", &hash, false).unwrap();
+
+    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/", http.local_addr().unwrap());
+    let app = App::new(db, origin(&base).unwrap(), 0, None).unwrap();
+    let web = tokio::spawn(async move {
+        axum::serve(
+            http,
+            router(app).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
+    let client = Client::new();
+    let login = client
+        .post(format!("{base}admin/login"))
+        .header("X-Fesen-Admin", "1")
+        .json(&json!({"username": "admin", "password": PASSWORD}))
+        .send()
+        .await
+        .unwrap();
+    let cookie = login.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    let bob_net = Adapter::with_device(
+        "bob-mac",
+        Ipv4Addr::new(192, 0, 2, 33),
+        None,
+        DeviceOs::Macos,
+        "bob-hw-id",
+    );
+    let bob = Core::new(dir.path().join("bob"), bob_net, false).unwrap();
+    bob.execute(Command::Join {
+        address: base.clone(),
+    })
+    .await
+    .unwrap();
+    let s1 = bob
+        .execute(Command::Login {
+            username: "bob".into(),
+            password: PASSWORD.into(),
+            label: "bob-mac".into(),
+        })
+        .await
+        .unwrap();
+    let old_id = s1.device_id.clone().expect("device id");
+    eventually(|| bob.status().online).await;
+
+    // Active (non-revoked) device cannot be deleted directly.
+    assert_eq!(
+        client
+            .post(format!("{base}admin/action"))
+            .header("X-Fesen-Admin", "1")
+            .header(header::COOKIE, &cookie)
+            .json(&json!({"op": "remove_device", "device": old_id}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    // Revoke online device: kicked immediately with DeviceRevoked error.
+    assert_eq!(
+        client
+            .post(format!("{base}admin/action"))
+            .header("X-Fesen-Admin", "1")
+            .header(header::COOKIE, &cookie)
+            .json(&json!({"op": "revoke", "device": old_id}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    eventually(|| bob.status().member.is_none() && bob.status().error == Some(Code::DeviceRevoked))
+        .await;
+
+    // Re-login with valid password automatically rotates to a new certificate & device ID.
+    let s2 = bob
+        .execute(Command::Login {
+            username: "bob".into(),
+            password: PASSWORD.into(),
+            label: "bob-mac".into(),
+        })
+        .await
+        .unwrap();
+    let new_id = s2.device_id.clone().expect("new device id");
+    assert_ne!(new_id, old_id);
+    eventually(|| bob.status().online).await;
+
+    // Revoked historical record can now be cleanly removed from admin list.
+    assert_eq!(
+        client
+            .post(format!("{base}admin/action"))
+            .header("X-Fesen-Admin", "1")
+            .header(header::COOKIE, &cookie)
+            .json(&json!({"op": "remove_device", "device": old_id}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let snap: Value = client
+        .get(format!("{base}admin/session"))
+        .header(header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let devices = snap["devices"].as_array().unwrap();
+    assert!(!devices.iter().any(|d| d["id"] == old_id));
+    assert!(devices.iter().any(|d| d["id"] == new_id && d["online"] == true));
+
+    // Offline revoke scenario: stop bob, revoke new_id while offline, then verify password re-login rotates cert seamlessly.
+    bob.execute(Command::Stop).await.unwrap();
+    assert_eq!(
+        client
+            .post(format!("{base}admin/action"))
+            .header("X-Fesen-Admin", "1")
+            .header(header::COOKIE, &cookie)
+            .json(&json!({"op": "revoke", "device": new_id}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert!(matches!(
+        bob.execute(Command::Start).await,
+        Err(Code::Unauthorized)
+    ));
+    let s3 = bob
+        .execute(Command::Login {
+            username: "bob".into(),
+            password: PASSWORD.into(),
+            label: "bob-mac".into(),
+        })
+        .await
+        .unwrap();
+    let third_id = s3.device_id.clone().expect("third device id");
+    assert_ne!(third_id, new_id);
+
+    bob.stop();
+    bob.wait_stopped().await;
+    web.abort();
+}

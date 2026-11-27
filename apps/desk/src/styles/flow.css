@@ -1,4 +1,19 @@
-.service-flow { display: grid; gap: 14px; }
+.service-flow {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: none;
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  padding: 12px var(--gutter) 32px;
+}
+@media (pointer: fine) {
+  .service-flow {
+    scrollbar-gutter: stable;
+    padding-right: max(16px, calc(var(--gutter) - 8px));
+  }
+}
 .flow-section {
   display: grid;
   gap: 6px;
@@ -127,11 +142,14 @@
 .list-toolbar {
   --tb-h: var(--ctl-sm);
   --tb-r: 7px;
+  flex: none;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  margin-bottom: 10px;
+  padding: 9px var(--gutter);
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 75%, transparent);
+  background: var(--bg);
 }
 .view-seg {
   display: inline-grid;

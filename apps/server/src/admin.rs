@@ -287,6 +287,7 @@ enum Action {
     Enable { username: String, enabled: bool },
     ChangePassword { current: String, password: String },
     Revoke { device: String },
+    RemoveDevice { device: String },
     Logout,
 }
 
@@ -350,6 +351,12 @@ async fn action(
             store::revoke(&g.db, &device)?;
             g.remove(&device, true);
             true
+        }
+        Action::RemoveDevice { device } => {
+            let g = app.inner.lock().unwrap();
+            gate(&g, &headers)?;
+            store::remove_revoked_device(&g.db, &device)?;
+            false
         }
         Action::Logout => {
             let g = app.inner.lock().unwrap();

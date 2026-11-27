@@ -30,3 +30,15 @@ pub async fn site<R: Runtime>(app: &tauri::AppHandle<R>, request: Value) -> Resu
         .await
         .map_err(|_| "browser_failed".to_owned())
 }
+
+pub async fn add_tile<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<String, String> {
+    let reply = app
+        .state::<PluginHandle<R>>()
+        .run_mobile_plugin_async::<Value>("addTile", json!({}))
+        .await
+        .map_err(|_| "internal".to_owned())?;
+    Ok(reply["status"]
+        .as_str()
+        .unwrap_or("dismissed")
+        .to_owned())
+}

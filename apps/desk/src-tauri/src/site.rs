@@ -245,6 +245,14 @@ pub async fn open_site(
 }
 
 static CLOSED: tokio::sync::Mutex<u64> = tokio::sync::Mutex::const_new(0);
+#[cfg(any(windows, target_os = "macos"))]
+static BLOCKED_NAV: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(any(windows, target_os = "macos"))]
+fn blocked_nav() -> &'static std::sync::Mutex<std::collections::HashSet<u64>> {
+    BLOCKED_NAV.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
 const VISIBLE: &str = include_str!("site-visible.js");
 fn valid_bounds([x, y, w, h]: [i32; 4]) -> bool {
     x >= 0 && y >= 0 && (1..=32768).contains(&w) && (1..=32768).contains(&h)
@@ -275,10 +283,16 @@ fn desktop(
     };
     let page = tauri::Url::parse(url).map_err(|_| "invalid")?;
     let origin = page.origin();
+    blocked_nav().lock().unwrap().remove(&attempt);
     let builder = WebviewBuilder::new(format!("site-{attempt}"), WebviewUrl::External(page))
         .incognito(true)
         .on_navigation(move |url| {
-            url.origin() == origin && url.username().is_empty() && url.password().is_none()
+            let allowed =
+                url.origin() == origin && url.username().is_empty() && url.password().is_none();
+            if !allowed {
+                blocked_nav().lock().unwrap().insert(attempt);
+            }
+            allowed
         })
         .on_new_window(|_, _| NewWindowResponse::Deny)
         .on_permission_request(|_, _| PermissionResponse::Deny)
@@ -309,7 +323,11 @@ pub async fn site_view(
     }
     let mut closed = CLOSED.lock().await;
     match op.as_str() {
-        "close" => *closed = (*closed).max(attempt),
+        "close" => {
+            *closed = (*closed).max(attempt);
+            #[cfg(any(windows, target_os = "macos"))]
+            blocked_nav().lock().unwrap().remove(&attempt);
+        }
         "inspect" | "move" if attempt <= *closed => return Err("cancelled".into()),
         "inspect" => {}
         "move" if bounds.is_some_and(valid_bounds) => {}
@@ -334,7 +352,10 @@ pub async fn site_view(
             return Ok("closed".into());
         };
         match op.as_str() {
-            "close" => view.close().map_err(|_| "browser_failed")?,
+            "close" => {
+                blocked_nav().lock().unwrap().remove(&attempt);
+                view.close().map_err(|_| "browser_failed")?;
+            }
             "move" => {
                 let [x, y, w, h] = bounds.unwrap();
                 view.set_bounds(Rect {
@@ -356,9 +377,13 @@ pub async fn site_view(
                     .await
                     .ok()
                     .and_then(Result::ok);
-                return Ok(result
+                let state = result
                     .and_then(|s| serde_json::from_str::<String>(&s).ok())
-                    .unwrap_or_else(|| "loading".into()));
+                    .unwrap_or_else(|| "loading".into());
+                if state == "loading" && blocked_nav().lock().unwrap().remove(&attempt) {
+                    return Ok("preview_redirect_blocked".into());
+                }
+                return Ok(state);
             }
         }
         Ok("ok".into())

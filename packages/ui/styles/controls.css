@@ -122,16 +122,64 @@
   color: var(--bad);
 }
 
-.workspace { padding-block: clamp(18px, 3.5vh, 28px) 40px; }
+.workspace {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0;
+}
+.workspace:has(> #signin:not([hidden])),
+.workspace:has(> #loading:not([hidden])) {
+  overflow-y: auto;
+  overscroll-behavior: none;
+  padding: 12px var(--gutter) 32px;
+}
+.workspace > #content {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.workspace > #content:not(:has(> .panel)) {
+  overflow-y: auto;
+  overscroll-behavior: none;
+  padding: 12px var(--gutter) 32px;
+}
+.panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
 .panel.panel-enter,
 .panel-body.panel-enter { animation: fesen-enter var(--dur-mid) var(--ease) both; }
 .panel-bar {
+  flex: none;
   display: flex;
   align-items: stretch;
   justify-content: space-between;
   gap: 12px;
-  margin-bottom: 12px;
+  padding: 6px var(--gutter) 0;
   border-bottom: 1px solid var(--line);
+  background: var(--bg);
+}
+.panel-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: none;
+  padding: 12px var(--gutter) 32px;
+}
+@media (pointer: fine) {
+  .panel-body {
+    scrollbar-gutter: stable;
+    padding-right: max(16px, calc(var(--gutter) - 8px));
+  }
 }
 .panel-bar .tabs { min-width: 0; flex: 1; }
 .panel-bar > .button,

@@ -21,16 +21,30 @@ import AppKit
         }
     }
 
+    private func demoteIfPromoted() {
+        if NSApp.activationPolicy() != .accessory {
+            _ = NSApp.setActivationPolicy(.accessory)
+        }
+    }
+
     @objc func openApp() {
+        demoteIfPromoted()
         if instance(.regular)?.activate() == true {
-            NSApp.terminate(nil)
             return
         }
         let config = NSWorkspace.OpenConfiguration()
         config.createsNewApplicationInstance = true
-        NSWorkspace.shared.openApplication(at: bundle, configuration: config) { _, _ in
-            DispatchQueue.main.async { NSApp.terminate(nil) }
+        NSWorkspace.shared.openApplication(at: bundle, configuration: config) { [weak self] _, _ in
+            DispatchQueue.main.async { self?.demoteIfPromoted() }
         }
+    }
+
+    func applicationWillBecomeActive(_ notification: Notification) {
+        demoteIfPromoted()
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        demoteIfPromoted()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -39,6 +53,7 @@ import AppKit
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
+        demoteIfPromoted()
         // The cold GUI receives the open event; an existing GUI receives the join via its singleton.
         guard let url = urls.first(where: { $0.scheme == "fesen" && $0.host == "join" }),
               let link = URLComponents(url: url, resolvingAgainstBaseURL: false),
@@ -52,8 +67,8 @@ import AppKit
         let config = NSWorkspace.OpenConfiguration()
         config.createsNewApplicationInstance = true
         config.arguments = ["--fesen-join", url.absoluteString]
-        NSWorkspace.shared.open([url], withApplicationAt: bundle, configuration: config) { _, _ in
-            DispatchQueue.main.async { NSApp.terminate(nil) }
+        NSWorkspace.shared.open([url], withApplicationAt: bundle, configuration: config) { [weak self] _, _ in
+            DispatchQueue.main.async { self?.demoteIfPromoted() }
         }
     }
 }

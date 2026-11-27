@@ -170,6 +170,9 @@ private let trigramPaths: [[UInt8]] = [
     private var queue: [UInt8] = []
     private var animTimer: Timer?
     private var pollTicks = 0
+    private var publisherRunning = false
+    private var physical: PhysicalNetwork?
+    private let netQueue = DispatchQueue(label: "io.fesen.client.publisher", qos: .utility)
 
     init(bundle: URL, usesExtension: Bool) {
         self.usesExtension = usesExtension
@@ -194,15 +197,15 @@ private let trigramPaths: [[UInt8]] = [
         ) else {
             return NSImage(size: NSSize(width: 18, height: 18))
         }
-        let rows: [(bit: UInt8, y: CGFloat)] = [(1, 5), (2, 15), (4, 25)]
+        let rows: [(bit: UInt8, y: CGFloat)] = [(1, 6), (2, 16), (4, 26)]
         for row in rows {
             let rowAlpha: CGFloat = hotBit == 0 ? alpha : ((hotBit & row.bit) != 0 ? 1.0 : 0.36)
             ctx.setFillColor(red: 0, green: 0, blue: 0, alpha: rowAlpha)
             if (mask & row.bit) != 0 {
-                ctx.fill(CGRect(x: 4, y: row.y, width: 28, height: 6))
+                ctx.fill(CGRect(x: 5, y: row.y, width: 26, height: 4))
             } else {
-                ctx.fill(CGRect(x: 4, y: row.y, width: 12, height: 6))
-                ctx.fill(CGRect(x: 20, y: row.y, width: 12, height: 6))
+                ctx.fill(CGRect(x: 5, y: row.y, width: 10, height: 4))
+                ctx.fill(CGRect(x: 21, y: row.y, width: 10, height: 4))
             }
         }
         guard let cg = ctx.makeImage() else {
@@ -294,18 +297,8 @@ private let trigramPaths: [[UInt8]] = [
         }
     }
 
-    @objc func applicationDidFinishLaunching(_ notification: Notification) {
-        DistributedNotificationCenter.default().addObserver(self, selector: #selector(preferenceChanged),
-            name: MenuBarPreference.changed, object: bundle.path, suspensionBehavior: .deliverImmediately)
-        DistributedNotificationCenter.default().addObserver(self, selector: #selector(statusNotified),
-            name: MenuBarPreference.statusChanged, object: bundle.path, suspensionBehavior: .deliverImmediately)
-        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(workspaceChanged),
-            name: NSWorkspace.didLaunchApplicationNotification, object: nil)
-        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(workspaceChanged),
-            name: NSWorkspace.didTerminateApplicationNotification, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(vpnStatusChanged),
-            name: .NEVPNStatusDidChange, object: nil)
-        guard MenuBarPreference.local.refresh() else { quitMenu(); return }
+    private func showStatusItem() {
+        guard item == nil else { return }
         let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item = status
         renderMask(0b000, alpha: 0.50)
@@ -319,8 +312,50 @@ private let trigramPaths: [[UInt8]] = [
         menu.addItem(.separator())
         menu.addItem(withTitle: zh ? "退出飞弦" : "Quit Fesen", action: #selector(quitApp), keyEquivalent: "").target = self
         status.menu = menu
+        if markState == .connected {
+            renderMask(0b100, alpha: 1.0)
+        } else if markState == .connecting {
+            renderMask(currentMask, alpha: 0.9, highlightChanged: true)
+        }
+    }
+
+    private func hideStatusItem() {
+        if let status = item {
+            NSStatusBar.system.removeStatusItem(status)
+        }
+        item = nil
+        toggleItem = nil
+    }
+
+    @objc func applicationDidFinishLaunching(_ notification: Notification) {
+        DistributedNotificationCenter.default().addObserver(self, selector: #selector(preferenceChanged),
+            name: MenuBarPreference.changed, object: bundle.path, suspensionBehavior: .deliverImmediately)
+        DistributedNotificationCenter.default().addObserver(self, selector: #selector(statusNotified),
+            name: MenuBarPreference.statusChanged, object: bundle.path, suspensionBehavior: .deliverImmediately)
+        DistributedNotificationCenter.default().addObserver(self, selector: #selector(ensurePublisherRequested),
+            name: MenuBarPreference.ensurePublisher, object: bundle.path, suspensionBehavior: .deliverImmediately)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(workspaceChanged),
+            name: NSWorkspace.didLaunchApplicationNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(workspaceChanged),
+            name: NSWorkspace.didTerminateApplicationNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(vpnStatusChanged),
+            name: .NEVPNStatusDidChange, object: nil)
+        let enabled = MenuBarPreference.local.refresh()
+        if usesExtension && !enabled { quitMenu(); return }
+        if enabled { showStatusItem() }
         if usesExtension { Task { await refreshTunnel() } }
-        else { syncStatus() }
+        else {
+            ensurePublisherRunning()
+            syncStatus()
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        if !usesExtension {
+            ph_publisher_stop()
+            physical?.stop()
+            physical = nil
+        }
     }
 
     // Zero steady-state polling: refreshes on OS notifications, menu open, and briefly while connecting.
@@ -354,20 +389,34 @@ private let trigramPaths: [[UInt8]] = [
         }
     }
 
-    private func launchBackgroundPublisher(completion: @escaping @Sendable (Bool) -> Void) {
-        let executable = bundle.appendingPathComponent("Contents/MacOS/fesen")
-        let process = Process()
-        process.executableURL = executable
-        process.arguments = ["--publisher"]
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-            completion(true)
-        } catch {
-            completion(false)
+    private func ensurePublisherRunning() {
+        guard !usesExtension, !publisherRunning else { return }
+        publisherRunning = true
+        let net = PhysicalNetwork()
+        net.start(on: netQueue) { ph_publisher_changed() }
+        physical = net
+        Thread.detachNewThread { [weak self] in
+            ph_publisher_run()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.publisherRunning = false
+                self.physical?.stop()
+                self.physical = nil
+                self.setMark(.idle)
+                if !MenuBarPreference.local.refresh() {
+                    self.quitMenu()
+                }
+            }
         }
+    }
+
+    @objc private func ensurePublisherRequested(_ notification: Notification) {
+        ensurePublisherRunning()
+    }
+
+    private func launchBackgroundPublisher(completion: @escaping @Sendable (Bool) -> Void) {
+        ensurePublisherRunning()
+        completion(true)
     }
 
     private func connect() {
@@ -458,13 +507,10 @@ private let trigramPaths: [[UInt8]] = [
             NSApp.terminate(nil)
             return
         }
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let quitOk = LocalCoreIPC.sendQuit()
+        ph_publisher_stop()
+        DispatchQueue.global(qos: .utility).async {
+            _ = LocalCoreIPC.sendQuit()
             DispatchQueue.main.async {
-                if !quitOk {
-                    _ = self?.instance(.prohibited)?.terminate()
-                    _ = self?.instance(.accessory)?.terminate()
-                }
                 NSApp.terminate(nil)
             }
         }
@@ -477,7 +523,18 @@ private let trigramPaths: [[UInt8]] = [
     }
 
     @objc private func preferenceChanged(_ notification: Notification) {
-        if !MenuBarPreference.local.refresh() { quitMenu() }
+        let enabled = MenuBarPreference.local.refresh()
+        if usesExtension {
+            if !enabled { quitMenu() }
+            return
+        }
+        if enabled {
+            showStatusItem()
+            syncStatus()
+        } else {
+            hideStatusItem()
+            if !publisherRunning { quitMenu() }
+        }
     }
 
     @objc private func statusNotified(_ notification: Notification) {

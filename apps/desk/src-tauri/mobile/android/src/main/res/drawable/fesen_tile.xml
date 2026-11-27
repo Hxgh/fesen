@@ -3,8 +3,8 @@
     android:height="24dp"
     android:viewportWidth="64"
     android:viewportHeight="64">
-    <!-- Pure Gen trigram (☶), locked 5-bar monochrome geometry -->
-    <path android:fillColor="#ffffff" android:pathData="M4,6h56v12h-56z" />
-    <path android:fillColor="#ffffff" android:pathData="M4,26h24v12h-24z M36,26h24v12h-24z" />
-    <path android:fillColor="#ffffff" android:pathData="M4,46h24v12h-24z M36,46h24v12h-24z" />
+    <!-- Pure Gen trigram (☶), refined 5-bar monochrome geometry (8:10:12) -->
+    <path android:fillColor="#ffffff" android:pathData="M6,8h52v8h-52z" />
+    <path android:fillColor="#ffffff" android:pathData="M6,28h21v8h-21z M37,28h21v8h-21z" />
+    <path android:fillColor="#ffffff" android:pathData="M6,48h21v8h-21z M37,48h21v8h-21z" />
 </vector>

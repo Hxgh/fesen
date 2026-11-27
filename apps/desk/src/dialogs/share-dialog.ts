@@ -1,6 +1,6 @@
 import { failure, t } from "../i18n";
-import { createIconButton, osBadge } from "../../../../packages/ui/icons.js";
-import { singleIp, singlePort } from "../../../../packages/ui/host-card.js";
+import { createIconButton, targetOsPill } from "../../../../packages/ui/icons.js";
+import { meaningfulHostName, singleIp, singlePort } from "../../../../packages/ui/host-card.js";
 import { act, applyJoinLink, edit, editor, render, request, showDialog, showError, syncBrand } from "../app/runtime";
 import { effectiveKind, endpoint, inferDefaultKind, inputRanges, isUsableHostIp, parsePortEntries, ranges } from "../model/net";
 import { isActiveShare, state } from "../model/state";
@@ -9,27 +9,59 @@ import { button, dialogHeader, el, field, protocolSelect, str, submit } from "..
 
 export function confirmRemoveShare(share: Share) {
   state.message = "";
+  const addr = endpoint(share.rules.ips, share.rules.ports);
+  const ip = singleIp(share);
+  const trimmedName = share.name.trim();
+  const cleanName = ip
+    ? meaningfulHostName(trimmedName, ip, share.host_os ?? null)
+    : (trimmedName !== addr ? trimmedName : "");
+  const card = el(
+    "div",
+    "confirm-card",
+    el(
+      "div",
+      "confirm-head",
+      el("span", "confirm-addr", addr),
+      el("span", "proto-tag", effectiveKind(share).toUpperCase()),
+    ),
+    ...(cleanName ? [el("span", "confirm-name", cleanName)] : []),
+  );
   edit(
     t("confirm_remove"),
     submit(t("remove"), "danger"),
     () => {
       void act({ op: "remove", id: share.id }, () => editor.close());
     },
-    el("p", "muted", share.name),
-    el("p", "endpoint", endpoint(share.rules.ips, share.rules.ports)),
+    el("p", "muted", t("confirm_remove_body")),
+    card,
   );
 }
 
-export function confirmRemoveHost(ip: string, hostLabel: string, items: Share[]) {
+export function confirmRemoveHost(ip: string, cleanName: string, items: Share[]) {
   state.message = "";
+  const prompt = cleanName
+    ? t("confirm_remove_host_named").replace("{host}", cleanName).replace("{n}", String(items.length))
+    : t("confirm_remove_host_body").replace("{n}", String(items.length));
+  const sorted = [...items].sort((a, b) => (a.rules.ports[0]?.start ?? 0) - (b.rules.ports[0]?.start ?? 0));
+  const card = el(
+    "div",
+    "confirm-card",
+    el(
+      "div",
+      "confirm-head",
+      el("span", "confirm-addr", ip),
+      el("span", "count", t("ports_count").replace("{n}", String(items.length))),
+    ),
+    el("div", "confirm-ports", ...sorted.map((s) => el("span", "confirm-port", `:${ranges(s.rules.ports)}`))),
+  );
   edit(
     t("confirm_remove_host"),
     submit(t("remove_host"), "danger"),
     () => {
       void act({ op: "remove_many", ids: items.map((s) => s.id) }, () => editor.close());
     },
-    el("p", "muted", t("confirm_remove_host_body").replace("{host}", hostLabel).replace("{n}", String(items.length))),
-    el("p", "endpoint", `${ip} · ${items.map((s) => `:${ranges(s.rules.ports)}`).join(", ")}`),
+    el("p", "muted", prompt),
+    card,
   );
 }
 
@@ -186,6 +218,7 @@ export function openAddShare(prefill?: { ip?: string; name?: string }) {
 
   const initialExisting = ipVal ? existingForIp(ipVal) : [];
   const manageMode = initialExisting.length > 0;
+  const initialIp = manageMode ? ipVal : "";
   const oldHostName = manageMode ? (initialExisting[0]!.name || ipVal) : "";
 
   if (manageMode) {
@@ -377,7 +410,7 @@ export function openAddShare(prefill?: { ip?: string; name?: string }) {
       ? button(t("cancel_scan"), () => cancelHostProbe(true), "deep-scan-btn cancel")
       : button(t("deep_scan"), () => void detectCommonServices(true), "deep-scan-btn");
     function syncHeaderMeta() {
-      const osEl = osBadge(effectiveHostOs(), "server");
+      const osEl = targetOsPill(effectiveHostOs());
       osTagHost.replaceChildren(...(osEl ? [osEl] : []));
       const validIp = isUsableHostIp(ipVal.trim());
       detectBtn.disabled = state.busy || (!probingAll && !validIp);
@@ -391,7 +424,7 @@ export function openAddShare(prefill?: { ip?: string; name?: string }) {
       maxLength: 900,
       placeholder: "198.51.100.35 / 203.0.113.0/29",
       spellcheck: false,
-      disabled: manageMode || probingAll,
+      disabled: probingAll,
     });
     ipInput.addEventListener("input", () => {
       ipVal = ipInput.value;
@@ -547,11 +580,13 @@ export function openAddShare(prefill?: { ip?: string; name?: string }) {
       localError = "";
       const singleHost = isUsableHostIp(ipsText);
       const allDiscrete = chosen.every((c) => c.port !== undefined);
+      if (manageMode && !singleHost) { localError = t("invalid_host_ip"); draw(); return; }
       if (singleHost && allDiscrete) {
         const os = effectiveHostOs();
         void act({
           op: "save_host",
           ip: ipsText,
+          old_ip: manageMode ? initialIp : null,
           name: nameVal.trim() || ipsText,
           host_os: os,
           services: chosen.map((c) => ({ port: c.port!, kind: c.kind })),
@@ -590,7 +625,7 @@ export function openAddShare(prefill?: { ip?: string; name?: string }) {
     const footer = el(
       "div",
       "dialog-footer",
-      ...(manageMode ? [button(t("remove_host"), () => confirmRemoveHost(ipVal.trim(), nameVal.trim() || ipVal.trim(), initialExisting), "button ghost text-danger leading")] : []),
+      ...(manageMode ? [button(t("remove_host"), () => confirmRemoveHost(initialIp, meaningfulHostName(oldHostName, initialIp, null), initialExisting), "button ghost text-danger leading")] : []),
       button(t("cancel"), () => { if (!state.busy) editor.close(); }, "button"),
       saveBtn,
     );

@@ -44,6 +44,8 @@ pub struct Routes {
     to_original: HashMap<Ipv4Addr, Ipv4Addr>,
     to_service_original: HashMap<Ipv4Addr, (String, Ipv4Addr)>,
     primary_indices: Vec<usize>,
+    primary_keys: HashSet<(String, String)>,
+    remapped_keys: HashSet<(String, String)>,
     remapped_by_owner: HashMap<String, Vec<usize>>,
     reserved: BTreeMap<u32, u32>,
     reserved_peers: HashMap<String, BTreeMap<u32, u32>>,
@@ -87,6 +89,7 @@ impl Routes {
         labels: &[Label],
         control: Option<Ipv4Addr>,
         keep_empty_tun: bool,
+        local_shares: &[Range<Ipv4Addr>],
     ) -> Result<Self, Code> {
         if directory.is_empty() && !keep_empty_tun {
             return Ok(previous.cleared());
@@ -98,6 +101,7 @@ impl Routes {
                 .iter()
                 .filter(|r| r.cidr.prefix > 0)
                 .map(|r| extract(r.cidr.range()))
+                .chain(local_shares.iter().copied().map(extract))
                 .chain(
                     network
                         .addresses
@@ -108,15 +112,91 @@ impl Routes {
                         .map(|ip| (ip.into(), ip.into())),
                 ),
         );
+        let mut primary_flags = vec![false; directory.len()];
+        let mut remapped_flags = vec![false; directory.len()];
+        let mut primary: Vec<&Offering> = Vec::with_capacity(directory.len());
+        let has_conflict = |primary: &[&Offering], o: &Offering| {
+            primary
+                .iter()
+                .any(|p| p.owner != o.owner && p.service.rules.conflicts(&o.service.rules))
+        };
+        // Keep currently connected primaries first so new arrivals never hijack an active peer's route.
+        for (idx, o) in directory.iter().enumerate() {
+            let key = (o.owner.clone(), o.service.id.clone());
+            if previous.primary_keys.contains(&key) && !has_conflict(&primary, o) {
+                primary.push(o);
+                primary_flags[idx] = true;
+            }
+        }
+        // Keep continuously online remapped peers pinned to their virtual IP across primary blips.
+        for (idx, o) in directory.iter().enumerate() {
+            if primary_flags[idx] {
+                continue;
+            }
+            let key = (o.owner.clone(), o.service.id.clone());
+            if previous.remapped_keys.contains(&key) {
+                remapped_flags[idx] = true;
+            }
+        }
+        for (idx, o) in directory.iter().enumerate() {
+            if primary_flags[idx] || remapped_flags[idx] {
+                continue;
+            }
+            if has_conflict(&primary, o) {
+                remapped_flags[idx] = true;
+            } else {
+                primary.push(o);
+                primary_flags[idx] = true;
+            }
+        }
+        // Keep all ports of a remapped peer host unified on that peer's virtual IP.
+        loop {
+            let mut remapped_owner_ips: HashMap<&str, Vec<(u32, u32)>> = HashMap::new();
+            for (idx, o) in directory.iter().enumerate() {
+                if remapped_flags[idx] {
+                    remapped_owner_ips
+                        .entry(o.owner.as_str())
+                        .or_default()
+                        .extend(o.service.rules.ips.iter().copied().map(extract));
+                }
+            }
+            if remapped_owner_ips.is_empty() {
+                break;
+            }
+            for spans in remapped_owner_ips.values_mut() {
+                *spans = union(spans.iter().copied());
+            }
+            let mut moved = false;
+            for (idx, o) in directory.iter().enumerate() {
+                if !primary_flags[idx] {
+                    continue;
+                }
+                if let Some(spans) = remapped_owner_ips.get(o.owner.as_str())
+                    && o.service.rules.ips.iter().any(|r| {
+                        let (a, b) = extract(*r);
+                        let pos = spans.partition_point(|&(_, end)| end < a);
+                        spans.get(pos).is_some_and(|&(sa, _)| sa <= b)
+                    })
+                {
+                    primary_flags[idx] = false;
+                    remapped_flags[idx] = true;
+                    moved = true;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
         let mut primary: Vec<&Offering> = Vec::with_capacity(directory.len());
         let mut primary_indices: Vec<usize> = Vec::with_capacity(directory.len());
+        let mut primary_keys = HashSet::new();
+        let mut remapped_keys = HashSet::new();
         let mut remapped_services = HashSet::new();
         let mut remapped_by_owner: HashMap<String, Vec<usize>> = HashMap::new();
         for (idx, o) in directory.iter().enumerate() {
-            if primary
-                .iter()
-                .any(|p| p.owner != o.owner && p.service.rules.conflicts(&o.service.rules))
-            {
+            let key = (o.owner.clone(), o.service.id.clone());
+            if remapped_flags[idx] {
+                remapped_keys.insert(key);
                 remapped_services.insert(o.service.id.clone());
                 remapped_by_owner
                     .entry(o.owner.clone())
@@ -125,6 +205,7 @@ impl Routes {
             } else {
                 primary.push(o);
                 primary_indices.push(idx);
+                primary_keys.insert(key);
             }
         }
         let targets = union(
@@ -313,6 +394,8 @@ impl Routes {
             to_original,
             to_service_original,
             primary_indices,
+            primary_keys,
+            remapped_keys,
             remapped_by_owner,
             directory,
             reserved,
@@ -392,10 +475,11 @@ mod tests {
     #[test]
     fn connected_mobile_has_an_empty_split_tunnel_until_a_share_exists() {
         let network = Network::default();
-        let active = Routes::build(&Routes::default(), &network, vec![], &[], None, true).unwrap();
+        let active =
+            Routes::build(&Routes::default(), &network, vec![], &[], None, true, &[]).unwrap();
         assert!(active.tun.address.is_some());
         assert!(active.tun.dns.is_none() && active.tun.routes.is_empty());
-        let off = Routes::build(&active, &network, vec![], &[], None, false).unwrap();
+        let off = Routes::build(&active, &network, vec![], &[], None, false, &[]).unwrap();
         assert_eq!(off.tun, Tun::default());
     }
 
@@ -447,6 +531,7 @@ mod tests {
             &labels,
             None,
             false,
+            &[],
         )
         .unwrap();
         assert!(!routes.ready_for(&offers));
@@ -485,7 +570,7 @@ mod tests {
             index: 1,
             metric: 0,
         });
-        let rebuilt = Routes::build(&routes, &network, offers, &labels, None, false).unwrap();
+        let rebuilt = Routes::build(&routes, &network, offers, &labels, None, false, &[]).unwrap();
         assert_ne!(rebuilt.tun.address, routes.tun.address);
         assert_ne!(rebuilt.tun.dns, routes.tun.dns);
         assert_ne!(rebuilt.tun.address, Some(alias));
@@ -510,21 +595,106 @@ mod tests {
         };
         let network = Network::default();
         let sa = offer("dev-a", "0000000000000000000000000000000a", "192.0.2.10", "80");
-        let sb = offer("dev-b", "0000000000000000000000000000000b", "192.0.2.10", "80");
-        let routes = Routes::build(&Routes::default(), &network, vec![sa.clone(), sb.clone()], &[], None, false).unwrap();
+        let sb_http = offer("dev-b", "0000000000000000000000000000000b", "192.0.2.10", "80");
+        let sb_tls = offer("dev-b", "0000000000000000000000000000000c", "192.0.2.10", "443");
+        let routes = Routes::build(
+            &Routes::default(),
+            &network,
+            vec![sa.clone(), sb_http.clone(), sb_tls.clone()],
+            &[],
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
         let orig: Ipv4Addr = "192.0.2.10".parse().unwrap();
         let ip_a = routes.access_ip_for(&sa.service.id, orig);
-        let ip_b = routes.access_ip_for(&sb.service.id, orig);
+        let ip_b_http = routes.access_ip_for(&sb_http.service.id, orig);
+        let ip_b_tls = routes.access_ip_for(&sb_tls.service.id, orig);
         assert_eq!(ip_a, orig);
-        assert_ne!(ip_b, orig);
-        assert!(VIRTUAL.contains(ip_b));
+        assert_ne!(ip_b_http, orig);
+        assert!(VIRTUAL.contains(ip_b_http));
+        // All ports on the same remapped peer host stay unified on one virtual IP.
+        assert_eq!(ip_b_http, ip_b_tls);
         assert!(matches!(
             routes.destination(SocketAddrV4::new(ip_a, 80)),
             Destination::Peer { owner, .. } if owner == "dev-a"
         ));
         assert!(matches!(
-            routes.destination(SocketAddrV4::new(ip_b, 80)),
+            routes.destination(SocketAddrV4::new(ip_b_http, 80)),
             Destination::Peer { owner, .. } if owner == "dev-b"
         ));
+        assert!(matches!(
+            routes.destination(SocketAddrV4::new(ip_b_tls, 443)),
+            Destination::Peer { owner, .. } if owner == "dev-b"
+        ));
+
+        // If dev-a drops transiently while dev-b stays connected, dev-b retains its virtual IP
+        // and does not silently hijack dev-a's original IP.
+        let routes_b_only = Routes::build(
+            &routes,
+            &network,
+            vec![sb_http.clone(), sb_tls.clone()],
+            &[],
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(routes_b_only.access_ip_for(&sb_http.service.id, orig), ip_b_http);
+        assert_eq!(routes_b_only.access_ip_for(&sb_tls.service.id, orig), ip_b_tls);
+
+        // Active local share protects that IP even when not present in a specific interface route.
+        let local_span = Range {
+            start: orig,
+            end: orig,
+        };
+        let routes_with_local = Routes::build(
+            &Routes::default(),
+            &network,
+            vec![sa.clone()],
+            &[],
+            None,
+            false,
+            &[local_span],
+        )
+        .unwrap();
+        let mapped_a = routes_with_local.access_ip_for(&sa.service.id, orig);
+        assert_ne!(mapped_a, orig);
+        assert!(VIRTUAL.contains(mapped_a));
+        assert!(matches!(
+            routes_with_local.destination(SocketAddrV4::new(orig, 80)),
+            Destination::Local
+        ));
+    }
+
+    #[test]
+    fn existing_primary_owner_keeps_original_ip_when_alphabetically_earlier_peer_joins() {
+        let offer = |owner: &str, id: &str, ips, ports| Offering {
+            owner: owner.into(),
+            member: owner.into(),
+            device: Some(owner.into()),
+            device_os: None,
+            service: Publication {
+                id: id.into(),
+                name: id.into(),
+                rules: Rules::parse(ips, ports).unwrap(),
+                http: false,
+                kind: None,
+                host_os: None,
+            },
+        };
+        let network = Network::default();
+        let bob = offer("bob", "00000000000000000000000000000002", "198.51.100.55", "80");
+        let alice = offer("alice", "00000000000000000000000000000001", "198.51.100.55", "80");
+        let orig: Ipv4Addr = "198.51.100.55".parse().unwrap();
+
+        let r1 = Routes::build(&Routes::default(), &network, vec![bob.clone()], &[], None, false, &[]).unwrap();
+        assert_eq!(r1.access_ip_for(&bob.service.id, orig), orig);
+
+        // Server sorts alice ahead of bob; bob must retain 198.51.100.55 and alice maps virtually.
+        let r2 = Routes::build(&r1, &network, vec![alice.clone(), bob.clone()], &[], None, false, &[]).unwrap();
+        assert_eq!(r2.access_ip_for(&bob.service.id, orig), orig);
+        assert_ne!(r2.access_ip_for(&alice.service.id, orig), orig);
     }
 }

@@ -1,8 +1,12 @@
+import { invoke } from "@tauri-apps/api/core";
 import { failure, i18n, t } from "../i18n";
 import { osBadge } from "../../../../packages/ui/icons.js";
+import { groupByHost, singleIp } from "../../../../packages/ui/host-card.js";
 import { openSettingsModal } from "../../../../packages/ui/settings.js";
-import { act, edit, editor, render, request, scale, serverHost, settingsDialog, syncBrand, theme } from "../app/runtime";
+import { act, edit, editor, render, request, scale, serverHost, settingsDialog, showDialog, syncBrand, theme } from "../app/runtime";
 import { desktop, mac, state } from "../model/state";
+import { endpoint } from "../model/net";
+import type { DeviceProfile, Share } from "../model/types";
 import { button, el, field, notify, str, submit, tool } from "../ui/dom";
 import { currentWinSize, getCloseBehavior, isWinSizeDefault, resetDesktopWindowSize, syncCloseBehavior } from "../ui/window";
 import { refreshSiteDialogI18n } from "./site-dialog";
@@ -17,6 +21,99 @@ function openRenameDevice(currentName: string) {
     },
     field(t("device"), "label", currentName, { required: true, maxLength: 64 }),
   );
+}
+
+function backupRuleChips(p: DeviceProfile, includeShares: boolean): HTMLElement[] {
+  const chips: HTMLElement[] = [];
+  if (includeShares) {
+    const entries = groupByHost(p.shares, (s: Share) => singleIp(s));
+    for (const entry of entries) {
+      if (entry.grouped && entry.items.length >= 2) {
+        chips.push(el("span", "confirm-port", `${entry.ip} (${entry.items.length})`));
+      } else {
+        const s = (entry.grouped ? entry.items[0] : entry.item) as Share;
+        chips.push(el("span", "confirm-port", endpoint(s.rules.ips, s.rules.ports)));
+      }
+    }
+  }
+  for (const f of p.forwards) {
+    chips.push(el("span", "confirm-port", `127.0.0.1:${f.local_port}`));
+  }
+  const maxShown = 6;
+  if (chips.length > maxShown) {
+    const rest = chips.length - maxShown;
+    return [...chips.slice(0, maxShown), el("span", "confirm-port muted", `+${rest}`)];
+  }
+  return chips;
+}
+
+function visibleBackupProfiles(): DeviceProfile[] {
+  const hasLocalRules = (state.status?.shares.length ?? 0) > 0 || (state.status?.forwards?.length ?? 0) > 0;
+  return (state.status?.cloud_profiles ?? []).filter((p) => {
+    const isSelfDev = !!state.status?.machine_id && p.machine_id === state.status.machine_id;
+    if (isSelfDev) {
+      return !hasLocalRules && (p.shares.length > 0 || p.forwards.length > 0);
+    }
+    // Never import another device's LAN shares (different device = different LAN); only 127 forwards are portable.
+    return p.forwards.length > 0;
+  });
+}
+
+function openRuleBackupsDialog() {
+  settingsDialog.close();
+  function draw() {
+    const profiles = visibleBackupProfiles();
+    if (!profiles.length) {
+      editor.close();
+      return;
+    }
+    const cards = profiles.map((p) => {
+      const isSelfDev = !!state.status?.machine_id && p.machine_id === state.status.machine_id;
+      const osEl = osBadge(p.os, { fallback: "device", local: isSelfDev, prefix: isSelfDev ? t("badge_local") : "" });
+      const impBtn = button(t(isSelfDev ? "import_profile" : "import_forwards_only"), () => {
+        void request({
+          op: "import_profile",
+          machine_id: p.machine_id,
+          import_shares: isSelfDev,
+          import_forwards: true,
+        }, false).then((next) => {
+          state.status = next;
+          editor.close();
+          render(true);
+          notify(t(isSelfDev ? "profile_imported" : "forwards_imported"));
+        }).catch((err) => notify(failure(err), true));
+      }, "button");
+      const delBtn = tool("close", t("delete_backup"), () => {
+        void request({ op: "delete_profile", machine_id: p.machine_id }, false)
+          .then((next) => {
+            state.status = next;
+            render(true);
+            if (editor.open) draw();
+          })
+          .catch((err) => notify(failure(err), true));
+      });
+      const chips = backupRuleChips(p, isSelfDev);
+      return el(
+        "div",
+        "confirm-card",
+        el(
+          "div",
+          "confirm-head",
+          el(
+            "div",
+            "backup-card-title",
+            ...(osEl ? [osEl] : []),
+            el("span", "settings-device-name", p.name),
+            ...(isSelfDev ? [el("span", "local-tag", t("badge_local"))] : []),
+          ),
+          el("div", "backup-card-actions", impBtn, delBtn),
+        ),
+        ...(chips.length ? [el("div", "confirm-ports", ...chips)] : []),
+      );
+    });
+    showDialog(t("rule_backups_title"), cards, [], false);
+  }
+  draw();
 }
 
 export function openSettings() {
@@ -60,6 +157,25 @@ export function openSettings() {
           fb.setAttribute("role", "alert");
           nodes.push(fb);
         }
+      }
+
+      if (!desktop) {
+        const tileBtn = button(t("quick_tile_add"), () => {
+          tileBtn.disabled = true;
+          void invoke<string>("add_quick_tile")
+            .then((res) => {
+              if (res === "added") notify(t("quick_tile_added"));
+              else if (res === "already_added") notify(t("quick_tile_already"));
+            })
+            .catch(() => notify(t("quick_tile_failed"), true))
+            .finally(() => { tileBtn.disabled = false; });
+        }, "button");
+        nodes.push(el(
+          "div",
+          "settings-row",
+          el("span", "settings-label", t("quick_tile")),
+          tileBtn,
+        ));
       }
 
       if (desktop) {
@@ -157,47 +273,19 @@ export function openSettings() {
         nodes.push(el("div", "settings-row", el("span", "settings-label", t("current_device")), devVal));
       }
 
-      const profiles = (state.status?.cloud_profiles ?? []).filter((p) => p.shares.length > 0 || p.forwards.length > 0);
+      const profiles = visibleBackupProfiles();
       if (state.status?.member && profiles.length) {
-        const list = el("div", "settings-profile-list", ...profiles.map((p) => {
-          const osEl = osBadge(p.os, "device");
-          const counts = `${p.shares.length}/${p.forwards.length}`;
-          const impBtn = button(t("import_profile"), () => {
-            void request({
-              op: "import_profile",
-              machine_id: p.machine_id,
-              import_shares: true,
-              import_forwards: true,
-            }, false).then((next) => {
-              state.status = next;
-              render(true);
-              notify(t("profile_imported"));
-              if (settingsDialog.open) redraw();
-            }).catch((err) => notify(failure(err), true));
-          }, "button");
-          const delBtn = tool("close", t("delete_backup"), () => {
-            void request({ op: "delete_profile", machine_id: p.machine_id }, false)
-              .then((next) => {
-                state.status = next;
-                render(true);
-                if (settingsDialog.open) redraw();
-              })
-              .catch((err) => notify(failure(err), true));
-          });
-          return el(
+        nodes.push(el(
+          "div",
+          "settings-row",
+          el("span", "settings-label", t("rule_backups")),
+          el(
             "div",
-            "settings-profile-row",
-            el(
-              "div",
-              "settings-profile-meta",
-              ...(osEl ? [osEl] : []),
-              el("span", "settings-device-name", p.name),
-              el("span", "mono muted", `#${p.machine_id.slice(0, 6)} · ${counts}`),
-            ),
-            el("div", "settings-profile-btns", impBtn, delBtn),
-          );
-        }));
-        nodes.push(el("div", "field-group", el("span", "settings-label", t("cloud_profiles")), list));
+            "settings-window",
+            el("span", "settings-window-val", t("devices_count").replace("{n}", String(profiles.length))),
+            button(t("rule_backups_open"), () => openRuleBackupsDialog(), "button"),
+          ),
+        ));
       }
 
       if (state.status?.member && state.status.server) {
