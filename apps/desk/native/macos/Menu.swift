@@ -5,12 +5,28 @@ import Foundation
 import NetworkExtension
 
 @main private struct Tray {
-    @MainActor static func main() {
+    static func main() {
         let args = CommandLine.arguments
-        guard args.count == 2, ["--local", "--extension"].contains(args[1]) else { return }
-        let bundle = URL(fileURLWithPath: args[0]).resolvingSymlinksInPath()
+        let executable = URL(fileURLWithPath: args[0]).resolvingSymlinksInPath()
+        let menuApp = executable
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        guard Bundle(url: bundle)?.bundleIdentifier == "io.fesen.client" else { return }
+        let bundle = menuApp
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        guard (NSDictionary(contentsOf: bundle.appendingPathComponent("Contents/Info.plist"))?["CFBundleIdentifier"] as? String) == "io.fesen.client" else { return }
+        if args.count == 3, args[1] == "--spawn", ["--local", "--extension"].contains(args[2]) {
+            // Relaunch via LaunchServices from a non-AppKit process so the GUI never owns parentASN.
+            let config = NSWorkspace.OpenConfiguration()
+            config.createsNewApplicationInstance = true
+            config.activates = false
+            config.arguments = [args[2]]
+            let done = DispatchSemaphore(value: 0)
+            NSWorkspace.shared.openApplication(at: menuApp, configuration: config) { _, _ in
+                done.signal()
+            }
+            _ = done.wait(timeout: .now() + 5)
+            return
+        }
+        guard args.count == 2, ["--local", "--extension"].contains(args[1]) else { return }
         let cache = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/io.fesen.client")
         try? FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
         let fd = open(cache.appendingPathComponent("menu.lock").path, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
@@ -25,7 +41,9 @@ import NetworkExtension
             usleep(50_000)
         }
         guard locked else { return }
-        Menu(bundle: bundle, usesExtension: args[1] == "--extension").run()
+        MainActor.assumeIsolated {
+            Menu(bundle: bundle, usesExtension: args[1] == "--extension").run()
+        }
     }
 }
 
@@ -171,8 +189,8 @@ private let trigramPaths: [[UInt8]] = [
     private var animTimer: Timer?
     private var pollTicks = 0
     private var publisherRunning = false
-    private var physical: PhysicalNetwork?
-    private let netQueue = DispatchQueue(label: "io.fesen.client.publisher", qos: .utility)
+    private var publisherProcess: Process?
+    private var allowTerminate = false
 
     init(bundle: URL, usesExtension: Bool) {
         self.usesExtension = usesExtension
@@ -328,6 +346,8 @@ private let trigramPaths: [[UInt8]] = [
     }
 
     @objc func applicationDidFinishLaunching(_ notification: Notification) {
+        ProcessInfo.processInfo.disableAutomaticTermination("Fesen background service")
+        ProcessInfo.processInfo.disableSuddenTermination()
         DistributedNotificationCenter.default().addObserver(self, selector: #selector(preferenceChanged),
             name: MenuBarPreference.changed, object: bundle.path, suspensionBehavior: .deliverImmediately)
         DistributedNotificationCenter.default().addObserver(self, selector: #selector(statusNotified),
@@ -338,6 +358,8 @@ private let trigramPaths: [[UInt8]] = [
             name: NSWorkspace.didLaunchApplicationNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(workspaceChanged),
             name: NSWorkspace.didTerminateApplicationNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(systemWillPowerOff),
+            name: NSWorkspace.willPowerOffNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(vpnStatusChanged),
             name: .NEVPNStatusDidChange, object: nil)
         let enabled = MenuBarPreference.local.refresh()
@@ -350,11 +372,24 @@ private let trigramPaths: [[UInt8]] = [
         }
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if allowTerminate || (!MenuBarPreference.local.refresh() && (usesExtension || !publisherRunning)) {
+            return .terminateNow
+        }
+        return .terminateCancel
+    }
+
+    @objc private func systemWillPowerOff(_ notification: Notification) {
+        allowTerminate = true
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         if !usesExtension {
-            ph_publisher_stop()
-            physical?.stop()
-            physical = nil
+            if publisherProcess?.isRunning == true {
+                _ = LocalCoreIPC.sendQuit()
+                publisherProcess?.terminate()
+                publisherProcess = nil
+            }
         }
     }
 
@@ -390,23 +425,34 @@ private let trigramPaths: [[UInt8]] = [
     }
 
     private func ensurePublisherRunning() {
-        guard !usesExtension, !publisherRunning else { return }
+        guard !usesExtension else { return }
+        if publisherProcess?.isRunning == true {
+            publisherRunning = true
+            return
+        }
+        let executable = bundle.appendingPathComponent("Contents/MacOS/fesen")
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = ["--publisher"]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
         publisherRunning = true
-        let net = PhysicalNetwork()
-        net.start(on: netQueue) { ph_publisher_changed() }
-        physical = net
-        Thread.detachNewThread { [weak self] in
-            ph_publisher_run()
+        process.terminationHandler = { [weak self] _ in
             DispatchQueue.main.async {
                 guard let self else { return }
+                self.publisherProcess = nil
                 self.publisherRunning = false
-                self.physical?.stop()
-                self.physical = nil
                 self.setMark(.idle)
                 if !MenuBarPreference.local.refresh() {
                     self.quitMenu()
                 }
             }
+        }
+        if (try? process.run()) != nil {
+            publisherProcess = process
+        } else {
+            publisherRunning = false
         }
     }
 
@@ -499,6 +545,7 @@ private let trigramPaths: [[UInt8]] = [
     }
 
     @objc private func quitApp() {
+        allowTerminate = true
         animTimer?.invalidate()
         animTimer = nil
         _ = instance(.regular)?.terminate()
@@ -507,16 +554,17 @@ private let trigramPaths: [[UInt8]] = [
             NSApp.terminate(nil)
             return
         }
-        ph_publisher_stop()
-        DispatchQueue.global(qos: .utility).async {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
             _ = LocalCoreIPC.sendQuit()
             DispatchQueue.main.async {
+                self?.publisherProcess?.terminate()
                 NSApp.terminate(nil)
             }
         }
     }
 
     @objc private func quitMenu() {
+        allowTerminate = true
         animTimer?.invalidate()
         animTimer = nil
         NSApp.terminate(nil)

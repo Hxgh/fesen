@@ -84,7 +84,8 @@ final class AppleHost {
     private var manager: NETunnelProviderManager?
     private let activation = Activation()
     private var installation: Task<NETunnelProviderManager, Error>?
-    private var tray: Process?
+    private var tray: NSRunningApplication?
+    private var launchingTray = false
 
     func find() async throws -> NETunnelProviderManager? {
         if let manager { return manager }
@@ -168,25 +169,42 @@ final class AppleHost {
     func openTray(force: Bool = false) {
         guard force || MenuBarPreference.local.enabled else { closeTray(); return }
         for app in NSWorkspace.shared.runningApplications where MenuBarPreference.isMenu(app.executableURL, in: bundleURLIfAny()) {
-            if !app.isTerminated { return }
+            if !app.isTerminated {
+                tray = app
+                return
+            }
         }
-        if tray?.isRunning == true { return }
-        let executable = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/fesen-menu")
+        if tray?.isTerminated == false || launchingTray { return }
+        let executable = MenuBarPreference.menuAppURL(in: Bundle.main.bundleURL)
+            .appendingPathComponent("Contents/MacOS/fesen-menu")
+        let mode = invalidPackage == nil ? "--extension" : "--local"
         let process = Process()
         process.executableURL = executable
-        process.arguments = [invalidPackage == nil ? "--extension" : "--local"]
+        process.arguments = ["--spawn", mode]
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
-        if (try? process.run()) != nil { tray = process }
+        launchingTray = true
+        process.terminationHandler = { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.launchingTray = false
+                self.tray = NSWorkspace.shared.runningApplications.first {
+                    !$0.isTerminated && MenuBarPreference.isMenu($0.executableURL, in: self.bundleURLIfAny())
+                }
+            }
+        }
+        if (try? process.run()) == nil {
+            launchingTray = false
+        }
     }
 
     private func bundleURLIfAny() -> URL { Bundle.main.bundleURL }
 
     func closeTray() {
-        tray?.terminate()
+        _ = tray?.terminate()
         tray = nil
-        // Reopened GUIs don't own the old Process handle. Match only the menu executable, never the core.
+        // Reopened GUIs don't own the old launch handle. Match only the menu executable, never the core.
         let bundle = Bundle.main.bundleURL
         DistributedNotificationCenter.default().postNotificationName(MenuBarPreference.changed,
             object: bundle.standardizedFileURL.path, userInfo: nil, deliverImmediately: true)
@@ -274,6 +292,30 @@ private final class Activation: NSObject, @preconcurrency OSSystemExtensionReque
         }
         complete(failure)
     }
+}
+
+@_cdecl("ph_host_publisher_main")
+func hostPublisherMain() {
+    guard Bundle.main.bundleIdentifier == "io.fesen.client" else { return }
+    // Keep the background publisher off AppKit: a windowless .prohibited NSApplication
+    // is terminated by macOS loginwindow (~30s) via kAEQuitApplication + SIGTERM.
+    let queue = DispatchQueue(label: "io.fesen.client.publisher", qos: .utility)
+    let physical = PhysicalNetwork()
+    physical.start(on: queue) { ph_publisher_changed() }
+    signal(SIGTERM, SIG_IGN)
+    signal(SIGINT, SIG_IGN)
+    let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: queue)
+    term.setEventHandler { ph_publisher_stop() }
+    term.resume()
+    let intr = DispatchSource.makeSignalSource(signal: SIGINT, queue: queue)
+    intr.setEventHandler { ph_publisher_stop() }
+    intr.resume()
+    defer {
+        term.cancel()
+        intr.cancel()
+        physical.stop()
+    }
+    ph_publisher_run()
 }
 
 typealias Callback = @convention(c) (UInt, UnsafePointer<UInt8>?, Int) -> Void

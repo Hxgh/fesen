@@ -59,19 +59,30 @@ swiftc -target arm64-apple-macos15.0 -swift-version 5 -O -module-name FesenTunne
   -import-objc-header "$tunnel/Core.h" "$tunnel/PhysicalNetwork.swift" "$tunnel/Tunnel.swift" "$tunnel/main.swift" \
   "$root/target/$t/$profile/libfesen_core.a" -framework NetworkExtension -framework Security \
   -framework SystemConfiguration -o "$extension/MacOS/FesenTunnel"
-swiftc -target arm64-apple-macos15.0 -swift-version 5 -O -module-name FesenMenu \
-  -import-objc-header "$tunnel/Core.h" "$tunnel/PhysicalNetwork.swift" \
-  "$desk/native/macos/Accessory.swift" "$desk/native/macos/MenuBarPreference.swift" "$desk/native/macos/Menu.swift" \
-  "$root/target/$t/$profile/libfesen_core.a" -framework Network -framework Security \
-  -framework SystemConfiguration -o "$app/Contents/MacOS/fesen-menu"
 mkdir -p "$app/Contents/Resources"
 cp -R "$desk/native/macos/zh-Hans.lproj" "$desk/native/macos/en.lproj" "$app/Contents/Resources/"
 plutil -replace LSHasLocalizedDisplayName -bool true "$app/Contents/Info.plist"
+menu_bundle="$app/Contents/Helpers/FesenMenu.app"
+menu_contents="$menu_bundle/Contents"
+mkdir -p "$menu_contents/MacOS" "$menu_contents/Resources"
+cp -R "$desk/native/macos/zh-Hans.lproj" "$desk/native/macos/en.lproj" "$menu_contents/Resources/"
+cp "$app/Contents/Info.plist" "$menu_contents/Info.plist"
+plutil -replace CFBundleExecutable -string fesen-menu "$menu_contents/Info.plist"
+plutil -replace CFBundleIdentifier -string io.fesen.client.menu "$menu_contents/Info.plist"
+plutil -replace LSUIElement -bool true "$menu_contents/Info.plist"
+plutil -replace NSSupportsAutomaticTermination -bool false "$menu_contents/Info.plist"
+plutil -remove CFBundleURLTypes "$menu_contents/Info.plist" 2>/dev/null || true
+plutil -remove CFBundleIconFile "$menu_contents/Info.plist" 2>/dev/null || true
+swiftc -target arm64-apple-macos15.0 -swift-version 5 -O -module-name FesenMenu \
+  "$desk/native/macos/Accessory.swift" "$desk/native/macos/MenuBarPreference.swift" "$desk/native/macos/Menu.swift" \
+  -framework NetworkExtension \
+  -o "$menu_contents/MacOS/fesen-menu"
 
 if ! $unsigned; then
   signing="$(mktemp -d)"
   trap 'rm -r "$signing"' EXIT
   cp "$FESEN_HOST_PROFILE" "$app/Contents/embedded.provisionprofile"
+  cp "$FESEN_HOST_PROFILE" "$menu_contents/embedded.provisionprofile"
   cp "$FESEN_TUNNEL_PROFILE" "$extension/embedded.provisionprofile"
   cp "$desk/native/macos/Host.entitlements" "$signing/host.plist"
   cp "$tunnel/Tunnel.entitlements" "$signing/tunnel.plist"
@@ -83,13 +94,13 @@ if ! $unsigned; then
   done
   codesign --force --timestamp --options runtime --sign "$FESEN_SIGN_ID" --entitlements "$signing/tunnel.plist" "${extension%/Contents}"
   codesign --force --timestamp --options runtime --sign "$FESEN_SIGN_ID" --identifier io.fesen.client \
-    --entitlements "$signing/host.plist" "$app/Contents/MacOS/fesen-menu"
+    --entitlements "$signing/host.plist" "$menu_bundle"
   codesign --force --timestamp --options runtime --sign "$FESEN_SIGN_ID" --entitlements "$signing/host.plist" "$app"
 else
   # Seal local builds too. A linker-only signature omits Info.plist and identifies
   # each build by a different executable name instead of the responsible app.
   codesign --force --sign - --timestamp=none "${extension%/Contents}"
-  codesign --force --sign - --timestamp=none --identifier io.fesen.client.menu "$app/Contents/MacOS/fesen-menu"
+  codesign --force --sign - --timestamp=none --identifier io.fesen.client "$menu_bundle"
   codesign --force --sign - --timestamp=none "$app"
 fi
 codesign --verify --deep --strict "$app"

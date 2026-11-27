@@ -16,6 +16,7 @@ unsafe extern "C" {
     fn ph_host_tray();
     fn ph_host_close_tray();
     fn ph_host_launch_publisher(context: usize, done: unsafe extern "C" fn(usize, i32));
+    fn ph_host_publisher_main();
 }
 
 pub fn configure_window(window: &tauri::WebviewWindow) {
@@ -26,7 +27,14 @@ pub fn configure_window(window: &tauri::WebviewWindow) {
 
 // Runs on the executable's main thread, before Tauri, its WebView or the GUI singleton.
 pub fn native_publisher() -> bool {
-    false
+    if !std::env::args_os()
+        .skip(1)
+        .eq([std::ffi::OsString::from("--publisher")])
+    {
+        return false;
+    }
+    unsafe { ph_host_publisher_main() };
+    true
 }
 
 unsafe extern "C" fn launched(context: usize, ok: i32) {

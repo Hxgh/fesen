@@ -22,7 +22,11 @@ struct MenuBarPreference {
         return enabled
     }
 
+    static func menuAppURL(in bundle: URL) -> URL {
+        bundle.standardizedFileURL.appendingPathComponent("Contents/Helpers/FesenMenu.app")
+    }
+
     static func isMenu(_ executable: URL?, in bundle: URL) -> Bool {
-        executable?.standardizedFileURL == bundle.standardizedFileURL.appendingPathComponent("Contents/MacOS/fesen-menu")
+        executable?.standardizedFileURL == menuAppURL(in: bundle).appendingPathComponent("Contents/MacOS/fesen-menu")
     }
 }

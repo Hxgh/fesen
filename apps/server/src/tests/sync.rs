@@ -112,6 +112,7 @@ async fn startup_preferences_auto_restore_only_on_same_network() {
     let server = http.local_addr().unwrap();
     let base = origin(&format!("http://{server}")).unwrap();
     let app = App::new(db, base.clone(), 0, None).unwrap();
+    let app_handle = app.clone();
     let web = tokio::spawn(axum::serve(http, router(app)).into_future());
 
     let net = Adapter::new("home-lan", Ipv4Addr::new(192, 0, 2, 10), None);
@@ -199,6 +200,12 @@ async fn startup_preferences_auto_restore_only_on_same_network() {
     eventually(|| core2.status().active.contains(&keep_on)).await;
     assert!(!core2.status().active.contains(&keep_off));
     assert!(!core2.status().auto_share_blocked);
+    // Transient control-link drop on the same network auto-restores shares on reconnect.
+    let dev_id = core2.status().device_id.unwrap();
+    app_handle.inner.lock().unwrap().remove(&dev_id, false);
+    eventually(|| !core2.status().online).await;
+    eventually(|| core2.status().online && core2.status().active.contains(&keep_on)).await;
+    assert!(!core2.status().active.contains(&keep_off));
     core2.execute(Command::Quit).await.unwrap();
     core2.wait_stopped().await;
 

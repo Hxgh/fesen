@@ -498,9 +498,7 @@ impl Core {
             }
             state.network = network;
             let was_sharing = !state.sharing.is_empty();
-            if was_sharing {
-                state.restore_pending = false;
-            }
+            state.restore_pending = false;
             for (_, s) in state.sharing.drain() {
                 s.cancel.cancel();
             }
@@ -631,10 +629,29 @@ impl Core {
                 let this = self.clone();
                 tokio::spawn(async move {
                     if let Ok(_op) = this.operations.try_lock() {
-                        let wanted = this.state.lock().unwrap().wanted;
+                        let wanted = {
+                            let mut s = this.state.lock().unwrap();
+                            if s.wanted
+                                && s.link.is_none()
+                                && s.error != Some(Code::NetworkChanged)
+                                && s.local.auto_share
+                                && s.network.known()
+                            {
+                                let (active, share_net) = s.local.active_shares();
+                                if !active.is_empty()
+                                    && !share_net.is_empty()
+                                    && s.network.marker == share_net
+                                {
+                                    s.restore_pending = true;
+                                }
+                            }
+                            s.wanted
+                        };
                         if wanted && let Err(e) = this.resume().await {
-                            let paused =
-                                this.state.lock().unwrap().error == Some(Code::NetworkChanged);
+                            let mut s = this.state.lock().unwrap();
+                            s.restore_pending = false;
+                            let paused = s.error == Some(Code::NetworkChanged);
+                            drop(s);
                             if !paused {
                                 this.report(e);
                             }
