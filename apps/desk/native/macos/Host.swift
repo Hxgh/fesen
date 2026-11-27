@@ -216,39 +216,27 @@ final class AppleHost {
 }
 
 @_cdecl("ph_host_publisher_main")
-@MainActor func hostPublisherMain() {
+func hostPublisherMain() {
     guard Bundle.main.bundleIdentifier == "io.fesen.client" else { return }
-    let publisher = Publisher()
-    let app = NSApplication.shared
-    app.setActivationPolicy(.prohibited)
-    app.delegate = publisher
-    withExtendedLifetime(publisher) { app.run() }
-}
-
-@MainActor private final class Publisher: NSObject, NSApplicationDelegate {
-    private let physical = PhysicalNetwork()
-    private var finished = false
-    private var terminating = false
-
-    @objc func applicationDidFinishLaunching(_ notification: Notification) {
-        physical.start(on: .main) { ph_publisher_changed() }
-        DispatchQueue.global(qos: .utility).async {
-            ph_publisher_run()
-            DispatchQueue.main.async {
-                self.physical.stop()
-                self.finished = true
-                if self.terminating { NSApp.reply(toApplicationShouldTerminate: true) }
-                else { NSApp.terminate(nil) }
-            }
-        }
+    // Keep the background publisher off AppKit: a windowless .prohibited NSApplication
+    // is terminated by macOS loginwindow (~30s) via kAEQuitApplication + SIGTERM.
+    let queue = DispatchQueue(label: "io.fesen.client.publisher", qos: .utility)
+    let physical = PhysicalNetwork()
+    physical.start(on: queue) { ph_publisher_changed() }
+    signal(SIGTERM, SIG_IGN)
+    signal(SIGINT, SIG_IGN)
+    let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: queue)
+    term.setEventHandler { ph_publisher_stop() }
+    term.resume()
+    let intr = DispatchSource.makeSignalSource(signal: SIGINT, queue: queue)
+    intr.setEventHandler { ph_publisher_stop() }
+    intr.resume()
+    defer {
+        term.cancel()
+        intr.cancel()
+        physical.stop()
     }
-
-    @objc func applicationShouldTerminate(_ application: NSApplication) -> NSApplication.TerminateReply {
-        if finished { return .terminateNow }
-        terminating = true
-        ph_publisher_stop()
-        return .terminateLater
-    }
+    ph_publisher_run()
 }
 
 @MainActor
