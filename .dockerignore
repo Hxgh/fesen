@@ -8,5 +8,4 @@
 .env*
 .local
 apps/desk
-docs
 scripts
