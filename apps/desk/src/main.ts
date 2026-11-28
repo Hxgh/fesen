@@ -201,7 +201,7 @@ function renderApp(force = false) {
         attach(t("continue")),
       ));
     } else if ((mac && ["extension_unsigned", "extension_restart", "extension_location"].includes(state.message))
-      || state.message === "core_location") {
+      || ["core_location", "core_missing"].includes(state.message)) {
       content.replaceChildren();
     } else {
       const caption = state.message === "extension_setup"

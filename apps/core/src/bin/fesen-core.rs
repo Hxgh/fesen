@@ -6,16 +6,12 @@ async fn main() -> anyhow::Result<()> {
     use fesen_core::{
         Core,
         ipc::Endpoint,
-        platform::windows::{Windows, data_dir, installed, tray},
+        platform::windows::{Windows, data_dir, tray, verify_core},
     };
     use std::sync::Arc;
 
     let binary = std::env::current_exe()?;
-    let dll = binary.with_file_name("wintun.dll");
-    anyhow::ensure!(
-        installed(&binary) && installed(&dll),
-        "请从 Program Files 中启动飞弦（Fesen）"
-    );
+    let (_, dll) = verify_core(&binary).map_err(|e| anyhow::anyhow!("{}", e.code()))?;
     let dir = data_dir()?;
     let endpoint = Endpoint::bind(&dir).await?;
     let p = Windows::new(dll);

@@ -82,7 +82,7 @@ async fn call(app: &tauri::AppHandle, request: Value, launch: bool) -> Result<Va
 async fn call(_app: &tauri::AppHandle, request: Value, launch: bool) -> Result<Value, String> {
     use fesen_core::{
         ipc,
-        platform::windows::{data_dir, elevate, installed},
+        platform::windows::{data_dir, elevate, verify_core},
     };
     static START: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let error = || String::from("not_connected");
@@ -100,13 +100,11 @@ async fn call(_app: &tauri::AppHandle, request: Value, launch: bool) -> Result<V
     let core = std::env::current_exe()
         .map_err(|_| error())?
         .with_file_name("fesen-core.exe");
-    if !installed(&core) {
-        return Err(String::from("core_location"));
-    }
+    verify_core(&core).map_err(|e| String::from(e.code()))?;
     tauri::async_runtime::spawn_blocking(move || elevate(&core))
         .await
         .map_err(|_| error())?
-        .map_err(|_| error())?;
+        .map_err(|e| String::from(e.code()))?;
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(150)).await;
         if let Ok(reply) = ipc::request(&dir, &request).await {
@@ -140,6 +138,8 @@ pub fn run() {
             let _ = app.emit_to("main", "deep-link://new-url", [url]);
         }
         if let Some(window) = app.get_window("main") {
+            let _ = window.unminimize();
+            let _ = window.show();
             let _ = window.set_focus();
         }
     }));

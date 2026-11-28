@@ -224,7 +224,7 @@ pub(crate) fn datagram(protect: impl FnOnce(&Socket) -> io::Result<()>) -> io::R
     Ok(sock.into())
 }
 
-#[cfg(any(target_os = "android", target_os = "macos", test))]
+#[cfg(any(windows, target_os = "android", target_os = "macos", test))]
 pub(crate) fn datagram6(protect: impl FnOnce(&Socket) -> io::Result<()>) -> io::Result<UdpSocket> {
     let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_only_v6(true)?;

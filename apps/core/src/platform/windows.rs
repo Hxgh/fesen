@@ -1,14 +1,15 @@
-use super::{DeviceInfo, Network, Platform, Tun, Underlay, hash_machine_id};
+use super::{DeviceInfo, Network, Platform, Tun, Underlay, datagram6, hash_machine_id};
 use crate::{Command as CoreCommand, Core};
 use fesen_acl::{Cidr, VIRTUAL};
 use fesen_proto::DeviceOs;
+use sha2::{Digest, Sha256};
 use socket2::Socket;
 use std::{
     cell::Cell,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
     fs, io,
-    net::Ipv4Addr,
+    net::{Ipv4Addr, Ipv6Addr, UdpSocket},
     os::windows::{
         ffi::{OsStrExt, OsStringExt},
         fs::{MetadataExt, OpenOptionsExt},
@@ -25,13 +26,16 @@ use std::{
 };
 use tokio::{runtime::Handle, sync::mpsc};
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
+    Foundation::{ERROR_CANCELLED, GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM},
     Globalization::GetUserDefaultUILanguage,
     Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS,
         DeleteObject, GetDC, ReleaseDC,
     },
-    NetworkManagement::IpHelper::*,
+    NetworkManagement::{
+        IpHelper::*,
+        Ndis::IfOperStatusUp,
+    },
     Networking::WinSock::*,
     Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -49,9 +53,9 @@ use windows_sys::Win32::{
     },
     UI::{
         Shell::{
-            FOLDERID_LocalAppData, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, NIF_ICON,
-            NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
-            SHGetKnownFolderPath, Shell_NotifyIconW, ShellExecuteW,
+            FOLDERID_LocalAppData, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+            NIM_MODIFY, NOTIFYICONDATAW, SE_ERR_ACCESSDENIED, SHGetKnownFolderPath,
+            Shell_NotifyIconW, ShellExecuteW,
         },
         WindowsAndMessaging::*,
     },
@@ -61,9 +65,14 @@ const NRPT: &str = "fesen .fesen resolver";
 const NO_WINDOW: u32 = 0x0800_0000;
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const TRAY_STATE_MESSAGE: u32 = WM_APP + 2;
+const WINTUN_SHA256: [u8; 32] = [
+    0xe5, 0xda, 0x84, 0x47, 0xdc, 0x2c, 0x32, 0x0e, 0xdc, 0x0f, 0xc5, 0x2f, 0xa0, 0x18, 0x85,
+    0xc1, 0x03, 0xde, 0x8c, 0x11, 0x84, 0x81, 0xf6, 0x83, 0x64, 0x3c, 0xac, 0xc3, 0x22, 0x0d,
+    0xaf, 0xce,
+];
 
 pub fn data_dir() -> io::Result<PathBuf> {
-    known_folder(&FOLDERID_LocalAppData).map(|p| p.join("fesen"))
+    known_folder(&FOLDERID_LocalAppData).map(|p| shell_path(&p).unwrap_or(p).join("fesen"))
 }
 
 fn known_folder(id: &windows_sys::core::GUID) -> io::Result<PathBuf> {
@@ -128,17 +137,50 @@ fn os_dir(read: unsafe extern "system" fn(*mut u16, u32) -> u32) -> io::Result<P
     }
 }
 
-pub fn installed(path: &Path) -> bool {
-    let Ok(path) = path.canonicalize() else {
-        return false;
-    };
-    [&FOLDERID_ProgramFiles, &FOLDERID_ProgramFilesX86]
-        .iter()
-        .any(|id| {
-            known_folder(id)
-                .and_then(|p| p.canonicalize())
-                .is_ok_and(|root| path.starts_with(root))
-        })
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElevateError {
+    Location,
+    Missing,
+    Denied,
+    Failed,
+}
+
+impl ElevateError {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Location => "core_location",
+            Self::Missing => "core_missing",
+            Self::Denied => "uac_denied",
+            Self::Failed => "not_connected",
+        }
+    }
+}
+
+fn check_regular_binary(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| {
+        meta.is_file()
+            && !meta.file_type().is_symlink()
+            && (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) == 0
+    })
+}
+
+fn verify_wintun(dll: &Path) -> io::Result<()> {
+    let bytes = fs::read(dll)?;
+    if Sha256::digest(&bytes).as_slice() != WINTUN_SHA256 {
+        return Err(io::Error::other("wintun checksum mismatch"));
+    }
+    Ok(())
+}
+
+pub fn verify_core(core_exe: &Path) -> Result<(PathBuf, PathBuf), ElevateError> {
+    let dll = core_exe.with_file_name("wintun.dll");
+    if !check_regular_binary(core_exe) || !check_regular_binary(&dll) {
+        return Err(ElevateError::Missing);
+    }
+    let launch_core = shell_path(core_exe).map_err(|_| ElevateError::Location)?;
+    let launch_dll = shell_path(&dll).map_err(|_| ElevateError::Location)?;
+    verify_wintun(&launch_dll).map_err(|_| ElevateError::Missing)?;
+    Ok((launch_core, launch_dll))
 }
 
 fn check(code: u32) -> io::Result<()> {
@@ -191,6 +233,7 @@ fn nrpt(dns: Option<Ipv4Addr>) -> io::Result<()> {
     if let Some(dns) = dns {
         script.push_str(&format!("Add-DnsClientNrptRule -Namespace '.fesen' -NameServers '{dns}' -DisplayName 'Fesen' -Comment '{NRPT}' | Out-Null;"));
     }
+    script.push_str("Clear-DnsClientCache -ErrorAction SilentlyContinue | Out-Null;");
     let status = Command::new(power)
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .creation_flags(NO_WINDOW)
@@ -265,6 +308,7 @@ impl Windows {
     }
 
     fn adapter(&self, ip: Ipv4Addr) -> io::Result<Adapter> {
+        verify_wintun(&self.dll)?;
         let network = unsafe { wintun::load_from_path(&self.dll) }.map_err(io::Error::other)?;
         let adapter = wintun::Adapter::create(&network, "Fesen", "Fesen", None)
             .map_err(io::Error::other)?;
@@ -408,10 +452,41 @@ impl Platform for Windows {
             0 => None,
             idx => Some(idx),
         };
+        let mut active_if = HashSet::new();
+        let mut loopback_if = HashSet::new();
+        let mut if_metrics = HashMap::new();
         let mut routes = Vec::new();
         let mut gateways = Vec::new();
         let mut ips = Vec::new();
         unsafe {
+            let mut if_table = std::ptr::null_mut::<MIB_IF_TABLE2>();
+            check(GetIfTable2(&mut if_table))?;
+            for row in std::slice::from_raw_parts(
+                (*if_table).Table.as_ptr(),
+                (*if_table).NumEntries as usize,
+            ) {
+                if Some(row.InterfaceIndex) == own || row.OperStatus != IfOperStatusUp {
+                    continue;
+                }
+                if row.Type == IF_TYPE_SOFTWARE_LOOPBACK {
+                    loopback_if.insert(row.InterfaceIndex);
+                } else {
+                    active_if.insert(row.InterfaceIndex);
+                }
+            }
+            FreeMibTable(if_table.cast());
+
+            let mut ip_if_table = std::ptr::null_mut::<MIB_IPINTERFACE_TABLE>();
+            if GetIpInterfaceTable(AF_INET, &mut ip_if_table) == 0 && !ip_if_table.is_null() {
+                for row in std::slice::from_raw_parts(
+                    (*ip_if_table).Table.as_ptr(),
+                    (*ip_if_table).NumEntries as usize,
+                ) {
+                    if_metrics.insert(row.InterfaceIndex, row.Metric);
+                }
+                FreeMibTable(ip_if_table.cast());
+            }
+
             let mut table = std::ptr::null_mut::<MIB_IPFORWARD_TABLE2>();
             check(GetIpForwardTable2(AF_INET, &mut table))?;
             for r in
@@ -420,16 +495,32 @@ impl Platform for Windows {
                 if Some(r.InterfaceIndex) == own {
                     continue;
                 }
+                let is_active = active_if.contains(&r.InterfaceIndex);
+                let is_loopback = loopback_if.contains(&r.InterfaceIndex);
+                if !is_active && !is_loopback {
+                    continue;
+                }
                 let prefix = r.DestinationPrefix;
                 let Ok(cidr) = Cidr::new(ipv4(prefix.Prefix), prefix.PrefixLength) else {
                     continue;
                 };
+                if cidr.ip.is_multicast()
+                    || cidr.ip == Ipv4Addr::BROADCAST
+                    || (cidr.ip.is_link_local() && cidr.prefix >= 16)
+                {
+                    continue;
+                }
+                let metric = if_metrics
+                    .get(&r.InterfaceIndex)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(r.Metric);
                 routes.push(Underlay {
                     cidr,
                     index: r.InterfaceIndex,
-                    metric: r.Metric,
+                    metric,
                 });
-                if cidr.prefix == 0 {
+                if is_active && cidr.prefix == 0 {
                     gateways.push((r.InterfaceIndex, ipv4(r.NextHop)));
                 }
             }
@@ -440,7 +531,7 @@ impl Platform for Windows {
                 std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
             {
                 let ip = ipv4(row.Address);
-                if Some(row.InterfaceIndex) != own
+                if active_if.contains(&row.InterfaceIndex)
                     && !ip.is_loopback()
                     && !ip.is_link_local()
                     && !VIRTUAL.contains(ip)
@@ -511,6 +602,51 @@ impl Platform for Windows {
         } else {
             Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
         }
+    }
+
+    fn ipv6_udp(&self) -> Option<(UdpSocket, Vec<Ipv6Addr>)> {
+        let index = self.network.read().unwrap().bind_index(None);
+        if index == 0 {
+            return None;
+        }
+        let mut addresses = Vec::new();
+        unsafe {
+            let mut table = std::ptr::null_mut::<MIB_UNICASTIPADDRESS_TABLE>();
+            if GetUnicastIpAddressTable(AF_INET6, &mut table) == 0 && !table.is_null() {
+                for row in std::slice::from_raw_parts(
+                    (*table).Table.as_ptr(),
+                    (*table).NumEntries as usize,
+                ) {
+                    if row.InterfaceIndex != index || row.DadState != IpDadStatePreferred {
+                        continue;
+                    }
+                    addresses.push(Ipv6Addr::from(row.Address.Ipv6.sin6_addr.u.Byte));
+                }
+                FreeMibTable(table.cast());
+            }
+        }
+        if addresses.is_empty() {
+            return None;
+        }
+        let socket = datagram6(|sock| {
+            // WinSock IPV6_UNICAST_IF takes host byte order (unlike IP_UNICAST_IF).
+            if unsafe {
+                setsockopt(
+                    sock.as_raw_socket() as usize,
+                    IPPROTO_IPV6,
+                    IPV6_UNICAST_IF,
+                    (&index as *const u32).cast(),
+                    std::mem::size_of_val(&index) as i32,
+                )
+            } == 0
+            {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+            }
+        })
+        .ok()?;
+        Some((socket, addresses))
     }
 
     fn apply(&self, tun: &Tun) -> io::Result<()> {
@@ -608,14 +744,9 @@ fn shell_path(path: &Path) -> io::Result<PathBuf> {
     Ok(PathBuf::from(OsString::from_wide(trimmed)))
 }
 
-pub fn elevate(path: &Path) -> io::Result<()> {
-    if !installed(path) {
-        return Err(io::Error::other(
-            "Fesen must be installed in Program Files",
-        ));
-    }
+pub fn elevate(path: &Path) -> Result<(), ElevateError> {
     // ShellExecuteW does not accept `\\?\` extended-length paths from Path::canonicalize().
-    let launch = shell_path(path)?;
+    let (launch, _) = verify_core(path)?;
     let dir = launch.parent().map(wide);
     let verb = wide("runas");
     let file = wide(&launch);
@@ -628,11 +759,15 @@ pub fn elevate(path: &Path) -> io::Result<()> {
             dir.as_ref().map_or(std::ptr::null(), |d| d.as_ptr()),
             SW_HIDE,
         )
-    };
-    if code as isize > 32 {
+    } as isize;
+    if code > 32 {
         Ok(())
+    } else if code == SE_ERR_ACCESSDENIED as isize
+        || unsafe { GetLastError() } == ERROR_CANCELLED
+    {
+        Err(ElevateError::Denied)
     } else {
-        Err(io::Error::other("could not start Fesen core"))
+        Err(ElevateError::Failed)
     }
 }
 
@@ -977,7 +1112,9 @@ pub async fn tray(core: Arc<Core>, gui: PathBuf) {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_verbatim_drive_units;
+    use super::{ElevateError, strip_verbatim_drive_units, verify_core};
+    use std::fs;
+    use tempfile::tempdir;
 
     fn utf16(s: &str) -> Vec<u16> {
         s.encode_utf16().collect()
@@ -1001,5 +1138,18 @@ mod tests {
             strip_verbatim_drive_units(&utf16(r"\\?\Volume{1234}\Fesen\fesen-core.exe")),
             None
         );
+    }
+
+    #[test]
+    fn verify_core_rejects_missing_or_corrupt_sibling_binaries() {
+        let dir = tempdir().unwrap();
+        let core = dir.path().join("fesen-core.exe");
+        assert_eq!(verify_core(&core), Err(ElevateError::Missing));
+
+        fs::write(&core, b"stub").unwrap();
+        assert_eq!(verify_core(&core), Err(ElevateError::Missing));
+
+        fs::write(dir.path().join("wintun.dll"), b"bad-dll").unwrap();
+        assert_eq!(verify_core(&core), Err(ElevateError::Missing));
     }
 }
