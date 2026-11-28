@@ -1,5 +1,5 @@
 import { i18n } from "../i18n";
-import type { Label, LocalForwardStatus, Offering, Probe, Status, ViewMode } from "./types";
+import type { Label, LocalForwardStatus, Offering, Probe, Status, UpdateState, ViewMode } from "./types";
 
 export const mac = /Macintosh/.test(navigator.userAgent);
 export const desktop = !/Android/i.test(navigator.userAgent);
@@ -31,6 +31,7 @@ export const state = {
   lastViewKey: "",
   pendingJoin: undefined as string | undefined,
   appVersion: "",
+  update: { status: "idle" } as UpdateState,
   lastAutoShareBlocked: false,
   brandBooted: false,
   viewMode: readViewMode() as ViewMode,

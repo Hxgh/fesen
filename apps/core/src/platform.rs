@@ -35,13 +35,39 @@ impl Network {
     pub fn bind_index(&self, target: Option<Ipv4Addr>) -> u32 {
         self.routes
             .iter()
-            .filter(|r| target.map_or(r.cidr.prefix == 0, |ip| r.cidr.range().contains(ip)))
+            .filter(|r| {
+                target.map_or(r.cidr.prefix == 0, |ip| {
+                    (r.cidr.prefix == 0 || r.cidr.prefix >= 8) && r.cidr.range().contains(ip)
+                })
+            })
             .max_by_key(|r| (r.cidr.prefix, std::cmp::Reverse(r.metric)))
             .map_or(0, |r| r.index)
     }
 
     pub fn known(&self) -> bool {
         !self.marker.is_empty() && !self.addresses.is_empty()
+    }
+
+    pub fn same_underlay(&self, other: &Self) -> bool {
+        if self.marker != other.marker || self.addresses != other.addresses || self.dns != other.dns
+        {
+            return false;
+        }
+        let mut a: Vec<_> = self
+            .routes
+            .iter()
+            .map(|r| (r.cidr.ip, r.cidr.prefix, r.index))
+            .collect();
+        let mut b: Vec<_> = other
+            .routes
+            .iter()
+            .map(|r| (r.cidr.ip, r.cidr.prefix, r.index))
+            .collect();
+        a.sort_unstable();
+        a.dedup();
+        b.sort_unstable();
+        b.dedup();
+        a == b
     }
 }
 
@@ -140,6 +166,9 @@ pub trait Platform: Send + Sync + 'static {
         }
         #[cfg(not(target_os = "linux"))]
         Vec::new()
+    }
+    fn tcp_client_process(&self, _local_port: u16) -> Option<String> {
+        None
     }
     fn network(&self) -> io::Result<Network>;
     fn protect(&self, socket: &Socket, target: Option<Ipv4Addr>) -> io::Result<()>;

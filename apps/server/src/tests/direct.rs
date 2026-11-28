@@ -51,24 +51,26 @@ fn tcp_only_center_exchanges_bounded_ipv6_candidates() {
     let (access_out, mut access_in) = mpsc::channel(4);
     let (owner_out, mut owner_in) = mpsc::channel(4);
     let access = group
-        .connect(
-            "access",
-            "member-a".into(),
-            "DeviceA".into(),
-            Some(DeviceOs::Macos),
-            vec![1],
-            access_out,
-        )
+        .connect(crate::group::ConnectDevice {
+            id: "access".into(),
+            member: "member-a".into(),
+            label: "DeviceA".into(),
+            os: Some(DeviceOs::Macos),
+            machine_id: None,
+            cert: vec![1],
+            outgoing: access_out,
+        })
         .unwrap();
     let owner = group
-        .connect(
-            "owner",
-            "member-b".into(),
-            "DeviceB".into(),
-            Some(DeviceOs::Windows),
-            vec![2],
-            owner_out,
-        )
+        .connect(crate::group::ConnectDevice {
+            id: "owner".into(),
+            member: "member-b".into(),
+            label: "DeviceB".into(),
+            os: Some(DeviceOs::Windows),
+            machine_id: None,
+            cert: vec![2],
+            outgoing: owner_out,
+        })
         .unwrap();
     use fesen_proto::{Call, Publication};
     group

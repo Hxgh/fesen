@@ -16,14 +16,18 @@ import {
   request,
   serverHost,
   settingsDialog,
+  showDialog,
   showError,
   syncBrand,
   syncSigninSubmit,
   theme,
 } from "./app/runtime";
-import { openSettings } from "./dialogs/settings-dialog";
+import { openSettings, refreshSettingsIfOpen } from "./dialogs/settings-dialog";
+import { openDiagnostics } from "./dialogs/diag-dialog";
 import { addShare } from "./dialogs/share-dialog";
 import { checkSiteDialog, refreshSiteDialogI18n } from "./dialogs/site-dialog";
+import { initUpdateUi, syncUpdateUi, updateTrigger } from "./dialogs/update-dialog";
+import { startUpdater } from "./app/updater";
 import { accessIpFor, effectiveKind, toInt } from "./model/net";
 import { desktop, loadCollapsed, mac, probes, serviceKey, state } from "./model/state";
 import type { IconName, Reply, Status } from "./model/types";
@@ -105,6 +109,30 @@ window.addEventListener("keydown", (event) => {
   }
 });
 
+function confirmDisconnect(data: Status) {
+  const shares = data.active.length;
+  const flows = data.active_flows ?? 0;
+  const msg = shares > 0 && flows > 0
+    ? t("confirm_disconnect_busy").replace("{shares}", String(shares)).replace("{flows}", String(flows))
+    : shares > 0
+      ? t("confirm_disconnect_shares").replace("{shares}", String(shares))
+      : flows > 0
+        ? t("confirm_disconnect_flows").replace("{flows}", String(flows))
+        : t("confirm_disconnect_idle");
+  showDialog(
+    t("confirm_disconnect_title"),
+    [el("p", "muted", msg)],
+    [
+      button(t("cancel"), () => editor.close(), "button"),
+      button(t("disconnect_now"), () => {
+        editor.close();
+        void act({ op: "stop" });
+      }, "button danger"),
+    ],
+    false,
+  );
+}
+
 function buildConnectionControl(data: Status): HTMLElement {
   const running = data.running;
   const online = data.online;
@@ -118,10 +146,31 @@ function buildConnectionControl(data: Status): HTMLElement {
     size: "lg",
     tone: online ? "accent" : "muted",
     spinning: connecting,
-    onClick: () => void act({ op: running ? "stop" : "start" }),
+    onClick: () => {
+      if (online) {
+        confirmDisconnect(data);
+      } else {
+        void act({ op: running ? "stop" : "start" });
+      }
+    },
   });
   b.setAttribute("data-connect-btn", "1");
   b.setAttribute("aria-pressed", String(running));
+  return b;
+}
+
+function buildTrafficControl(data: Status): HTMLElement {
+  const active = (data.active_flows ?? 0) > 0;
+  const b = createIconButton({
+    icon: "activity",
+    title: t("diag_live_traffic"),
+    variant: "solid",
+    size: "lg",
+    tone: active ? "accent" : "muted",
+    onClick: () => openDiagnostics("traffic"),
+  });
+  b.setAttribute("data-traffic-btn", "1");
+  b.setAttribute("aria-haspopup", "dialog");
   return b;
 }
 
@@ -170,6 +219,10 @@ function renderApp(force = false) {
     host_probe: null,
     admin_data: null,
   }, state.tab, state.joining]);
+  const trafficBtn = actions.querySelector<HTMLButtonElement>('[data-traffic-btn="1"]');
+  if (trafficBtn && data) {
+    trafficBtn.classList.toggle("accent", (data.active_flows ?? 0) > 0);
+  }
   if (!force && state.applied === next) return;
   if (!force && !data?.member && content.contains(document.activeElement)) return;
   state.applied = next;
@@ -187,7 +240,7 @@ function renderApp(force = false) {
     onClick: () => openSettings(),
   });
   settingsBtn.setAttribute("aria-haspopup", "dialog");
-  actions.append(settingsBtn);
+  actions.append(updateTrigger, settingsBtn);
 
   if (!data) {
     const attach = (caption: string) => button(caption, () => void act({ op: "attach" }), "button primary");
@@ -299,6 +352,7 @@ function renderApp(force = false) {
     ...(adminBtn && adminSep ? [adminBtn, adminSep] : []),
     ...(state.tab === "services" ? [addShare()] : []),
     buildConnectionControl(data),
+    buildTrafficControl(data),
   );
   if (restoreAdminBtnFocus && adminBtn) {
     adminBtn.focus({ preventScroll: true });
@@ -358,13 +412,16 @@ function deepLink(urls: string[] | null) {
 
 async function boot() {
   initWindowsChrome(theme.get());
+  initUpdateUi(refreshSettingsIfOpen);
   syncBrand(true);
   void initDesktopWindowSize(settingsDialog);
   i18n.onChange(() => {
     refreshSiteDialogI18n();
+    syncUpdateUi();
     syncBrand();
     render(true);
   });
+  startUpdater();
   try { state.status = await request({ op: "attach" }, !mac); }
   catch (error) { state.message = typeof error === "string" ? error : "not_connected"; }
   syncBrand(true);

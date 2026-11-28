@@ -99,7 +99,12 @@ impl Routes {
             network
                 .routes
                 .iter()
-                .filter(|r| r.cidr.prefix > 0)
+                .filter(|r| {
+                    r.cidr.prefix >= 8
+                        && !(r.cidr.prefix < 15
+                            && r.cidr.range().contains(VIRTUAL.start)
+                            && r.cidr.range().contains(VIRTUAL.end))
+                })
                 .map(|r| extract(r.cidr.range()))
                 .chain(local_shares.iter().copied().map(extract))
                 .chain(
@@ -696,5 +701,74 @@ mod tests {
         let r2 = Routes::build(&r1, &network, vec![alice.clone(), bob.clone()], &[], None, false, &[]).unwrap();
         assert_eq!(r2.access_ip_for(&bob.service.id, orig), orig);
         assert_ne!(r2.access_ip_for(&alice.service.id, orig), orig);
+    }
+
+    #[test]
+    fn split_default_supernets_do_not_exhaust_virtual_pool_or_conflict() {
+        let mut network = Network::default();
+        for cidr in [
+            "0.0.0.0/0",
+            "0.0.0.0/1",
+            "128.0.0.0/1",
+            "64.0.0.0/2",
+            "32.0.0.0/3",
+            "16.0.0.0/4",
+            "8.0.0.0/5",
+            "4.0.0.0/6",
+            "2.0.0.0/7",
+            "198.0.0.0/9",
+            "192.168.31.0/24",
+        ] {
+            network.routes.push(Underlay {
+                cidr: cidr.parse().unwrap(),
+                index: 11,
+                metric: 0,
+            });
+        }
+        let peer_offer = Offering {
+            owner: "peer-a".into(),
+            member: "peer-a".into(),
+            device: Some("peer-a".into()),
+            device_os: None,
+            service: Publication {
+                id: "00000000000000000000000000000010".into(),
+                name: "web".into(),
+                rules: Rules::parse("203.0.113.10", "80").unwrap(),
+                http: false,
+                kind: None,
+                host_os: None,
+            },
+        };
+        let overlap_offer = Offering {
+            owner: "peer-b".into(),
+            member: "peer-b".into(),
+            device: Some("peer-b".into()),
+            device_os: None,
+            service: Publication {
+                id: "00000000000000000000000000000011".into(),
+                name: "ssh".into(),
+                rules: Rules::parse("192.168.31.20", "22").unwrap(),
+                http: false,
+                kind: None,
+                host_os: None,
+            },
+        };
+        let routes = Routes::build(
+            &Routes::default(),
+            &network,
+            vec![peer_offer, overlap_offer],
+            &[],
+            None,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(VIRTUAL.contains(routes.tun.address.unwrap()));
+        assert_eq!(
+            routes.access_ip("203.0.113.10".parse().unwrap()),
+            "203.0.113.10".parse::<Ipv4Addr>().unwrap()
+        );
+        let mapped = routes.access_ip("192.168.31.20".parse().unwrap());
+        assert!(VIRTUAL.contains(mapped));
     }
 }

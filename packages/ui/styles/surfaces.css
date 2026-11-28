@@ -600,3 +600,31 @@ dialog::backdrop {
   font-size: var(--fs-sm);
   color: var(--muted);
 }
+.settings-head-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.settings-head-tabs { flex: none; }
+.settings-foot-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.settings-foot-link {
+  border: 0;
+  background: transparent;
+  padding: 2px 5px;
+  border-radius: 5px;
+  font: inherit;
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+.settings-foot-link:hover {
+  background: var(--soft);
+  color: var(--ink);
+}

@@ -83,6 +83,52 @@ export type HostProbe = {
   cancelled?: boolean;
 };
 
+export type LogEntry = {
+  ts: number;
+  level: "ERR" | "WARN" | "INFO" | string;
+  scope: string;
+  message: string;
+};
+
+export type FlowKind = "outbound_tun" | "outbound_forward" | "inbound_local" | "inbound_lan";
+
+export type TrafficSample = {
+  ts_ms: number;
+  tx_bps: number;
+  rx_bps: number;
+};
+
+export type TrafficFlow = {
+  id: number;
+  kind: FlowKind;
+  service: string;
+  service_name: string;
+  peer: string;
+  source?: string | null;
+  target: string;
+  local_port?: number | null;
+  tx_bytes: number;
+  rx_bytes: number;
+  tx_bps: number;
+  rx_bps: number;
+  duration_ms: number;
+  anomaly: boolean;
+};
+
+export type TrafficSnapshot = {
+  enabled: boolean;
+  ts_ms: number;
+  active_flows: number;
+  total_tx_bytes: number;
+  total_rx_bytes: number;
+  total_tx_bps: number;
+  total_rx_bps: number;
+  control_tx_bytes: number;
+  control_rx_bytes: number;
+  history: TrafficSample[];
+  flows: TrafficFlow[];
+};
+
 export type Status = {
   version?: number;
   server: string;
@@ -118,6 +164,9 @@ export type Status = {
   probe?: ProbeOutcome;
   host_probe?: HostProbe;
   admin_data?: unknown;
+  logs?: LogEntry[];
+  verbose_logs?: boolean;
+  traffic?: TrafficSnapshot;
 };
 
 export type Request = Record<string, unknown> & { op: string };
@@ -154,3 +203,65 @@ export type SourceInfo = {
   memberLabel: string;
   deviceLabel: string;
 };
+
+export type UpdateState =
+  | { status: "idle" }
+  | { status: "checking" }
+  | { status: "up_to_date"; current: string; checked_at: number }
+  | {
+      status: "available";
+      current: string;
+      version: string;
+      notes: string;
+      pub_date?: string | null;
+      size?: number | null;
+      release_url?: string | null;
+    }
+  | {
+      status: "downloading";
+      current: string;
+      version: string;
+      notes: string;
+      pub_date?: string | null;
+      downloaded: number;
+      total?: number | null;
+      release_url?: string | null;
+    }
+  | {
+      status: "paused";
+      current: string;
+      version: string;
+      notes: string;
+      pub_date?: string | null;
+      downloaded: number;
+      total?: number | null;
+      release_url?: string | null;
+    }
+  | {
+      status: "ready";
+      current: string;
+      version: string;
+      notes: string;
+      pub_date?: string | null;
+      size: number;
+      release_url?: string | null;
+    }
+  | {
+      status: "installing";
+      current: string;
+      version: string;
+      notes: string;
+      pub_date?: string | null;
+      release_url?: string | null;
+    }
+  | {
+      status: "error";
+      current: string;
+      stage: string;
+      message: string;
+      version?: string | null;
+      notes?: string | null;
+      pub_date?: string | null;
+      size?: number | null;
+      release_url?: string | null;
+    };

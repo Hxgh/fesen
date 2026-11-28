@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.content.res.Configuration
 import android.graphics.drawable.Icon
+import android.net.Uri
 import android.net.VpnService
 import android.os.Bundle
 import android.os.Handler
@@ -16,10 +17,12 @@ import android.os.Looper
 import android.os.Message
 import android.os.Messenger
 import android.os.ResultReceiver
+import android.provider.Settings
 import android.view.View
 import android.view.WindowManager
 import android.webkit.WebView
 import androidx.activity.result.ActivityResult
+import androidx.core.content.FileProvider
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -29,6 +32,7 @@ import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
+import java.io.File
 
 @TauriPlugin
 class FesenPlugin(private val activity: Activity) : Plugin(activity) {
@@ -82,6 +86,43 @@ class FesenPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun siteView(invoke: Invoke) { main.post { preview?.command(invoke) ?: invoke.reject("browser_failed") } }
+
+    @Command
+    fun installApk(invoke: Invoke) {
+        main.post {
+            val rawPath = invoke.getArgs().optString("path")
+            if (rawPath.isBlank()) {
+                invoke.reject("invalid")
+                return@post
+            }
+            val file = runCatching { File(rawPath).canonicalFile }.getOrNull()
+            val updatesRoot = runCatching { File(activity.cacheDir, "updates").canonicalFile }.getOrNull()
+            if (file == null || updatesRoot == null || !file.path.startsWith(updatesRoot.path + File.separator) || !file.isFile) {
+                invoke.reject("invalid")
+                return@post
+            }
+            if (!activity.packageManager.canRequestPackageInstalls()) {
+                val settingsIntent = Intent(
+                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:${activity.packageName}")
+                ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                runCatching { activity.startActivity(settingsIntent) }
+                invoke.reject("install_permission")
+                return@post
+            }
+            runCatching {
+                val uri = FileProvider.getUriForFile(activity, "${activity.packageName}.fileprovider", file)
+                val installIntent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, "application/vnd.android.package-archive")
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                activity.startActivity(installIntent)
+                invoke.resolve(JSObject().put("status", "launched"))
+            }.onFailure {
+                invoke.reject("update_failed")
+            }
+        }
+    }
 
     @Command
     fun addTile(invoke: Invoke) {

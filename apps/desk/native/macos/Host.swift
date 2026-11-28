@@ -224,12 +224,22 @@ final class AppleHost {
 @_cdecl("ph_host_configure_window")
 @MainActor func hostConfigureWindow(_ ptr: UnsafeMutableRawPointer) {
     let window = Unmanaged<NSWindow>.fromOpaque(ptr).takeUnretainedValue()
+    window.titleVisibility = .hidden
     window.titlebarAppearsTransparent = true
     window.titlebarSeparatorStyle = .none
+    if window.toolbar == nil {
+        window.toolbar = NSToolbar(identifier: "io.fesen.client.titlebar")
+    }
+    window.toolbarStyle = .unified
     if let close = window.standardWindowButton(.closeButton),
        let titlebarView = close.superview {
         for sub in titlebarView.subviews where !(sub is NSControl) {
             sub.isHidden = true
+        }
+        if let container = titlebarView.superview {
+            for sub in container.subviews where sub !== titlebarView {
+                sub.isHidden = true
+            }
         }
     }
 }

@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use std::sync::Arc;
 #[cfg(any(windows, target_os = "macos"))]
 use std::time::Duration;
 
@@ -10,6 +11,93 @@ mod android;
 #[cfg(target_os = "macos")]
 mod macos;
 mod site;
+mod update;
+#[cfg(windows)]
+mod windows;
+
+#[tauri::command]
+async fn update_state(
+    window: tauri::Webview,
+    updater: tauri::State<'_, Arc<update::ManagerState>>,
+) -> Result<update::UpdateState, String> {
+    if window.label() != "main" {
+        return Err("unauthorized".into());
+    }
+    Ok(updater.snapshot().await)
+}
+
+#[tauri::command]
+async fn check_for_update(
+    window: tauri::Webview,
+    app: tauri::AppHandle,
+    updater: tauri::State<'_, Arc<update::ManagerState>>,
+    silent: Option<bool>,
+) -> Result<update::UpdateState, String> {
+    if window.label() != "main" {
+        return Err("unauthorized".into());
+    }
+    Ok(update::check_for_update(&app, &updater, silent.unwrap_or(false)).await)
+}
+
+#[tauri::command]
+async fn download_update(
+    window: tauri::Webview,
+    app: tauri::AppHandle,
+    updater: tauri::State<'_, Arc<update::ManagerState>>,
+) -> Result<update::UpdateState, String> {
+    if window.label() != "main" {
+        return Err("unauthorized".into());
+    }
+    update::download_update(app, updater.inner().clone()).await
+}
+
+#[tauri::command]
+async fn pause_update_download(
+    window: tauri::Webview,
+    app: tauri::AppHandle,
+    updater: tauri::State<'_, Arc<update::ManagerState>>,
+) -> Result<update::UpdateState, String> {
+    if window.label() != "main" {
+        return Err("unauthorized".into());
+    }
+    Ok(update::pause_update_download(&app, &updater).await)
+}
+
+#[tauri::command]
+async fn cancel_update_download(
+    window: tauri::Webview,
+    app: tauri::AppHandle,
+    updater: tauri::State<'_, Arc<update::ManagerState>>,
+) -> Result<update::UpdateState, String> {
+    if window.label() != "main" {
+        return Err("unauthorized".into());
+    }
+    Ok(update::cancel_update_download(&app, &updater).await)
+}
+
+#[tauri::command]
+async fn install_update(
+    window: tauri::Webview,
+    app: tauri::AppHandle,
+    updater: tauri::State<'_, Arc<update::ManagerState>>,
+) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("unauthorized".into());
+    }
+    update::install_update(&app, &updater).await
+}
+
+#[tauri::command]
+async fn open_release_url(
+    window: tauri::Webview,
+    app: tauri::AppHandle,
+    url: String,
+) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("unauthorized".into());
+    }
+    update::open_release_url(&app, &url)
+}
 
 #[tauri::command]
 async fn core_command(
@@ -76,6 +164,18 @@ async fn call(app: &tauri::AppHandle, request: Value, launch: bool) -> Result<Va
     })
     .await
     .map_err(|_| "not_connected".to_owned())?
+}
+
+#[cfg(windows)]
+#[tauri::command]
+async fn sync_snap_button(
+    window: tauri::WebviewWindow,
+    rect: windows::SnapRect,
+) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("unauthorized".into());
+    }
+    windows::sync_snap_button(&window, rect)
 }
 
 #[cfg(windows)]
@@ -159,6 +259,13 @@ pub fn run() {
         site::open_site,
         site::site_view,
         site::service_action,
+        update_state,
+        check_for_update,
+        download_update,
+        pause_update_download,
+        cancel_update_download,
+        install_update,
+        open_release_url,
         open_extension_settings,
         menu_bar_setting
     ]);
@@ -168,24 +275,60 @@ pub fn run() {
         site::open_site,
         site::site_view,
         site::service_action,
+        update_state,
+        check_for_update,
+        download_update,
+        pause_update_download,
+        cancel_update_download,
+        install_update,
+        open_release_url,
         add_quick_tile
     ]);
-    #[cfg(not(any(target_os = "macos", target_os = "android")))]
+    #[cfg(windows)]
     let app = app.invoke_handler(tauri::generate_handler![
         core_command,
         site::open_site,
         site::site_view,
-        site::service_action
+        site::service_action,
+        update_state,
+        check_for_update,
+        download_update,
+        pause_update_download,
+        cancel_update_download,
+        install_update,
+        open_release_url,
+        sync_snap_button
     ]);
-    #[cfg(target_os = "macos")]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "android")))]
+    let app = app.invoke_handler(tauri::generate_handler![
+        core_command,
+        site::open_site,
+        site::site_view,
+        site::service_action,
+        update_state,
+        check_for_update,
+        download_update,
+        pause_update_download,
+        cancel_update_download,
+        install_update,
+        open_release_url
+    ]);
+    let app = app.manage(Arc::new(update::ManagerState::new()));
     let app = app.setup(|app| {
-        if macos::menu_bar_setting(None).unwrap_or(true) {
-            macos::tray();
-        } else {
-            macos::close_tray();
-        }
-        if let Some(window) = app.get_webview_window("main") {
-            macos::configure_window(&window);
+        let cleanup_handle = app.handle().clone();
+        tauri::async_runtime::spawn(async move {
+            update::cleanup_stale_updates(cleanup_handle).await;
+        });
+        #[cfg(target_os = "macos")]
+        {
+            if macos::menu_bar_setting(None).unwrap_or(true) {
+                macos::tray();
+            } else {
+                macos::close_tray();
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                macos::configure_window(&window);
+            }
         }
         Ok(())
     });

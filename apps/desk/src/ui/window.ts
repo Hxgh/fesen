@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { LogicalSize } from "@tauri-apps/api/dpi";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { t } from "../i18n";
 import { desktop, mac, win } from "../model/state";
@@ -86,22 +87,69 @@ export function initWindowsChrome(initialTheme: string) {
   controls.append(minBtn, maxBtn, closeBtn);
   topbar.append(controls);
 
+  let lastSnapKey = "";
+  let snapRaf = 0;
+  const syncSnapRect = () => {
+    snapRaf = 0;
+    const r = maxBtn.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    let visible = !document.hidden && r.width > 0 && r.height > 0 && !document.querySelector("dialog[open]");
+    if (visible) {
+      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      visible = !!hit && (hit === maxBtn || maxBtn.contains(hit));
+    }
+    const x = Math.round(r.left * dpr);
+    const y = Math.round(r.top * dpr);
+    const width = Math.max(0, Math.round(r.right * dpr) - x);
+    const height = Math.max(0, Math.round(r.bottom * dpr) - y);
+    const key = `${visible}:${maximized}:${x}:${y}:${width}:${height}`;
+    if (key === lastSnapKey) return;
+    lastSnapKey = key;
+    void invoke("sync_snap_button", { rect: { visible, x, y, width, height } }).catch(() => {});
+  };
+  const scheduleSnapSync = () => {
+    if (!snapRaf) snapRaf = window.requestAnimationFrame(syncSnapRect);
+  };
+
   const refreshMaximized = async () => {
     try {
       const next = await appWin.isMaximized();
-      if (next === maximized) return;
-      maximized = next;
-      maxIcon.path.setAttribute("d", maximized ? RESTORE_PATH : MAX_PATH);
-      winControlsRefreshI18n?.();
+      if (next !== maximized) {
+        maximized = next;
+        maxIcon.path.setAttribute("d", maximized ? RESTORE_PATH : MAX_PATH);
+        winControlsRefreshI18n?.();
+      }
+      scheduleSnapSync();
     } catch {}
   };
 
   document.documentElement.classList.toggle("is-unfocused", !document.hasFocus());
   void appWin.onFocusChanged(({ payload }) => {
     document.documentElement.classList.toggle("is-unfocused", !payload);
+    scheduleSnapSync();
   }).catch(() => {});
 
+  void listen<{ hover: boolean; active: boolean }>("win-max-state", ({ payload }) => {
+    maxBtn.classList.toggle("is-hover", !!payload?.hover);
+    maxBtn.classList.toggle("is-active", !!payload?.active);
+  }).catch(() => {});
+
+  if (typeof ResizeObserver !== "undefined") {
+    const ro = new ResizeObserver(() => scheduleSnapSync());
+    ro.observe(topbar);
+    ro.observe(maxBtn);
+  }
+  const dialogObserver = new MutationObserver(() => scheduleSnapSync());
+  document.querySelectorAll("dialog").forEach((dlg) => {
+    dialogObserver.observe(dlg, { attributes: true, attributeFilter: ["open"] });
+  });
+  const bodyObserver = new MutationObserver(() => scheduleSnapSync());
+  bodyObserver.observe(document.body, { childList: true });
+  window.addEventListener("resize", scheduleSnapSync);
+  document.addEventListener("visibilitychange", scheduleSnapSync);
+
   void refreshMaximized();
+  scheduleSnapSync();
   void appWin.onResized(() => { void refreshMaximized(); }).catch(() => {});
   syncWindowsTheme(initialTheme);
 }

@@ -14,6 +14,7 @@ use crate::{
     packets,
     platform::{DeviceInfo, Network, Platform, Tun},
     routing::Routes,
+    traffic::TrafficTracker,
 };
 use fesen_proto::{Code, Credential, LocalForwardStatus, origin};
 use std::{
@@ -23,7 +24,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -53,7 +54,7 @@ pub struct Core {
     pub(crate) quit: CancellationToken,
     applied_shutdown: CancellationToken,
     forwards_shutdown: CancellationToken,
-    flows: AtomicUsize,
+    pub(crate) traffic: Arc<TrafficTracker>,
     keep_access: bool,
 }
 
@@ -69,6 +70,7 @@ impl Core {
         let network = platform.network().unwrap_or_default();
         let log = Arc::new(Log::new(&dir));
         log.prune();
+        let traffic = Arc::new(TrafficTracker::new(log.clone()));
         let core = Arc::new(Self {
             dir,
             device_info,
@@ -104,7 +106,7 @@ impl Core {
             quit: CancellationToken::new(),
             applied_shutdown: CancellationToken::new(),
             forwards_shutdown: CancellationToken::new(),
-            flows: AtomicUsize::new(0),
+            traffic,
             keep_access,
         });
         if core.platform.system_routing() {
@@ -133,7 +135,7 @@ impl Core {
 
     fn has_work(&self, state: &State) -> bool {
         !state.sharing.is_empty()
-            || self.flows.load(Ordering::Acquire) != 0
+            || self.traffic.active_count() != 0
             || (self.keep_access && state.wanted)
             || (state.wanted && !state.local.forwards().is_empty())
     }
@@ -278,7 +280,7 @@ impl Core {
             services: state.view.clone(),
             shares: state.local.shares().to_vec(),
             active,
-            active_flows: self.flows.load(Ordering::Acquire),
+            active_flows: self.traffic.active_count(),
             labels: state.local.labels().to_vec(),
             virtual_ips: routes.mappings.clone(),
             service_virtual_ips: routes.service_mappings.clone(),
@@ -296,6 +298,9 @@ impl Core {
             probe: None,
             host_probe: None,
             admin_data: None,
+            logs: None,
+            verbose_logs: self.log.is_verbose(),
+            traffic: None,
         }
     }
 
@@ -395,7 +400,7 @@ impl Core {
         };
         {
             let mut state = self.state.lock().unwrap();
-            if state.network != net || self.quit.is_cancelled() {
+            if !state.network.same_underlay(&net) || self.quit.is_cancelled() {
                 session.link.direct.close();
                 return Err(Code::NetworkChanged);
             }
@@ -421,6 +426,9 @@ impl Core {
             }
             state.link = Some(session.link.clone());
         }
+        self.log.record_info("ctl", || {
+            format!("connected member={} admin={}", session.member, session.is_admin)
+        });
         tokio::spawn(self.clone().incoming(session.link.clone()));
         session.spawn(self.clone());
         self.changed();
@@ -448,6 +456,59 @@ impl Core {
 
     fn is_link(state: &State, link: &Arc<Link>) -> bool {
         state.link.as_ref().is_some_and(|l| Arc::ptr_eq(l, link))
+    }
+
+    pub(super) fn peer_label(&self, peer_id: &str) -> String {
+        let state = self.state.lock().unwrap();
+        if let Some(o) = state.view.iter().find(|o| o.owner == peer_id) {
+            return o
+                .device
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(o.member.as_str())
+                .to_owned();
+        }
+        peer_id.chars().take(8).collect()
+    }
+
+    pub(super) fn service_meta(&self, service_id: &str) -> (String, String) {
+        let state = self.state.lock().unwrap();
+        if let Some(o) = state.view.iter().find(|o| o.service.id == service_id) {
+            let peer = o
+                .device
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(o.member.as_str())
+                .to_owned();
+            return (o.service.name.clone(), peer);
+        }
+        if let Some(s) = state.local.shares().iter().find(|s| s.id == service_id) {
+            return (s.name.clone(), self.device_name(&state.local));
+        }
+        (service_id.chars().take(8).collect(), String::new())
+    }
+
+    pub(crate) fn resolve_flow_info(
+        &self,
+        service_id: &str,
+        peer_id: &str,
+        src_port: Option<u16>,
+    ) -> crate::traffic::ResolvedFlowInfo {
+        let (service_name, svc_peer) = self.service_meta(service_id);
+        let peer = if svc_peer.is_empty() && !peer_id.is_empty() {
+            self.peer_label(peer_id)
+        } else {
+            svc_peer
+        };
+        let source = src_port.map(|port| match self.platform.tcp_client_process(port) {
+            Some(proc) => format!("{proc} :{port}"),
+            None => format!(":{port}"),
+        });
+        crate::traffic::ResolvedFlowInfo {
+            service_name,
+            peer,
+            source,
+        }
     }
 
     pub(crate) fn link_ended(&self, link: &Arc<Link>, error: Option<Code>) {
@@ -491,11 +552,19 @@ impl Core {
             .and_then(Result::ok)
             .unwrap_or_default();
         *sampled = Instant::now();
-        let (link, was_sharing) = {
+        let (link, was_sharing, prev_marker, next_marker, prev_addrs, next_addrs) = {
             let mut state = self.state.lock().unwrap();
             if state.network == network {
                 return false;
             }
+            if state.network.same_underlay(&network) {
+                state.network = network;
+                return false;
+            }
+            let prev_marker = state.network.marker.clone();
+            let next_marker = network.marker.clone();
+            let prev_addrs = state.network.addresses.clone();
+            let next_addrs = network.addresses.clone();
             state.network = network;
             let was_sharing = !state.sharing.is_empty();
             state.restore_pending = false;
@@ -504,11 +573,26 @@ impl Core {
             }
             state.view.clear();
             state.latest.clear();
-            (state.link.take(), was_sharing)
+            (
+                state.link.take(),
+                was_sharing,
+                prev_marker,
+                next_marker,
+                prev_addrs,
+                next_addrs,
+            )
         };
         if let Some(link) = link {
             link.direct.close();
         }
+        self.log.record(
+            if was_sharing { "WARN" } else { "INFO" },
+            "net",
+            &format!(
+                "changed sharing={} addrs={:?}->{:?} gw={}->{}",
+                was_sharing, prev_addrs, next_addrs, prev_marker, next_marker
+            ),
+        );
         if was_sharing {
             self.report(Code::NetworkChanged);
         }
@@ -519,6 +603,8 @@ impl Core {
     async fn route_worker(self: Arc<Self>) {
         let mut rx = self.changes.subscribe();
         let mut applied = Tun::default();
+        let mut failures: u8 = 0;
+        let mut last_build_err: Option<Code> = None;
         loop {
             let (network, view, labels, control, wanted, local_shares) = {
                 let s = self.state.lock().unwrap();
@@ -549,40 +635,126 @@ impl Core {
                     &local_shares,
                 )
             };
-            let mut next = match result {
-                Ok(next) => next,
+            let (mut next, build_ok) = match result {
+                Ok(next) => {
+                    last_build_err = None;
+                    (next, true)
+                }
                 Err(e) => {
+                    if last_build_err != Some(e) {
+                        last_build_err = Some(e);
+                        self.log.record(
+                            "ERR",
+                            "route",
+                            &format!(
+                                "build failed err={e:?} routes={} addrs={:?}",
+                                network.routes.len(),
+                                network.addresses
+                            ),
+                        );
+                    }
                     self.report(e);
-                    self.routes.read().unwrap().cleared()
+                    (self.routes.read().unwrap().cleared(), false)
                 }
             };
             let tun = next.tun.clone();
             next.installed = tun == applied;
             *self.routes.write().unwrap() = next;
             self.bump_status();
-            if tun != applied {
+            let retry_at = if tun != applied {
                 let p = self.platform.clone();
                 let update = tun.clone();
-                let success = tokio::task::spawn_blocking(move || p.apply(&update))
-                    .await
-                    .is_ok_and(|r| r.is_ok());
-                if success {
-                    applied = tun;
-                    self.routes.write().unwrap().installed = true;
-                    self.bump_status();
-                } else {
-                    self.report(Code::Conflict);
-                    let p = self.platform.clone();
-                    let _ = tokio::task::spawn_blocking(move || p.apply(&Tun::default())).await;
-                    applied = Tun::default();
-                    let cleared = self.routes.read().unwrap().cleared();
-                    *self.routes.write().unwrap() = cleared;
-                    self.bump_status();
+                let apply_res = tokio::task::spawn_blocking(move || p.apply(&update)).await;
+                match apply_res {
+                    Ok(Ok(())) => {
+                        if failures > 0 || tun.address.is_some() {
+                            self.log.record_info("tun", || {
+                                format!(
+                                    "applied addr={:?} routes={} dns={:?}",
+                                    tun.address,
+                                    tun.routes.len(),
+                                    tun.dns
+                                )
+                            });
+                        }
+                        applied = tun;
+                        failures = 0;
+                        self.routes.write().unwrap().installed = true;
+                        {
+                            let mut state = self.state.lock().unwrap();
+                            if state.error == Some(Code::Conflict) {
+                                state.error = None;
+                            }
+                        }
+                        self.bump_status();
+                        None
+                    }
+                    Ok(Err(err)) => {
+                        failures = failures.saturating_add(1);
+                        self.log.record(
+                            "ERR",
+                            "tun",
+                            &format!("apply failed attempt={failures}: {err}"),
+                        );
+                        if failures >= 2 {
+                            self.report(Code::Conflict);
+                        }
+                        let delay = Duration::from_secs(match failures {
+                            0 | 1 => 2,
+                            2 => 4,
+                            3 => 8,
+                            _ => 15,
+                        });
+                        let p = self.platform.clone();
+                        let _ = tokio::task::spawn_blocking(move || p.apply(&Tun::default())).await;
+                        applied = Tun::default();
+                        let cleared = self.routes.read().unwrap().cleared();
+                        *self.routes.write().unwrap() = cleared;
+                        self.bump_status();
+                        Some(Instant::now() + delay)
+                    }
+                    Err(err) => {
+                        failures = failures.saturating_add(1);
+                        self.log.record("ERR", "tun", &format!("apply panicked: {err}"));
+                        if failures >= 2 {
+                            self.report(Code::Conflict);
+                        }
+                        let p = self.platform.clone();
+                        let _ = tokio::task::spawn_blocking(move || p.apply(&Tun::default())).await;
+                        applied = Tun::default();
+                        let cleared = self.routes.read().unwrap().cleared();
+                        *self.routes.write().unwrap() = cleared;
+                        self.bump_status();
+                        Some(Instant::now() + Duration::from_secs(2))
+                    }
                 }
-            }
+            } else {
+                failures = 0;
+                if build_ok {
+                    let mut cleared = false;
+                    {
+                        let mut state = self.state.lock().unwrap();
+                        if state.error == Some(Code::Conflict) {
+                            state.error = None;
+                            cleared = true;
+                        }
+                    }
+                    if cleared {
+                        self.bump_status();
+                    }
+                }
+                None
+            };
             tokio::select! {
                 _ = self.quit.cancelled() => break,
-                _ = rx.changed() => {},
+                _ = rx.changed() => {}
+                _ = async {
+                    if let Some(deadline) = retry_at {
+                        tokio::time::sleep_until(deadline).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {}
             }
         }
         *self.routes.write().unwrap() = Routes::default();
@@ -612,6 +784,7 @@ impl Core {
                     return;
                 }
             }
+            self.traffic.expire_if_idle();
             if self.refresh_network().await {
                 retry = None;
             }

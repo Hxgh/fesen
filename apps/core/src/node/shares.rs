@@ -70,7 +70,7 @@ impl Core {
             return Err(e);
         }
         let mut state = self.state.lock().unwrap();
-        if state.network != net
+        if !state.network.same_underlay(&net)
             || !Self::is_link(&state, &link)
             || link.direct.cancel.is_cancelled()
         {
@@ -185,7 +185,7 @@ impl Core {
         }
         if !published.is_empty() {
             let mut state = self.state.lock().unwrap();
-            if state.network != net
+            if !state.network.same_underlay(&net)
                 || !Self::is_link(&state, &link)
                 || link.direct.cancel.is_cancelled()
             {
@@ -546,12 +546,17 @@ impl Core {
         self: &Arc<Self>,
         link: &Arc<Link>,
         prefs: Vec<MemberPref>,
-        profiles: Vec<DeviceProfile>,
+        mut profiles: Vec<DeviceProfile>,
     ) {
         let (labels_changed, to_push, initial_profile) = {
             let mut state = self.state.lock().unwrap();
             if !Self::is_link(&state, link) {
                 return;
+            }
+            for p in &mut profiles {
+                if p.machine_id != self.device_info.machine_id {
+                    p.forwards.clear();
+                }
             }
             state.cloud_profiles = profiles;
             let initial_profile = if !state.profile_synced {

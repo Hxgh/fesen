@@ -177,8 +177,17 @@ async fn session_loop(mut socket: WebSocket, app: App, ip: Option<IpAddr>) {
             None
         };
         let prefs = store::list_prefs(&g.db, &member)?;
-        let profiles = store::list_profiles(&g.db, &member)?;
-        let session = g.connect(&id, member.clone(), label, os, cert.clone(), tx)?;
+        let raw_profiles = store::list_profiles(&g.db, &member)?;
+        let profiles = crate::group::Group::scope_profiles(&raw_profiles, hello.machine_id.as_deref());
+        let session = g.connect(crate::group::ConnectDevice {
+            id: id.clone(),
+            member: member.clone(),
+            label,
+            os,
+            machine_id: hello.machine_id.clone(),
+            cert: cert.clone(),
+            outgoing: tx,
+        })?;
         Ok((
             id,
             member,

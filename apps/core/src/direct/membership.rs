@@ -102,6 +102,11 @@ impl Membership {
         lease.peers.get(id).cloned()
     }
 
+    pub fn id_for(&self, cert: &[u8]) -> Option<String> {
+        let lease = self.0.read().unwrap();
+        lease.by_cert.get(cert).cloned()
+    }
+
     #[cfg(test)]
     pub(super) fn expire_now(&self) {
         self.0.write().unwrap().expires = Some(Instant::now());

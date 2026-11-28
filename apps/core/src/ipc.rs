@@ -104,7 +104,7 @@ static ADDR_CACHE: Mutex<Option<(PathBuf, Address)>> = Mutex::new(None);
 pub struct Endpoint {
     path: PathBuf,
     _lock: fs::File,
-    listener: TcpListener,
+    listener: Option<TcpListener>,
     token: [u8; 32],
     #[cfg(windows)]
     _directories: Vec<fs::File>,
@@ -140,47 +140,52 @@ impl Endpoint {
         Ok(Self {
             path,
             _lock: lock,
-            listener,
+            listener: Some(listener),
             token,
             #[cfg(windows)]
             _directories: pins,
         })
     }
 
-    pub async fn serve(self, core: Arc<Core>) {
+    pub async fn serve(mut self, core: Arc<Core>) {
         let capacity = Arc::new(Semaphore::new(48));
-        loop {
-            let conn = tokio::select! {
-                _ = core.quit.cancelled() => break,
-                conn = self.listener.accept() => conn,
-            };
-            let Ok((mut stream, _)) = conn else { break };
-            let _ = stream.set_nodelay(true);
-            let Ok(slot) = capacity.clone().try_acquire_owned() else {
-                continue;
-            };
-            let core = core.clone();
-            let token = self.token;
-            tokio::spawn(async move {
-                let _slot = slot;
-                let _ = timeout(Duration::from_secs(30), async {
-                    let mut supplied = [0; 32];
-                    stream.read_exact(&mut supplied).await?;
-                    if supplied
-                        .into_iter()
-                        .zip(token)
-                        .fold(0, |diff, (a, b)| diff | (a ^ b))
-                        != 0
-                    {
-                        return Ok(());
-                    }
-                    let command = read(&mut stream, MAX_COMMAND).await?;
-                    let reply = dispatch_bytes(&core, &command).await;
-                    write(&mut stream, &reply).await
-                })
-                .await;
-            });
+        if let Some(listener) = self.listener.take() {
+            loop {
+                let conn = tokio::select! {
+                    _ = core.quit.cancelled() => break,
+                    conn = listener.accept() => conn,
+                };
+                let Ok((mut stream, _)) = conn else { break };
+                let _ = stream.set_nodelay(true);
+                let Ok(slot) = capacity.clone().try_acquire_owned() else {
+                    continue;
+                };
+                let core = core.clone();
+                let token = self.token;
+                tokio::spawn(async move {
+                    let _slot = slot;
+                    let _ = timeout(Duration::from_secs(30), async {
+                        let mut supplied = [0; 32];
+                        stream.read_exact(&mut supplied).await?;
+                        if supplied
+                            .into_iter()
+                            .zip(token)
+                            .fold(0, |diff, (a, b)| diff | (a ^ b))
+                            != 0
+                        {
+                            return Ok(());
+                        }
+                        let command = read(&mut stream, MAX_COMMAND).await?;
+                        let reply = dispatch_bytes(&core, &command).await;
+                        write(&mut stream, &reply).await
+                    })
+                    .await;
+                });
+            }
+            drop(listener);
         }
+        // Release the listening socket and ipc.json immediately so GUI quit/detach never blocks on core teardown.
+        let _ = fs::remove_file(&self.path);
         core.stop();
         core.wait_stopped().await;
     }

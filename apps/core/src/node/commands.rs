@@ -198,6 +198,49 @@ impl Core {
                 self.bump_status();
                 return Ok(self.status());
             }
+            Command::Logs { limit, verbose } => {
+                self.touch_ui();
+                if let Some(enabled) = verbose {
+                    self.log.set_verbose(enabled);
+                    self.bump_status();
+                }
+                let logs = self.log.tail(limit.unwrap_or(200));
+                return Ok(Status {
+                    logs: Some(logs),
+                    ..self.status()
+                });
+            }
+            Command::ClearLogs => {
+                self.touch_ui();
+                self.log.clear().map_err(|_| Code::Internal)?;
+                return Ok(Status {
+                    logs: Some(Vec::new()),
+                    ..self.status()
+                });
+            }
+            Command::Traffic { enabled } => {
+                self.touch_ui();
+                let traffic = self
+                    .traffic
+                    .snapshot(enabled, |svc, peer, port| self.resolve_flow_info(svc, peer, port));
+                return Ok(Status {
+                    traffic: Some(traffic),
+                    ..self.status()
+                });
+            }
+            Command::DropFlow { id } => {
+                self.touch_ui();
+                if self.traffic.drop_flow(id) {
+                    self.log.record("WARN", "flow", &format!("dropped flow_id={id} by user"));
+                }
+                let traffic = self
+                    .traffic
+                    .snapshot(true, |svc, peer, port| self.resolve_flow_info(svc, peer, port));
+                return Ok(Status {
+                    traffic: Some(traffic),
+                    ..self.status()
+                });
+            }
             _ => {}
         }
         self.touch_ui();
@@ -228,7 +271,11 @@ impl Core {
             | Command::AdminAction { .. }
             | Command::SetPreferences { .. }
             | Command::SuggestLocalPort { .. }
-            | Command::DismissRestore => unreachable!(),
+            | Command::DismissRestore
+            | Command::Logs { .. }
+            | Command::ClearLogs
+            | Command::Traffic { .. }
+            | Command::DropFlow { .. } => unreachable!(),
             Command::Join { address } => {
                 let address = origin(&address)?.to_string();
                 let res = self.edit(|local| {
@@ -660,7 +707,7 @@ impl Core {
                             shares.push(imported);
                         }
                     }
-                    if import_forwards {
+                    if import_forwards && same_machine {
                         let forwards = local.forwards_mut()?;
                         for f in &profile.forwards {
                             if forwards.len() >= 64 {

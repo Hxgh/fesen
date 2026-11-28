@@ -7,6 +7,7 @@ import { createScale, createTheme } from "../../../../packages/ui/theme.js";
 import { mac, persistViewMode, state, toggleCollapsedKey } from "../model/state";
 import type { BrandState, Reply, Request, Status, ViewMode } from "../model/types";
 import { button, dialogHeader, el, notify } from "../ui/dom";
+import { openDiagnostics } from "../dialogs/diag-dialog";
 import { syncWindowControlsI18n, syncWindowsTheme } from "../ui/window";
 
 const rawTheme = createTheme("fesen_theme");
@@ -142,10 +143,16 @@ export function showError() {
     inlineError.hidden = !code;
     inlineError.textContent = code ? failure(code) : "";
     errorLine.hidden = true;
-    errorLine.textContent = "";
+    errorLine.replaceChildren();
   } else {
     errorLine.hidden = !code;
-    errorLine.textContent = code ? failure(code) : "";
+    if (code) {
+      const msg = el("span", "error-line-msg", failure(code));
+      const logBtn = button(t("diag_open_logs_btn"), () => openDiagnostics("logs"), "button ghost error-log-btn");
+      errorLine.replaceChildren(msg, logBtn);
+    } else {
+      errorLine.replaceChildren();
+    }
   }
   const dialogError = editor.querySelector<HTMLParagraphElement>("[role=alert]");
   if (dialogError) {

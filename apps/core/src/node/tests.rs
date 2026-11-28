@@ -692,3 +692,188 @@ async fn conditional_status_poll_skips_unchanged_and_tracks_mutations() {
     core.stop();
     core.wait_stopped().await;
 }
+
+#[tokio::test]
+async fn metric_jitter_preserves_sharing_while_topology_change_triggers_network_changed() {
+    use crate::platform::Underlay;
+    use std::sync::Mutex as StdMutex;
+
+    struct SwitchingPlatform(StdMutex<Network>);
+    impl Platform for SwitchingPlatform {
+        fn network(&self) -> io::Result<Network> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        fn protect(&self, _: &socket2::Socket, _: Option<Ipv4Addr>) -> io::Result<()> {
+            Ok(())
+        }
+        fn apply(&self, _: &Tun) -> io::Result<()> {
+            Ok(())
+        }
+        fn write_packet(&self, _: &[u8]) {}
+        fn set_input(&self, _: tokio::sync::mpsc::Sender<Vec<u8>>) {}
+    }
+
+    let initial = Network {
+        marker: "gw:192.0.2.1".into(),
+        addresses: vec![Ipv4Addr::new(192, 0, 2, 10)],
+        routes: vec![
+            Underlay {
+                cidr: "0.0.0.0/0".parse().unwrap(),
+                index: 11,
+                metric: 35,
+            },
+            Underlay {
+                cidr: "192.0.2.0/24".parse().unwrap(),
+                index: 11,
+                metric: 291,
+            },
+        ],
+        dns: vec![],
+    };
+    let platform = Arc::new(SwitchingPlatform(StdMutex::new(initial)));
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::new(dir.path().to_path_buf(), platform.clone(), false).unwrap();
+    let direct = direct::Direct::new(
+        Identity::new().unwrap(),
+        &*platform,
+        core.quit.child_token(),
+        false,
+    )
+    .unwrap();
+    let link = Link::isolated(direct);
+    let share_id = "0123456789abcdef0123456789abcdef".to_owned();
+    let publication = Publication {
+        id: share_id.clone(),
+        name: "Host".into(),
+        rules: Rules::parse("192.0.2.10", "22").unwrap(),
+        http: false,
+        kind: Some(ServiceKind::Ssh),
+        host_os: Some(HostOs::Windows),
+    };
+    {
+        let mut state = core.state.lock().unwrap();
+        state.link = Some(link.clone());
+        state.sharing.insert(
+            share_id.clone(),
+            Sharing {
+                publication,
+                cancel: link.direct.cancel.child_token(),
+            },
+        );
+    }
+
+    // Dynamic metric change alone updates stored metrics without pausing shares or dropping the link.
+    {
+        let mut net = platform.0.lock().unwrap();
+        net.routes[0].metric = 45;
+        net.routes[1].metric = 301;
+    }
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(!core.refresh_network().await);
+    assert_eq!(core.network().routes[0].metric, 45);
+    assert_eq!(core.status().active, vec![share_id]);
+    assert_eq!(core.status().error, None);
+    assert!(!link.direct.cancel.is_cancelled());
+
+    // A genuine gateway marker change still clears active shares and reports NetworkChanged.
+    {
+        let mut net = platform.0.lock().unwrap();
+        net.marker = "gw:198.51.100.1".into();
+    }
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(core.refresh_network().await);
+    assert!(core.status().active.is_empty());
+    assert_eq!(core.status().error, Some(Code::NetworkChanged));
+    assert!(link.direct.cancel.is_cancelled());
+
+    core.stop();
+    core.wait_stopped().await;
+}
+
+#[tokio::test]
+async fn route_worker_retries_transient_apply_failures_and_clears_conflict() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FlakyApplyPlatform {
+        calls: AtomicUsize,
+        fail_until: usize,
+    }
+    impl Platform for FlakyApplyPlatform {
+        fn network(&self) -> io::Result<Network> {
+            Ok(Network {
+                marker: "test".into(),
+                addresses: vec![Ipv4Addr::new(192, 0, 2, 10)],
+                ..Network::default()
+            })
+        }
+        fn protect(&self, _: &socket2::Socket, _: Option<Ipv4Addr>) -> io::Result<()> {
+            Ok(())
+        }
+        fn apply(&self, tun: &Tun) -> io::Result<()> {
+            if tun.address.is_some() {
+                let n = self.calls.fetch_add(1, Ordering::AcqRel) + 1;
+                if n <= self.fail_until {
+                    return Err(io::Error::other("transient adapter teardown race"));
+                }
+            }
+            Ok(())
+        }
+        fn write_packet(&self, _: &[u8]) {}
+        fn set_input(&self, _: tokio::sync::mpsc::Sender<Vec<u8>>) {}
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let platform = Arc::new(FlakyApplyPlatform {
+        calls: AtomicUsize::new(0),
+        fail_until: 2,
+    });
+    let core = Core::new(dir.path().to_path_buf(), platform.clone(), false).unwrap();
+    let direct = direct::Direct::new(
+        Identity::new().unwrap(),
+        &*platform,
+        core.quit.child_token(),
+        false,
+    )
+    .unwrap();
+    let link = Link::isolated(direct);
+    core.state.lock().unwrap().link = Some(link.clone());
+    let view = View {
+        peers: vec![],
+        services: vec![Offering {
+            owner: "peer".into(),
+            member: "member".into(),
+            device: None,
+            device_os: None,
+            service: Publication {
+                id: "0123456789abcdef0123456789abcdef".into(),
+                name: "Site".into(),
+                http: true,
+                kind: Some(ServiceKind::Http),
+                host_os: None,
+                rules: Rules::parse("198.51.100.20", "80").unwrap(),
+            },
+        }],
+    };
+    core.update_view(&link, view);
+
+    // Wait up to 8s for retry loop (2s + 4s) to recover from 2 consecutive apply() failures.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let st = core.status();
+        if st.routes_ready {
+            assert_eq!(st.error, None);
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "route_worker failed to recover: routes_ready={} error={:?} calls={}",
+            st.routes_ready,
+            st.error,
+            platform.calls.load(Ordering::Acquire)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    core.stop();
+    core.wait_stopped().await;
+}

@@ -37,12 +37,18 @@ fn sysctl_route_snapshot_matches_live_macos_network() {
         let Some(cidr) = parse_netstat_cidr(row[0]) else {
             continue;
         };
+        if cidr.prefix > 0 && cidr.prefix < 8 {
+            continue;
+        }
+        if is_virtual_tunnel(row[3]) {
+            continue;
+        }
         let name = std::ffi::CString::new(row[3]).unwrap();
         let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
         if index == 0 {
             continue;
         }
-        if cidr.prefix == 0 && !row[3].starts_with("utun") {
+        if cidr.prefix == 0 {
             expected_identity.push(format!("{}:{}", row[3], row[1]));
         }
         expected_routes.push(Underlay {

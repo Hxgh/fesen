@@ -120,6 +120,27 @@ fn can_route() -> bool {
     unsafe { ph_host_can_route() != 0 }
 }
 
+pub fn is_signed() -> bool {
+    can_route()
+}
+
+pub async fn prepare_update() {
+    if can_route() {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            request(serde_json::json!({"op": "stop"}), false),
+        )
+        .await;
+    } else if let Ok(dir) = publisher_dir() {
+        let _ = tokio::time::timeout(
+            Duration::from_millis(800),
+            ipc::request(&dir, &serde_json::json!({"op": "quit"})),
+        )
+        .await;
+    }
+    close_tray();
+}
+
 async fn publisher(value: &Value, start: bool) -> Result<Value, String> {
     static START: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let unavailable = || String::from("not_connected");

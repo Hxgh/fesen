@@ -7,7 +7,10 @@ use std::{
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -362,10 +365,52 @@ impl Local {
 
 const LOG_MAX: u64 = 10 * 1024 * 1024;
 const LOG_AGE: u64 = 7 * 24 * 60 * 60;
+const LOG_MSG_MAX: usize = 320;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub ts: u64,
+    pub level: String,
+    pub scope: String,
+    pub message: String,
+}
 
 pub struct Log {
     path: PathBuf,
     lock: Mutex<()>,
+    verbose: AtomicBool,
+}
+
+fn sanitize_log_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(LOG_MSG_MAX));
+    let mut prev_space = false;
+    for ch in raw.trim().chars() {
+        let mapped = if ch.is_control() { ' ' } else { ch };
+        if mapped.is_whitespace() {
+            if !prev_space && !out.is_empty() {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(mapped);
+            prev_space = false;
+        }
+        if out.chars().count() >= LOG_MSG_MAX {
+            break;
+        }
+    }
+    out.trim().to_owned()
+}
+
+fn code_level(code: Code) -> &'static str {
+    match code {
+        Code::Conflict
+        | Code::DeviceRevoked
+        | Code::Unauthorized
+        | Code::ProtocolMismatch
+        | Code::Internal => "ERR",
+        _ => "WARN",
+    }
 }
 
 impl Log {
@@ -373,6 +418,21 @@ impl Log {
         Self {
             path: dir.join("events.log"),
             lock: Mutex::new(()),
+            verbose: AtomicBool::new(false),
+        }
+    }
+
+    pub fn is_verbose(&self) -> bool {
+        self.verbose.load(Ordering::Relaxed)
+    }
+
+    pub fn set_verbose(&self, enabled: bool) {
+        self.verbose.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn record_info(&self, scope: &str, build: impl FnOnce() -> String) {
+        if self.is_verbose() {
+            self.record("INFO", scope, &build());
         }
     }
 
@@ -414,9 +474,8 @@ impl Log {
         }
     }
 
-    pub fn event(&self, code: Code) {
+    fn append_line(&self, line: &str) {
         let _lock = self.lock.lock().unwrap();
-        let line = format!("{} {code:?}\n", Self::now());
         let rotate = fs::metadata(&self.path).is_ok_and(|m| m.len() + line.len() as u64 > LOG_MAX);
         let mut options = private_file();
         options.create(true);
@@ -430,6 +489,87 @@ impl Log {
         {
             let _ = f.write_all(line.as_bytes());
         }
+    }
+
+    pub fn event(&self, code: Code) {
+        let level = code_level(code);
+        let line = format!("{} {level} core {code:?} ({code})\n", Self::now());
+        self.append_line(&line);
+    }
+
+    pub fn record(&self, level: &str, scope: &str, message: &str) {
+        let lvl = match level {
+            "ERR" | "WARN" | "INFO" => level,
+            _ => "INFO",
+        };
+        if lvl == "INFO" && !self.is_verbose() {
+            return;
+        }
+        let clean = sanitize_log_text(message);
+        if clean.is_empty() {
+            return;
+        }
+        let sc = scope
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .take(16)
+            .collect::<String>();
+        let sc = if sc.is_empty() { "core" } else { sc.as_str() };
+        let line = format!("{} {lvl} {sc} {clean}\n", Self::now());
+        self.append_line(&line);
+    }
+
+    pub fn tail(&self, limit: usize) -> Vec<LogEntry> {
+        use io::{BufRead, BufReader};
+        let cap = limit.clamp(1, 500);
+        let _lock = self.lock.lock().unwrap();
+        let Ok(file) = private_file().read(true).open(&self.path).and_then(vetted) else {
+            return Vec::new();
+        };
+        let mut ring = std::collections::VecDeque::with_capacity(cap);
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Some((ts_str, rest)) = trimmed.split_once(' ') else {
+                continue;
+            };
+            let Ok(ts) = ts_str.parse::<u64>() else {
+                continue;
+            };
+            let entry = if let Some((lvl, after_lvl)) = rest.split_once(' ')
+                && matches!(lvl, "ERR" | "WARN" | "INFO")
+                && let Some((scope, msg)) = after_lvl.split_once(' ')
+            {
+                LogEntry {
+                    ts,
+                    level: lvl.to_owned(),
+                    scope: scope.to_owned(),
+                    message: msg.to_owned(),
+                }
+            } else {
+                LogEntry {
+                    ts,
+                    level: "WARN".to_owned(),
+                    scope: "core".to_owned(),
+                    message: rest.to_owned(),
+                }
+            };
+            if ring.len() == cap {
+                ring.pop_front();
+            }
+            ring.push_back(entry);
+        }
+        ring.into_iter().collect()
+    }
+
+    pub fn clear(&self) -> io::Result<()> {
+        let _lock = self.lock.lock().unwrap();
+        if self.path.exists() {
+            save(&self.path, b"")?;
+        }
+        Ok(())
     }
 }
 
@@ -461,7 +601,21 @@ mod tests {
         log.event(Code::TargetTimeout);
         let contents = fs::read_to_string(&log.path).unwrap();
         assert_eq!(contents.lines().count(), 1);
-        assert!(contents.ends_with(" TargetTimeout\n"));
+        assert!(contents.contains("TargetTimeout"));
         assert!(contents.len() < LOG_MAX as usize);
+
+        log.record("INFO", "tun", "suppressed while non-verbose");
+        assert_eq!(log.tail(10).len(), 1);
+
+        log.set_verbose(true);
+        log.record("INFO", "tun", "ready addr=198.18.0.0\nline2");
+        let entries = log.tail(10);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].level, "INFO");
+        assert_eq!(entries[1].scope, "tun");
+        assert_eq!(entries[1].message, "ready addr=198.18.0.0 line2");
+
+        log.clear().unwrap();
+        assert!(log.tail(10).is_empty());
     }
 }

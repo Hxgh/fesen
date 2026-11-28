@@ -1,12 +1,10 @@
-use super::{
-    Core,
-    types::{COPY_BUF, Flow},
-};
+use super::{Core, types::COPY_BUF};
 use crate::{
     control::Link,
     direct::{self, Allowed},
     platform, probe,
     routing::Destination,
+    traffic::{FlowKind, FlowSpec},
 };
 use fesen_proto::{Code, HostOs, Open, ServiceKind, valid_id};
 use std::{
@@ -59,7 +57,11 @@ impl Core {
         }
     }
 
-    fn grant(&self, link: &Arc<Link>, request: &Open) -> Result<CancellationToken, Code> {
+    fn grant(
+        &self,
+        link: &Arc<Link>,
+        request: &Open,
+    ) -> Result<(CancellationToken, String), Code> {
         let state = self.state.lock().unwrap();
         if !Self::is_link(&state, link)
             || !state.network.known()
@@ -78,7 +80,7 @@ impl Core {
         {
             return Err(Code::Unauthorized);
         }
-        Ok(share.cancel.clone())
+        Ok((share.cancel.clone(), share.publication.name.clone()))
     }
 
     async fn serve_stream(
@@ -98,28 +100,56 @@ impl Core {
             _ = link.direct.cancel.cancelled() => None,
             result = async {
                 let request = timeout(Duration::from_secs(4), direct::frame_in::<Open>(&mut rx)).await.ok()?.ok()?;
-                let share = match self.grant(link, &request) {
-                    Ok(c) => c,
+                let (share, share_name) = match self.grant(link, &request) {
+                    Ok(v) => v,
                     Err(e) => {
-                        self.log.event(e);
+                        self.log.record("WARN", "share", &format!("denied target={} err={e:?}", request.target));
                         direct::frame_out(&mut tx, &Some(e)).await.ok()?;
                         return Some(());
                     }
                 };
                 // Recheck the underlay before connecting, not just on the periodic heartbeat.
                 if self.refresh_network().await { return None; }
-                let _flow = Flow::new(&self.flows);
+                let flow_cancel = share.child_token();
+                let is_local_target = request.target.ip().is_loopback()
+                    || self.network().addresses.contains(request.target.ip());
+                let peer_id = link
+                    .direct
+                    .membership
+                    .id_for(&peer.certificate)
+                    .unwrap_or_default();
+                let _ = share_name;
+                let mut flow = self.traffic.register(FlowSpec {
+                    kind: if is_local_target {
+                        FlowKind::InboundLocal
+                    } else {
+                        FlowKind::InboundLan
+                    },
+                    service: request.service.clone(),
+                    peer_id,
+                    src_port: None,
+                    target: request.target,
+                    local_port: None,
+                    cancel: flow_cancel.clone(),
+                });
                 tokio::select! {
                     biased;
-                    _ = share.cancelled() => None,
+                    _ = flow_cancel.cancelled() => {
+                        flow.close_stopped(|id| self.peer_label(id));
+                        None
+                    }
                     result = async {
                         match platform::tcp(&*self.platform, request.target).await {
-                            Ok(mut tcp) => {
+                            Ok(tcp) => {
                                 direct::frame_out(&mut tx, &Option::<Code>::None).await.ok()?;
-                                let mut peer = tokio::io::join(&mut rx, &mut tx);
-                                let _ = copy_bidirectional_with_sizes(&mut peer, &mut tcp, COPY_BUF, COPY_BUF).await;
+                                let mut peer_io = tokio::io::join(&mut rx, &mut tx);
+                                let mut counted_tcp = flow.wrap(tcp);
+                                let _ = copy_bidirectional_with_sizes(&mut peer_io, &mut counted_tcp, COPY_BUF, COPY_BUF).await;
                             }
-                            Err(e) => { direct::frame_out(&mut tx, &Some(e)).await.ok()?; }
+                            Err(e) => {
+                                flow.close_error(&format!("{e:?}"), |id| self.peer_label(id));
+                                direct::frame_out(&mut tx, &Some(e)).await.ok()?;
+                            }
                         }
                         Some(())
                     } => result,
@@ -131,10 +161,18 @@ impl Core {
 
     pub async fn forward<T: AsyncRead + AsyncWrite + Unpin>(
         &self,
-        mut app: T,
+        app: T,
         address: SocketAddrV4,
     ) -> Result<(), Code> {
-        let _flow = Flow::new(&self.flows);
+        self.forward_from(app, address, None).await
+    }
+
+    pub async fn forward_from<T: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        mut app: T,
+        address: SocketAddrV4,
+        src_port: Option<u16>,
+    ) -> Result<(), Code> {
         let dest = self.routes.read().unwrap().destination(address);
         match dest {
             Destination::Reject => Err(Code::Unauthorized),
@@ -157,14 +195,34 @@ impl Core {
                 service,
                 target,
             } => {
-                self.with_peer(&owner, Open { service, target }, async |tx, rx, _| {
-                    let mut remote = tokio::io::join(rx, tx);
-                    let _ =
-                        copy_bidirectional_with_sizes(&mut app, &mut remote, COPY_BUF, COPY_BUF)
-                            .await;
-                    Ok(())
-                })
-                .await
+                let flow_cancel = CancellationToken::new();
+                let mut flow = self.traffic.register(FlowSpec {
+                    kind: FlowKind::OutboundTun,
+                    service: service.clone(),
+                    peer_id: owner.clone(),
+                    src_port,
+                    target,
+                    local_port: None,
+                    cancel: flow_cancel.clone(),
+                });
+                let res = tokio::select! {
+                    biased;
+                    _ = flow_cancel.cancelled() => {
+                        flow.close_stopped(|id| self.peer_label(id));
+                        Ok(())
+                    }
+                    res = self.with_peer(&owner, Open { service: service.clone(), target }, async |tx, rx, _| {
+                        let mut remote = flow.wrap(tokio::io::join(rx, tx));
+                        let _ =
+                            copy_bidirectional_with_sizes(&mut app, &mut remote, COPY_BUF, COPY_BUF)
+                                .await;
+                        Ok(())
+                    }) => res,
+                };
+                if let Err(code) = &res {
+                    flow.close_error(&format!("{code:?}"), |id| self.peer_label(id));
+                }
+                res
             }
         }
     }
@@ -186,7 +244,6 @@ impl Core {
                 return Err(Code::Unauthorized);
             }
         }
-        let _flow = Flow::new(&self.flows);
         probe::http(platform::tcp(&*self.platform, target).await?, target).await
     }
 
@@ -216,7 +273,6 @@ impl Core {
         let cancel = self.quit.child_token();
         *self.probe_cancel.lock().unwrap() = Some(cancel.clone());
         let _cancel_guard = ProbeCancelGuard(&self.probe_cancel);
-        let _flow = Flow::new(&self.flows);
         let started = Instant::now();
         let fut = async {
             if ports.is_empty() {
@@ -281,7 +337,6 @@ impl Core {
                 offering.service.effective_kind(),
             )
         };
-        let _flow = Flow::new(&self.flows);
         timeout(
             Duration::from_secs(24),
             self.with_peer(&owner, request, async |mut tx, mut rx, open_rtt_ms| {

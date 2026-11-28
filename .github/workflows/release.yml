@@ -194,14 +194,17 @@ jobs:
               rm -f "$notary_zip"
             fi
             dmg_out="dist-release/${REPO}_${VERSION}_macos-arm64.dmg"
+            tar_out="dist-release/${REPO}_${VERSION}_macos-arm64.app.tar.gz"
           else
             bash scripts/build-macos.sh --unsigned
             dmg_out="dist-release/${REPO}_${VERSION}_macos-arm64-unsigned.dmg"
+            tar_out="dist-release/${REPO}_${VERSION}_macos-arm64-unsigned.app.tar.gz"
           fi
           dmg_stage="$RUNNER_TEMP/dmg-stage"
-          rm -rf "$dmg_stage" "$dmg_out"
+          rm -rf "$dmg_stage" "$dmg_out" "$tar_out"
           mkdir -p "$dmg_stage"
           ditto "$app_path" "$dmg_stage/Fesen.app"
+          COPYFILE_DISABLE=1 tar -C "$dmg_stage" -czf "$tar_out" Fesen.app
           ln -s /Applications "$dmg_stage/Applications"
           hdiutil create -volname "Fesen" -srcfolder "$dmg_stage" -ov -format UDZO "$dmg_out"
           rm -rf "$dmg_stage"
@@ -329,19 +332,81 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: release-assets
           merge-multiple: true
-      - name: Generate checksums & release body
+      - name: Generate checksums, latest.json & release body
         env:
           TAG: ${{ needs.meta.outputs.tag }}
+          VERSION: ${{ needs.meta.outputs.version }}
           IMAGE: ${{ needs.meta.outputs.image }}
+          REPO_FULL: ${{ github.repository }}
         run: |
           set -euo pipefail
+          prev_tag="$(git tag -l 'v*' --sort=-v:refname | grep -Fxv "$TAG" | head -n 1 || true)"
+          if [[ -n "$prev_tag" ]]; then
+            changelog="$(git log --no-merges --pretty=format:'- %s' "${prev_tag}..HEAD" | head -n 40 || true)"
+          else
+            changelog="$(git log --no-merges --pretty=format:'- %s' -n 20 || true)"
+          fi
+          if [[ -z "$changelog" ]]; then
+            changelog="- Maintenance and stability updates"
+          fi
+          export FESEN_CHANGELOG="$changelog"
+
           cd release-assets
           sha256sum * > SHA256SUMS.txt
+          node - <<'JS'
+          const fs = require('fs');
+          const tag = process.env.TAG;
+          const version = process.env.VERSION;
+          const repo = process.env.REPO_FULL;
+          const notes = (process.env.FESEN_CHANGELOG || '').trim();
+          const sums = {};
+          for (const line of fs.readFileSync('SHA256SUMS.txt', 'utf8').split(/\r?\n/)) {
+            const m = line.trim().match(/^([0-9a-fA-F]{64})\s+\*?(.+)$/);
+            if (m) sums[m[2]] = m[1].toLowerCase();
+          }
+          const files = Object.keys(sums);
+          const pick = (suffix) => {
+            const name = files.find((f) => f.endsWith(suffix));
+            if (!name) return null;
+            return {
+              url: `https://github.com/${repo}/releases/download/${tag}/${name}`,
+              sha256: sums[name],
+              size: fs.statSync(name).size,
+            };
+          };
+          const platforms = {};
+          const map = {
+            'windows-x86_64': '_windows-x64-setup.exe',
+            'darwin-aarch64': '_macos-arm64.app.tar.gz',
+            'darwin-aarch64-unsigned': '_macos-arm64-unsigned.app.tar.gz',
+            'darwin-aarch64-dmg': '_macos-arm64.dmg',
+            'darwin-aarch64-unsigned-dmg': '_macos-arm64-unsigned.dmg',
+            'android-aarch64': '_android-arm64.apk',
+            'android-aarch64-debug': '_android-arm64-debug.apk',
+          };
+          for (const [k, suffix] of Object.entries(map)) {
+            const item = pick(suffix);
+            if (item) platforms[k] = item;
+          }
+          const manifest = {
+            version,
+            tag,
+            pub_date: new Date().toISOString(),
+            notes,
+            url: `https://github.com/${repo}/releases/tag/${tag}`,
+            platforms,
+          };
+          fs.writeFileSync('latest.json', JSON.stringify(manifest, null, 2) + '\n');
+          JS
+
           printf '%s\n' \
             "### Server (Docker, linux/amd64 & linux/arm64)" \
             "" \
@@ -360,6 +425,9 @@ jobs:
             "- **Android 13+ (ARM64)**: \`*-android-arm64*.apk\`" \
             "" \
             "Verify checksums against \`SHA256SUMS.txt\`." \
+            "" \
+            "## What's Changed" \
+            "$changelog" \
             > ../release-notes.md
       - uses: softprops/action-gh-release@v3
         with:

@@ -1,9 +1,10 @@
 use crate::{
     control::Link,
-    local::Local,
+    local::{Local, LogEntry},
     platform::Network,
     probe,
     routing::{Label, Mapping},
+    traffic::TrafficSnapshot,
 };
 use fesen_proto::{
     Code, DeviceOs, DeviceProfile, HostOs, LocalForwardStatus, Offering, Publication, ServiceKind,
@@ -12,10 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     net::Ipv4Addr,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::Arc,
 };
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -158,6 +156,20 @@ pub enum Command {
         machine_id: String,
     },
     DismissRestore,
+    Logs {
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        verbose: Option<bool>,
+    },
+    ClearLogs,
+    Traffic {
+        #[serde(default)]
+        enabled: bool,
+    },
+    DropFlow {
+        id: u64,
+    },
 }
 
 fn default_true() -> bool {
@@ -227,6 +239,12 @@ pub struct Status {
     pub host_probe: Option<probe::HostProbe>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admin_data: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logs: Option<Vec<LogEntry>>,
+    #[serde(default)]
+    pub verbose_logs: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub traffic: Option<TrafficSnapshot>,
 }
 
 pub(super) type ForwardKey = (String, Ipv4Addr, u16);
@@ -261,21 +279,6 @@ pub(super) struct State {
     pub(super) error: Option<Code>,
     pub(super) is_admin: bool,
     pub(super) admin_token: Option<String>,
-}
-
-pub(super) struct Flow<'a>(&'a AtomicUsize);
-
-impl<'a> Flow<'a> {
-    pub(super) fn new(counter: &'a AtomicUsize) -> Self {
-        counter.fetch_add(1, Ordering::AcqRel);
-        Self(counter)
-    }
-}
-
-impl Drop for Flow<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
 }
 
 pub(super) struct HostUpdate {

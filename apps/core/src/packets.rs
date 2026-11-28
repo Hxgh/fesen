@@ -90,7 +90,7 @@ pub fn spawn(core: Arc<Core>) -> io::Result<()> {
         let slots = Arc::new(Semaphore::new(256));
         tokio::spawn(async move {
             loop {
-                let Some((stream, _, remote)) = (tokio::select! { _ = core.quit.cancelled() => None, stream = tcp.next() => stream })
+                let Some((stream, local, remote)) = (tokio::select! { _ = core.quit.cancelled() => None, stream = tcp.next() => stream })
                 else {
                     break;
                 };
@@ -104,11 +104,15 @@ pub fn spawn(core: Arc<Core>) -> io::Result<()> {
                 let core = core.clone();
                 let is_dns = remote.port() == 53
                     && core.routes.read().unwrap().tun.dns == Some(*remote.ip());
+                let src_port = match local {
+                    SocketAddr::V4(a) => Some(a.port()),
+                    _ => None,
+                };
                 tokio::spawn(async move {
                     let _slot = slot;
                     if is_dns {
                         let _ = timeout(Duration::from_secs(8), dns_tcp(&core, stream)).await;
-                    } else if let Err(e) = core.forward(stream, remote).await {
+                    } else if let Err(e) = core.forward_from(stream, remote, src_port).await {
                         core.report(e);
                     }
                 });

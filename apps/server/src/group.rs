@@ -281,6 +281,7 @@ pub struct Device {
     member: String,
     label: String,
     os: Option<DeviceOs>,
+    machine_id: Option<String>,
     cert: Vec<u8>,
     local: Vec<SocketAddrV4>,
     ipv6: Vec<SocketAddrV6>,
@@ -300,20 +301,22 @@ impl Device {
     }
 }
 
+pub struct ConnectDevice {
+    pub id: String,
+    pub member: String,
+    pub label: String,
+    pub os: Option<DeviceOs>,
+    pub machine_id: Option<String>,
+    pub cert: Vec<u8>,
+    pub outgoing: mpsc::Sender<Utf8Bytes>,
+}
+
 impl Group {
-    pub fn connect(
-        &mut self,
-        id: &str,
-        member: String,
-        label: String,
-        os: Option<DeviceOs>,
-        cert: Vec<u8>,
-        outgoing: mpsc::Sender<Utf8Bytes>,
-    ) -> Result<Arc<Session>, Code> {
-        if self.online.len() >= MAX_DEVICES && !self.online.contains_key(id) {
+    pub fn connect(&mut self, dev: ConnectDevice) -> Result<Arc<Session>, Code> {
+        if self.online.len() >= MAX_DEVICES && !self.online.contains_key(&dev.id) {
             return Err(Code::Limit);
         }
-        self.remove(id, false);
+        self.remove(&dev.id, false);
         let session = Arc::new(Session {
             cancel: CancellationToken::new(),
             revoked: AtomicBool::new(false),
@@ -324,16 +327,17 @@ impl Group {
             },
         });
         if self.probe_udp {
-            self.probes.insert(session.probe.clone(), id.to_owned());
+            self.probes.insert(session.probe.clone(), dev.id.clone());
         }
         self.online.insert(
-            id.to_owned(),
+            dev.id,
             Device {
-                member,
-                label,
-                os,
-                cert,
-                outgoing,
+                member: dev.member,
+                label: dev.label,
+                os: dev.os,
+                machine_id: dev.machine_id,
+                cert: dev.cert,
+                outgoing: dev.outgoing,
                 session: session.clone(),
                 local: vec![],
                 ipv6: vec![],
@@ -595,12 +599,30 @@ impl Group {
         let Ok(profiles) = store::list_profiles(&self.db, member) else {
             return;
         };
-        let Ok(json) = serde_json::to_string(&Event::Sync { prefs, profiles }) else {
-            return;
-        };
-        let frame = Utf8Bytes::from(json);
         for d in self.online.values().filter(|d| d.member == member) {
-            let _ = d.outgoing.try_send(frame.clone());
+            let scoped = Self::scope_profiles(&profiles, d.machine_id.as_deref());
+            if let Ok(json) = serde_json::to_string(&Event::Sync {
+                prefs: prefs.clone(),
+                profiles: scoped,
+            }) {
+                let _ = d.outgoing.try_send(Utf8Bytes::from(json));
+            }
         }
+    }
+
+    pub fn scope_profiles(
+        profiles: &[fesen_proto::DeviceProfile],
+        machine_id: Option<&str>,
+    ) -> Vec<fesen_proto::DeviceProfile> {
+        profiles
+            .iter()
+            .cloned()
+            .map(|mut p| {
+                if machine_id != Some(p.machine_id.as_str()) {
+                    p.forwards.clear();
+                }
+                p
+            })
+            .collect()
     }
 }

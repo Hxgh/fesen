@@ -675,6 +675,16 @@ async fn device_identity_os_reinstall_restore_and_cloud_sync() {
             .any(|p| p.machine_id == mac.status().machine_id && p.shares.len() == 1 && p.forwards.len() == 1)
     })
     .await;
+    // Other devices on the same account must never receive this device's private 127.0.0.1 forwards.
+    assert!(
+        phone
+            .status()
+            .cloud_profiles
+            .iter()
+            .filter(|p| p.machine_id == mac.status().machine_id)
+            .all(|p| p.forwards.is_empty()),
+        "other devices must not see local 127.0.0.1 forwards"
+    );
 
     mac.stop();
     mac.wait_stopped().await;

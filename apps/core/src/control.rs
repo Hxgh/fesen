@@ -268,12 +268,14 @@ impl Session {
     }
 }
 
-async fn send(ws: &mut Wire, value: &impl serde::Serialize) -> Result<(), Code> {
+async fn send(ws: &mut Wire, value: &impl serde::Serialize) -> Result<u64, Code> {
     let text = serde_json::to_string(value).map_err(|_| Code::Internal)?;
+    let bytes = text.len() as u64;
     timeout(Duration::from_secs(3), ws.send(Message::Text(text.into())))
         .await
         .map_err(|_| Code::NotConnected)?
-        .map_err(|_| Code::NotConnected)
+        .map_err(|_| Code::NotConnected)?;
+    Ok(bytes)
 }
 
 fn candidates(host: &[SocketAddrV4], observed: &[SocketAddrV4], ipv6: &[SocketAddrV6]) -> Call {
@@ -336,7 +338,8 @@ impl Worker {
             link.direct.probe(probe, *server);
         }
         let result = async {
-            send(&mut self.ws, &Request { seq: 0, call: candidates(&host, &[], local_ipv6) }).await?;
+            let n = send(&mut self.ws, &Request { seq: 0, call: candidates(&host, &[], local_ipv6) }).await?;
+            core.traffic.add_control_tx(n);
             loop {
                 tokio::select! {
                     biased;
@@ -345,7 +348,9 @@ impl Worker {
                     data = self.ws.next() => {
                         let Some(Ok(message)) = data else { return Err(Code::NotConnected) };
                         match message {
-                            Message::Text(text) => match serde_json::from_str::<Event>(&text).map_err(|_| Code::Invalid)? {
+                            Message::Text(text) => {
+                                core.traffic.add_control_rx(text.len() as u64);
+                                match serde_json::from_str::<Event>(&text).map_err(|_| Code::Invalid)? {
                                 Event::View { view } => {
                                     expiry = Instant::now() + LEASE;
                                     core.update_view(&link, view);
@@ -374,7 +379,8 @@ impl Worker {
                                 Event::Revoked | Event::Rejected { error: Code::DeviceRevoked } => return Err(Code::DeviceRevoked),
                                 Event::Rejected { error: Code::Unauthorized } => return Err(Code::Unauthorized),
                                 _ => return Err(Code::Invalid),
-                            },
+                                }
+                            }
                             Message::Ping(_) | Message::Pong(_) => {},
                             _ => return Err(Code::NotConnected),
                         }
@@ -382,7 +388,8 @@ impl Worker {
                     Some(result) = observations.recv() => {
                         if mapped != result {
                             mapped = result;
-                            send(&mut self.ws, &Request { seq: 0, call: candidates(&host, &mapped, local_ipv6) }).await?;
+                            let n = send(&mut self.ws, &Request { seq: 0, call: candidates(&host, &mapped, local_ipv6) }).await?;
+                            core.traffic.add_control_tx(n);
                         }
                     }
                     _ = registered.tick() => {
@@ -391,13 +398,15 @@ impl Worker {
                         }
                         if last_ping.elapsed() >= HEARTBEAT {
                             last_ping = Instant::now();
-                            send(&mut self.ws, &Request { seq: 0, call: Call::Ping }).await?;
+                            let n = send(&mut self.ws, &Request { seq: 0, call: Call::Ping }).await?;
+                            core.traffic.add_control_tx(n);
                         }
                         pending.retain(|_, (sent, _)| sent.elapsed() < Duration::from_secs(7));
                     }
                     Some((call, ret)) = self.calls.recv() => {
                         if ret.is_closed() { continue; }
-                        send(&mut self.ws, &Request { seq, call }).await?;
+                        let n = send(&mut self.ws, &Request { seq, call }).await?;
+                        core.traffic.add_control_tx(n);
                         pending.insert(seq, (Instant::now(), ret));
                         seq = seq.wrapping_add(1).max(1);
                     }

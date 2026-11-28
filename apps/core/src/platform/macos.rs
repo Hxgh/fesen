@@ -122,6 +122,14 @@ fn roundup_sa(sa_len: usize) -> usize {
     }
 }
 
+fn is_virtual_tunnel(name: &str) -> bool {
+    name.starts_with("utun")
+        || name.starts_with("ipsec")
+        || name.starts_with("ppp")
+        || name.starts_with("gif")
+        || name.starts_with("stf")
+}
+
 fn sysctl_ipv4_routes(
     own_if: Option<u32>,
     if_names: &HashMap<u32, String>,
@@ -253,23 +261,28 @@ fn sysctl_ipv4_routes(
         let Ok(cidr) = Cidr::new(dst_ip, prefix) else {
             continue;
         };
-        if cidr.prefix == 0 {
-            let if_name = if_names.get(&index).cloned().unwrap_or_else(|| {
-                let mut name_buf = [0 as c_char; libc::IFNAMSIZ];
-                let ptr = unsafe { libc::if_indextoname(index, name_buf.as_mut_ptr()) };
-                if ptr.is_null() {
-                    String::new()
-                } else {
-                    unsafe { CStr::from_ptr(ptr) }
-                        .to_string_lossy()
-                        .into_owned()
-                }
-            });
-            if !if_name.is_empty() && !if_name.starts_with("utun")
-                && let Some(gw) = gateway
-            {
-                identity.push(format!("{if_name}:{gw}"));
+        if cidr.prefix > 0 && cidr.prefix < 8 {
+            continue;
+        }
+        let if_name = if_names.get(&index).cloned().unwrap_or_else(|| {
+            let mut name_buf = [0 as c_char; libc::IFNAMSIZ];
+            let ptr = unsafe { libc::if_indextoname(index, name_buf.as_mut_ptr()) };
+            if ptr.is_null() {
+                String::new()
+            } else {
+                unsafe { CStr::from_ptr(ptr) }
+                    .to_string_lossy()
+                    .into_owned()
             }
+        });
+        if is_virtual_tunnel(&if_name) {
+            continue;
+        }
+        if cidr.prefix == 0
+            && !if_name.is_empty()
+            && let Some(gw) = gateway
+        {
+            identity.push(format!("{if_name}:{gw}"));
         }
         routes.push(Underlay {
             cidr,
@@ -404,6 +417,20 @@ impl Platform for Apple {
         found.into_iter().take(24).collect()
     }
 
+    fn tcp_client_process(&self, src_port: u16) -> Option<String> {
+        if self.tunnel.is_some() {
+            return None;
+        }
+        let query = format!("4TCP@127.0.0.1:{src_port}");
+        let out = command("/usr/sbin/lsof", &["-nP", "-F", "c", "-i", &query]).ok()?;
+        let name = out
+            .lines()
+            .filter_map(|l| l.strip_prefix('c'))
+            .map(str::trim)
+            .find(|n| !n.is_empty() && *n != "fesen" && *n != "fesen-core")?;
+        Some(name.chars().take(28).collect())
+    }
+
     fn network(&self) -> io::Result<Network> {
         let _lock = self.snapshot.lock().unwrap();
         let own_ip = *self.our_ip.lock().unwrap();
@@ -425,7 +452,10 @@ impl Platform for Apple {
         identity.sort_unstable();
         let mut addresses: Vec<_> = ifaces
             .into_iter()
-            .filter_map(|(_, ip, _)| {
+            .filter_map(|(name, ip, _)| {
+                if is_virtual_tunnel(&name) {
+                    return None;
+                }
                 if let IpAddr::V4(ip) = ip {
                     Some(ip)
                 } else {

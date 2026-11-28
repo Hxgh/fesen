@@ -1,7 +1,5 @@
-use super::{
-    Core,
-    types::{COPY_BUF, Flow, ForwardHandle, ForwardKey},
-};
+use super::{Core, types::COPY_BUF, types::ForwardHandle, types::ForwardKey};
+use crate::traffic::{FlowKind, FlowSpec};
 use fesen_proto::{Code, LocalForwardStatus, Open};
 use std::{
     collections::{HashMap, HashSet},
@@ -152,8 +150,14 @@ impl Core {
                         let target = SocketAddrV4::new(m.target_ip, m.target_port);
                         let own = owner.clone();
                         let tok = cancel.clone();
+                        let spec = ForwardSpec {
+                            owner: own,
+                            service: svc,
+                            target,
+                            local_port,
+                        };
                         tokio::spawn(async move {
-                            core.accept_forward_loop(listener, own, svc, target, tok, closed_tx)
+                            core.accept_forward_loop(listener, spec, tok, closed_tx)
                                 .await;
                         });
                         listeners.insert(
@@ -221,9 +225,7 @@ impl Core {
     async fn accept_forward_loop(
         self: Arc<Self>,
         listener: TcpListener,
-        owner: String,
-        service: String,
-        target: SocketAddrV4,
+        spec: ForwardSpec,
         cancel: CancellationToken,
         closed_tx: tokio::sync::oneshot::Sender<()>,
     ) {
@@ -233,32 +235,57 @@ impl Core {
                 _ = cancel.cancelled() => break,
                 res = listener.accept() => res,
             };
-            let Ok((mut client, _)) = conn else { break };
+            let Ok((mut client, client_addr)) = conn else { break };
             let Ok(permit) = slots.clone().try_acquire_owned() else {
                 continue;
             };
             let _ = client.set_nodelay(true);
             let core = self.clone();
-            let owner = owner.clone();
-            let service = service.clone();
+            let owner = spec.owner.clone();
+            let service = spec.service.clone();
+            let target = spec.target;
+            let local_port = spec.local_port;
+            let src_port = client_addr.port();
             let cancel = cancel.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let _flow = Flow::new(&core.flows);
-                tokio::select! {
+                let flow_cancel = cancel.child_token();
+                let mut flow = core.traffic.register(FlowSpec {
+                    kind: FlowKind::OutboundForward,
+                    service: service.clone(),
+                    peer_id: owner.clone(),
+                    src_port: Some(src_port),
+                    target,
+                    local_port: Some(local_port),
+                    cancel: flow_cancel.clone(),
+                });
+                let res = tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => {},
-                    _ = core.with_peer(&owner, Open { service, target }, async |tx, rx, _| {
-                        let mut remote = tokio::io::join(rx, tx);
+                    _ = flow_cancel.cancelled() => {
+                        flow.close_stopped(|id| core.peer_label(id));
+                        Ok(())
+                    }
+                    res = core.with_peer(&owner, Open { service, target }, async |tx, rx, _| {
+                        let mut remote = flow.wrap(tokio::io::join(rx, tx));
                         let _ = copy_bidirectional_with_sizes(&mut client, &mut remote, COPY_BUF, COPY_BUF).await;
                         Ok(())
-                    }) => {},
+                    }) => res,
+                };
+                if let Err(code) = res {
+                    flow.close_error(&format!("{code:?}"), |id| core.peer_label(id));
                 }
             });
         }
         drop(listener);
         let _ = closed_tx.send(());
     }
+}
+
+struct ForwardSpec {
+    owner: String,
+    service: String,
+    target: SocketAddrV4,
+    local_port: u16,
 }
 
 pub(super) fn suggest_free_port(preferred: Option<u16>, used: &HashSet<u16>) -> Option<u16> {

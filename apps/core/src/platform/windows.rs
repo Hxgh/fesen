@@ -26,7 +26,10 @@ use std::{
 };
 use tokio::{runtime::Handle, sync::mpsc};
 use windows_sys::Win32::{
-    Foundation::{ERROR_CANCELLED, GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM},
+    Foundation::{
+        CloseHandle, ERROR_CANCELLED, ERROR_INSUFFICIENT_BUFFER, ERROR_OBJECT_ALREADY_EXISTS,
+        GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM,
+    },
     Globalization::GetUserDefaultUILanguage,
     Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS,
@@ -49,7 +52,10 @@ use windows_sys::Win32::{
             ComputerNameDnsHostname, GetComputerNameExW, GetSystemDirectoryW,
             GetWindowsDirectoryW,
         },
-        Threading::GetCurrentThreadId,
+        Threading::{
+            GetCurrentThreadId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            QueryFullProcessImageNameW,
+        },
     },
     UI::{
         Shell::{
@@ -65,6 +71,7 @@ const NRPT: &str = "fesen .fesen resolver";
 const NO_WINDOW: u32 = 0x0800_0000;
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const TRAY_STATE_MESSAGE: u32 = WM_APP + 2;
+const ADAPTER_GUID: u128 = 0x7a9b_c210_4e35_4d1a_9f82_0f3e_5e1a_0001;
 const WINTUN_SHA256: [u8; 32] = [
     0xe5, 0xda, 0x84, 0x47, 0xdc, 0x2c, 0x32, 0x0e, 0xdc, 0x0f, 0xc5, 0x2f, 0xa0, 0x18, 0x85,
     0xc1, 0x03, 0xde, 0x8c, 0x11, 0x84, 0x81, 0xf6, 0x83, 0x64, 0x3c, 0xac, 0xc3, 0x22, 0x0d,
@@ -77,7 +84,7 @@ pub fn data_dir() -> io::Result<PathBuf> {
 
 fn known_folder(id: &windows_sys::core::GUID) -> io::Result<PathBuf> {
     let mut raw = std::ptr::null_mut::<u16>();
-    let result = unsafe {
+    unsafe {
         let result = SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut raw);
         let path = if result >= 0 && !raw.is_null() {
             let len = (0..).find(|i| *raw.add(*i) == 0).unwrap();
@@ -89,8 +96,7 @@ fn known_folder(id: &windows_sys::core::GUID) -> io::Result<PathBuf> {
         };
         CoTaskMemFree(raw.cast());
         path
-    };
-    result
+    }
 }
 
 pub fn pin_profile(dir: &Path) -> io::Result<Vec<fs::File>> {
@@ -307,49 +313,106 @@ impl Windows {
         }
     }
 
+    fn set_interface_mtu(index: u32, mtu: u32) -> io::Result<()> {
+        let mut row = MIB_IPINTERFACE_ROW::default();
+        for attempt in 0..5 {
+            unsafe {
+                InitializeIpInterfaceEntry(&mut row);
+                row.Family = AF_INET;
+                row.InterfaceIndex = index;
+                match GetIpInterfaceEntry(&mut row) {
+                    0 => {
+                        row.SitePrefixLength = 0;
+                        row.NlMtu = mtu;
+                        return check(SetIpInterfaceEntry(&mut row));
+                    }
+                    err if attempt < 4 => {
+                        let _ = err;
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    err => return check(err),
+                }
+            }
+        }
+        unreachable!()
+    }
+
     fn adapter(&self, ip: Ipv4Addr) -> io::Result<Adapter> {
         verify_wintun(&self.dll)?;
         let network = unsafe { wintun::load_from_path(&self.dll) }.map_err(io::Error::other)?;
-        let adapter = wintun::Adapter::create(&network, "Fesen", "Fesen", None)
-            .map_err(io::Error::other)?;
-        let index = adapter.get_adapter_index().map_err(io::Error::other)?;
-        adapter.set_mtu(super::MTU).map_err(io::Error::other)?;
-        let mut row = MIB_UNICASTIPADDRESS_ROW::default();
-        unsafe {
-            InitializeUnicastIpAddressEntry(&mut row);
-        }
-        row.InterfaceIndex = index;
-        row.Address = address(ip);
-        row.OnLinkPrefixLength = 32;
-        check(unsafe { CreateUnicastIpAddressEntry(&row) })?;
-        let session = Arc::new(
-            adapter
-                .start_session(4 * 1024 * 1024)
-                .map_err(io::Error::other)?,
-        );
-        let source = session.clone();
-        let input = self
-            .input
-            .get()
-            .cloned()
-            .ok_or_else(|| io::Error::other("packet input closed"))?;
-        let reader = std::thread::Builder::new()
-            .name("fesen-wintun".into())
-            .spawn(move || {
-                while let Ok(packet) = source.receive_blocking() {
-                    let _ = input.try_send(packet.bytes().to_vec());
+        let mut last_err = None;
+        let mut created_adapter = None;
+        for attempt in 0..8 {
+            match wintun::Adapter::create(&network, "Fesen", "Fesen", Some(ADAPTER_GUID)) {
+                Ok(adapter) => {
+                    created_adapter = Some(adapter);
+                    break;
                 }
-            })?;
-        Ok(Adapter {
-            session,
-            reader: Some(reader),
-            index,
-            config: Tun {
-                address: Some(ip),
-                ..Tun::default()
-            },
-            nrpt_lock: self.nrpt_lock.clone(),
-        })
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt < 7 {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+        }
+        let adapter = created_adapter.ok_or_else(|| {
+            io::Error::other(
+                last_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "failed to create adapter".into()),
+            )
+        })?;
+        let index = adapter.get_adapter_index().map_err(io::Error::other)?;
+        self.own_index.store(index, Ordering::Release);
+        let setup = (|| -> io::Result<Adapter> {
+            let adapter = adapter;
+            let input = self
+                .input
+                .get()
+                .cloned()
+                .ok_or_else(|| io::Error::other("packet input closed"))?;
+            let mut row = MIB_UNICASTIPADDRESS_ROW::default();
+            unsafe {
+                InitializeUnicastIpAddressEntry(&mut row);
+            }
+            row.InterfaceIndex = index;
+            row.Address = address(ip);
+            row.OnLinkPrefixLength = 32;
+            let ip_rc = unsafe { CreateUnicastIpAddressEntry(&row) };
+            if ip_rc != 0 && ip_rc != ERROR_OBJECT_ALREADY_EXISTS {
+                check(ip_rc)?;
+            }
+            Self::set_interface_mtu(index, super::MTU as u32)?;
+            let session = Arc::new(
+                adapter
+                    .start_session(4 * 1024 * 1024)
+                    .map_err(io::Error::other)?,
+            );
+            drop(adapter);
+            let source = session.clone();
+            let reader = std::thread::Builder::new()
+                .name("fesen-wintun".into())
+                .spawn(move || {
+                    while let Ok(packet) = source.receive_blocking() {
+                        let _ = input.try_send(packet.bytes().to_vec());
+                    }
+                })?;
+            Ok(Adapter {
+                session,
+                reader: Some(reader),
+                index,
+                config: Tun {
+                    address: Some(ip),
+                    ..Tun::default()
+                },
+                nrpt_lock: self.nrpt_lock.clone(),
+            })
+        })();
+        if setup.is_err() {
+            self.own_index.store(0, Ordering::Release);
+        }
+        setup
     }
 }
 
@@ -447,6 +510,70 @@ impl Platform for Windows {
         found.into_iter().take(24).map(|p| (p, None)).collect()
     }
 
+    fn tcp_client_process(&self, src_port: u16) -> Option<String> {
+        let mut size: u32 = 0;
+        let rc = unsafe {
+            GetExtendedTcpTable(
+                std::ptr::null_mut(),
+                &mut size,
+                0,
+                AF_INET as u32,
+                TCP_TABLE_OWNER_PID_CONNECTIONS,
+                0,
+            )
+        };
+        if rc != ERROR_INSUFFICIENT_BUFFER
+            || (size as usize) < std::mem::size_of::<MIB_TCPTABLE_OWNER_PID>()
+        {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        let rc = unsafe {
+            GetExtendedTcpTable(
+                buf.as_mut_ptr().cast(),
+                &mut size,
+                0,
+                AF_INET as u32,
+                TCP_TABLE_OWNER_PID_CONNECTIONS,
+                0,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        let table = unsafe { &*buf.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>() };
+        let count = table.dwNumEntries as usize;
+        let max_rows = buf
+            .len()
+            .saturating_sub(std::mem::offset_of!(MIB_TCPTABLE_OWNER_PID, table))
+            / std::mem::size_of::<MIB_TCPROW_OWNER_PID>();
+        let rows =
+            unsafe { std::slice::from_raw_parts(table.table.as_ptr(), count.min(max_rows)) };
+        let self_pid = std::process::id();
+        let pid = rows.iter().find_map(|row| {
+            let port = u16::from_be(row.dwLocalPort as u16);
+            (port == src_port && row.dwOwningPid > 4 && row.dwOwningPid != self_pid)
+                .then_some(row.dwOwningPid)
+        })?;
+        let proc_handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if proc_handle.is_null() {
+            return None;
+        }
+        let mut path_buf = [0u16; 512];
+        let mut len = path_buf.len() as u32;
+        let ok = unsafe {
+            QueryFullProcessImageNameW(proc_handle, 0, path_buf.as_mut_ptr(), &mut len)
+        };
+        unsafe { CloseHandle(proc_handle) };
+        if ok == 0 || len == 0 {
+            return None;
+        }
+        let full = OsString::from_wide(&path_buf[..len as usize]);
+        let stem = Path::new(&full).file_stem()?.to_string_lossy();
+        let trimmed = stem.trim();
+        (!trimmed.is_empty()).then(|| trimmed.chars().take(28).collect())
+    }
+
     fn network(&self) -> io::Result<Network> {
         let own = match self.own_index.load(Ordering::Acquire) {
             0 => None,
@@ -465,7 +592,10 @@ impl Platform for Windows {
                 (*if_table).Table.as_ptr(),
                 (*if_table).NumEntries as usize,
             ) {
-                if Some(row.InterfaceIndex) == own || row.OperStatus != IfOperStatusUp {
+                if Some(row.InterfaceIndex) == own
+                    || row.OperStatus != IfOperStatusUp
+                    || matches!(row.Type, IF_TYPE_PROP_VIRTUAL | IF_TYPE_TUNNEL)
+                {
                     continue;
                 }
                 if row.Type == IF_TYPE_SOFTWARE_LOOPBACK {
@@ -507,6 +637,7 @@ impl Platform for Windows {
                 if cidr.ip.is_multicast()
                     || cidr.ip == Ipv4Addr::BROADCAST
                     || (cidr.ip.is_link_local() && cidr.prefix >= 16)
+                    || (cidr.prefix > 0 && cidr.prefix < 8)
                 {
                     continue;
                 }
@@ -548,13 +679,15 @@ impl Platform for Windows {
                     (*table).NumEntries as usize,
                 ) {
                     let ip = ipv4(row.Address);
+                    let mac_len = row.PhysicalAddressLength as usize;
                     if gateways.contains(&(row.InterfaceIndex, ip))
-                        && (1..=32).contains(&row.PhysicalAddressLength)
+                        && (1..=32).contains(&mac_len)
+                        && row.PhysicalAddress[..mac_len].iter().any(|&b| b != 0)
                     {
                         macs.push((
                             row.InterfaceIndex,
                             ip,
-                            hex::encode(&row.PhysicalAddress[..row.PhysicalAddressLength as usize]),
+                            hex::encode(&row.PhysicalAddress[..mac_len]),
                         ));
                     }
                 }
@@ -655,13 +788,12 @@ impl Platform for Windows {
             .as_ref()
             .is_some_and(|a| a.config.address != tun.address)
         {
+            drop(active.take());
             self.own_index.store(0, Ordering::Release);
-            active.take();
         }
         let Some(ip) = tun.address else { return Ok(()) };
         if active.is_none() {
             let created = self.adapter(ip)?;
-            self.own_index.store(created.index, Ordering::Release);
             *active = Some(created);
         }
         let adapter = active.as_mut().unwrap();
@@ -678,7 +810,10 @@ impl Platform for Windows {
             let mut installed: HashSet<Cidr> = adapter.config.routes.iter().copied().collect();
             for route in &tun.routes {
                 if installed.insert(*route) {
-                    check(unsafe { CreateIpForwardEntry2(&route_row(adapter.index, *route)) })?;
+                    let rc = unsafe { CreateIpForwardEntry2(&route_row(adapter.index, *route)) };
+                    if rc != 0 && rc != ERROR_OBJECT_ALREADY_EXISTS {
+                        check(rc)?;
+                    }
                     adapter.config.routes.push(*route);
                 }
             }
@@ -691,8 +826,8 @@ impl Platform for Windows {
             Ok(())
         })();
         if result.is_err() {
+            drop(active.take());
             self.own_index.store(0, Ordering::Release);
-            active.take();
         }
         result
     }
@@ -736,7 +871,7 @@ fn strip_verbatim_drive_units(units: &[u16]) -> Option<&[u16]> {
     Some(units)
 }
 
-fn shell_path(path: &Path) -> io::Result<PathBuf> {
+pub fn shell_path(path: &Path) -> io::Result<PathBuf> {
     let canonical = path.canonicalize()?;
     let units: Vec<u16> = canonical.as_os_str().encode_wide().collect();
     let trimmed = strip_verbatim_drive_units(&units)
@@ -758,6 +893,36 @@ pub fn elevate(path: &Path) -> Result<(), ElevateError> {
             std::ptr::null(),
             dir.as_ref().map_or(std::ptr::null(), |d| d.as_ptr()),
             SW_HIDE,
+        )
+    } as isize;
+    if code > 32 {
+        Ok(())
+    } else if code == SE_ERR_ACCESSDENIED as isize
+        || unsafe { GetLastError() } == ERROR_CANCELLED
+    {
+        Err(ElevateError::Denied)
+    } else {
+        Err(ElevateError::Failed)
+    }
+}
+
+pub fn launch_installer(installer: &Path, args: &str) -> Result<(), ElevateError> {
+    if !check_regular_binary(installer) {
+        return Err(ElevateError::Missing);
+    }
+    let launch = shell_path(installer).map_err(|_| ElevateError::Location)?;
+    let dir = launch.parent().map(wide);
+    let verb = wide("open");
+    let file = wide(&launch);
+    let params = wide(args);
+    let code = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            params.as_ptr(),
+            dir.as_ref().map_or(std::ptr::null(), |d| d.as_ptr()),
+            SW_SHOWNORMAL,
         )
     } as isize;
     if code > 32 {
@@ -881,6 +1046,44 @@ unsafe fn gen_tray_icon(visual: u8, light: bool) -> (HICON, bool) {
     }
 }
 
+unsafe extern "system" fn close_gui_window(hwnd: HWND, lparam: LPARAM) -> i32 {
+    let target = unsafe { &*(lparam as *const PathBuf) };
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    if pid == 0 {
+        return 1;
+    }
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return 1;
+    }
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(process, 0, buf.as_mut_ptr(), &mut len) };
+    unsafe { CloseHandle(process) };
+    if ok != 0 && len > 0 {
+        let exe = PathBuf::from(OsString::from_wide(&buf[..len as usize]));
+        let matched = shell_path(&exe)
+            .unwrap_or(exe)
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&target.to_string_lossy());
+        if matched {
+            unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
+        }
+    }
+    1
+}
+
+fn close_gui(gui: &Path) {
+    let target = shell_path(gui).unwrap_or_else(|_| gui.to_path_buf());
+    unsafe {
+        EnumWindows(
+            Some(close_gui_window),
+            std::ptr::from_ref::<PathBuf>(&target) as LPARAM,
+        );
+    }
+}
+
 fn core_visual_state(core: &Core) -> u8 {
     core.visual_state()
 }
@@ -999,7 +1202,10 @@ unsafe extern "system" fn tray_window(window: HWND, message: u32, w: WPARAM, l: 
                                     open();
                                 }
                             }
-                            3 => state.core.stop(),
+                            3 => {
+                                state.core.stop();
+                                close_gui(&state.gui);
+                            }
                             _ => {}
                         }
                         DestroyMenu(menu);
