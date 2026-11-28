@@ -3,8 +3,10 @@ import type { Label, LocalForwardStatus, Offering, Probe, Status, ViewMode } fro
 
 export const mac = /Macintosh/.test(navigator.userAgent);
 export const desktop = !/Android/i.test(navigator.userAgent);
+export const win = desktop && /Windows/i.test(navigator.userAgent);
 if (desktop) document.documentElement.classList.add("os-desktop");
 if (mac) document.documentElement.classList.add("os-macos");
+if (win) document.documentElement.classList.add("os-windows");
 
 const VIEW_MODE_KEY = "fesen_view_mode";
 const COLLAPSE_STORE_KEY = "fesen_collapsed";

@@ -106,6 +106,9 @@
   --warn-bg: #fdf5e6;
   --bad: var(--fesen-vermilion-light);
   --bad-bg: #fdf0f0;
+  --caption-close-bg: #c42b1c;
+  --caption-close-active: #b3261a;
+  --caption-close-ink: var(--fesen-white);
 }
 
 :root[data-scale="sm"] {

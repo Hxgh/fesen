@@ -7,8 +7,17 @@ import { createScale, createTheme } from "../../../../packages/ui/theme.js";
 import { mac, persistViewMode, state, toggleCollapsedKey } from "../model/state";
 import type { BrandState, Reply, Request, Status, ViewMode } from "../model/types";
 import { button, dialogHeader, el, notify } from "../ui/dom";
+import { syncWindowControlsI18n, syncWindowsTheme } from "../ui/window";
 
-export const theme = createTheme("fesen_theme");
+const rawTheme = createTheme("fesen_theme");
+export const theme = {
+  get: rawTheme.get,
+  apply: rawTheme.apply,
+  set(next: string) {
+    rawTheme.set(next);
+    syncWindowsTheme(next);
+  },
+};
 export const scale = createScale("fesen_scale");
 
 export const content = document.querySelector<HTMLDivElement>("#content")!;
@@ -96,6 +105,7 @@ export function syncBrand(instant = false) {
     lastBrandName = name;
     brandNameEl.textContent = name;
   }
+  syncWindowControlsI18n();
   const bState = computeBrandState();
   topMark.setState(bState, instant);
   const hostText = state.status?.member ? serverHost(state.status.server) : "";

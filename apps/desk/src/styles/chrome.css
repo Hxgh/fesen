@@ -3,6 +3,12 @@
 @media (min-width: 1600px) { :root { --wrap: 1480px; } }
 @media (min-width: 1920px) { :root { --wrap: 1680px; } }
 @media (min-width: 2200px) { :root { --wrap: 2080px; } }
+.os-desktop .topbar {
+  user-select: none;
+  -webkit-user-select: none;
+}
+.os-desktop .identity { gap: 9px; }
+.os-desktop .brand-mark { pointer-events: none; }
 .os-macos .topbar::before {
   content: "";
   position: absolute;
@@ -24,17 +30,102 @@
   justify-content: space-between;
   gap: 12px;
 }
-.os-macos .identity { gap: 9px; }
-.os-desktop:not(.os-macos) #brand-name { display: none; }
-.os-macos .brand-mark { pointer-events: none; }
+.os-windows .topbar {
+  --win-btn-w: 46px;
+  --win-ctrl-gap: 14px;
+  --win-ctrl-clear: calc(var(--win-btn-w) * 3 + var(--win-ctrl-gap));
+}
+.os-windows .topbar-inner {
+  width: 100%;
+  max-width: none;
+  min-height: 52px;
+  padding-inline: 24px var(--win-ctrl-clear);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.win-controls {
+  position: absolute;
+  top: 0;
+  right: 0;
+  height: 100%;
+  display: flex;
+  align-items: stretch;
+  z-index: 2;
+}
+.win-controls::before {
+  content: "";
+  position: absolute;
+  left: calc(var(--win-ctrl-gap) * -0.5);
+  top: 50%;
+  transform: translateY(-50%);
+  width: 1px;
+  height: 16px;
+  background: var(--line-strong);
+  pointer-events: none;
+}
+.win-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--win-btn-w);
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: default;
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+.win-btn svg {
+  width: 10px;
+  height: 10px;
+  display: block;
+  flex: none;
+}
+.win-btn:hover {
+  background: color-mix(in srgb, var(--ink) 7%, transparent);
+  color: var(--ink);
+}
+.win-btn:active {
+  background: color-mix(in srgb, var(--ink) 12%, transparent);
+  color: var(--ink);
+}
+.win-btn.win-close:hover {
+  background: var(--caption-close-bg);
+  color: var(--caption-close-ink);
+}
+.win-btn.win-close:active {
+  background: var(--caption-close-active);
+  color: var(--caption-close-ink);
+}
+.win-btn:focus-visible { outline-offset: -2px; }
+.is-unfocused .win-btn { color: var(--faint); }
+.is-unfocused .win-btn:hover { color: var(--ink); }
+.is-unfocused .win-btn.win-close:hover { color: var(--caption-close-ink); }
 @media (max-width: 640px) {
   .os-macos .topbar-inner { padding-inline: 100px 12px; }
+  .os-windows .topbar-inner { padding-inline: 12px var(--win-ctrl-clear); }
+}
+@media (max-width: 410px) {
+  .os-windows .topbar {
+    --win-btn-w: 36px;
+    --win-ctrl-gap: 10px;
+  }
+  .os-windows .topbar .toolbar { gap: 4px; }
+  .os-windows .topbar .icon-btn.lg { --btn-sz: var(--btn-md); --ico-sz: var(--ico-md); }
 }
 @media (min-width: 1008px) {
   .os-macos .topbar-inner {
     width: min(calc(100% - 48px), var(--wrap));
     max-width: var(--wrap);
     padding-inline: max(0px, calc(100px - (100vw - var(--wrap)) / 2)) 0;
+  }
+  .os-windows .topbar-inner {
+    width: min(calc(100% - 48px), var(--wrap));
+    max-width: var(--wrap);
+    padding-inline: 0 max(0px, calc(var(--win-ctrl-clear) - (100vw - var(--wrap)) / 2));
   }
 }
 body {

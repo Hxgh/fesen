@@ -1,16 +1,110 @@
 import { invoke } from "@tauri-apps/api/core";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { desktop, mac } from "../model/state";
+import { t } from "../i18n";
+import { desktop, mac, win } from "../model/state";
 import type { CloseBehavior } from "../model/types";
 
 export const DEFAULT_WIN = { w: 430, h: 740 };
 const WIN_SIZE_KEY = "fesen_window_size";
+const SVG_NS = "http://www.w3.org/2000/svg";
+const MAX_PATH = "M1.5 1.5h7v7h-7z";
+const RESTORE_PATH = "M3 3V1.5h5.5V7H7M1.5 3H7v5.5H1.5z";
 
 let winSize = { ...DEFAULT_WIN };
 let hasCustomWinSize = false;
 let applyingWinSize = false;
 let resizeSaveTimer: number | undefined;
+let winControlsRefreshI18n: (() => void) | null = null;
+
+function captionSvg(pathData: string, crisp = true): { svg: SVGSVGElement; path: SVGPathElement } {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", "0 0 10 10");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "1");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS(SVG_NS, "path");
+  path.setAttribute("d", pathData);
+  if (crisp) path.setAttribute("shape-rendering", "crispEdges");
+  svg.append(path);
+  return { svg, path };
+}
+
+export function syncWindowsTheme(mode: string) {
+  if (!win) return;
+  const next = mode === "light" || mode === "dark" ? mode : null;
+  void getCurrentWindow().setTheme(next).catch(() => {});
+}
+
+export function syncWindowControlsI18n() {
+  winControlsRefreshI18n?.();
+}
+
+export function initWindowsChrome(initialTheme: string) {
+  if (!win) return;
+  const topbar = document.querySelector<HTMLElement>(".topbar");
+  if (!topbar || topbar.querySelector(".win-controls")) return;
+
+  const appWin = getCurrentWindow();
+  let maximized = false;
+
+  const minBtn = document.createElement("button");
+  minBtn.type = "button";
+  minBtn.className = "win-btn win-min";
+  minBtn.append(captionSvg("M1 5h8").svg);
+  minBtn.addEventListener("click", () => { void appWin.minimize().catch(() => {}); });
+
+  const maxBtn = document.createElement("button");
+  maxBtn.type = "button";
+  maxBtn.className = "win-btn win-max";
+  const maxIcon = captionSvg(MAX_PATH);
+  maxBtn.append(maxIcon.svg);
+  maxBtn.addEventListener("click", () => { void appWin.toggleMaximize().catch(() => {}); });
+
+  const closeBtn = document.createElement("button");
+  closeBtn.type = "button";
+  closeBtn.className = "win-btn win-close";
+  closeBtn.append(captionSvg("M1.5 1.5l7 7M8.5 1.5l-7 7", false).svg);
+  closeBtn.addEventListener("click", () => { void appWin.close().catch(() => {}); });
+
+  winControlsRefreshI18n = () => {
+    const minTip = t("win_minimize");
+    minBtn.title = minTip;
+    minBtn.setAttribute("aria-label", minTip);
+    const maxTip = t(maximized ? "win_restore" : "win_maximize");
+    maxBtn.title = maxTip;
+    maxBtn.setAttribute("aria-label", maxTip);
+    const closeTip = t("close");
+    closeBtn.title = closeTip;
+    closeBtn.setAttribute("aria-label", closeTip);
+  };
+  winControlsRefreshI18n();
+
+  const controls = document.createElement("div");
+  controls.className = "win-controls";
+  controls.append(minBtn, maxBtn, closeBtn);
+  topbar.append(controls);
+
+  const refreshMaximized = async () => {
+    try {
+      const next = await appWin.isMaximized();
+      if (next === maximized) return;
+      maximized = next;
+      maxIcon.path.setAttribute("d", maximized ? RESTORE_PATH : MAX_PATH);
+      winControlsRefreshI18n?.();
+    } catch {}
+  };
+
+  document.documentElement.classList.toggle("is-unfocused", !document.hasFocus());
+  void appWin.onFocusChanged(({ payload }) => {
+    document.documentElement.classList.toggle("is-unfocused", !payload);
+  }).catch(() => {});
+
+  void refreshMaximized();
+  void appWin.onResized(() => { void refreshMaximized(); }).catch(() => {});
+  syncWindowsTheme(initialTheme);
+}
 
 export function currentWinSize() {
   return winSize;
@@ -47,31 +141,32 @@ export function refreshWindowSizeRow(settingsDialog: HTMLDialogElement) {
 
 export async function initDesktopWindowSize(settingsDialog: HTMLDialogElement) {
   if (!desktop) return;
-  const win = getCurrentWindow();
+  const appWin = getCurrentWindow();
   const saved = readSavedWinSize();
   if (saved) {
     winSize = saved;
     hasCustomWinSize = !isDefaultWinSize(saved);
     if (hasCustomWinSize) {
       applyingWinSize = true;
-      try { await win.setSize(new LogicalSize(saved.w, saved.h)); } catch {}
+      try { await appWin.setSize(new LogicalSize(saved.w, saved.h)); } catch {}
       window.setTimeout(() => { applyingWinSize = false; }, 300);
     }
   } else {
     try {
-      const [phys, factor] = await Promise.all([win.innerSize(), win.scaleFactor()]);
+      const [phys, factor] = await Promise.all([appWin.innerSize(), appWin.scaleFactor()]);
       if (phys.width > 0 && phys.height > 0 && factor > 0) {
         winSize = { w: Math.round(phys.width / factor), h: Math.round(phys.height / factor) };
       }
     } catch {}
   }
   try {
-    await win.onResized(({ payload }) => {
+    await appWin.onResized(({ payload }) => {
       if (applyingWinSize || payload.width <= 0 || payload.height <= 0) return;
       window.clearTimeout(resizeSaveTimer);
       resizeSaveTimer = window.setTimeout(async () => {
         try {
-          const factor = await win.scaleFactor();
+          if (await appWin.isMaximized().catch(() => false)) return;
+          const factor = await appWin.scaleFactor();
           if (factor <= 0) return;
           const w = Math.round(payload.width / factor);
           const h = Math.round(payload.height / factor);
@@ -100,9 +195,10 @@ export async function resetDesktopWindowSize(settingsDialog: HTMLDialogElement) 
   try { localStorage.removeItem(WIN_SIZE_KEY); } catch {}
   refreshWindowSizeRow(settingsDialog);
   try {
-    const win = getCurrentWindow();
-    await win.setSize(new LogicalSize(DEFAULT_WIN.w, DEFAULT_WIN.h));
-    await win.center();
+    const appWin = getCurrentWindow();
+    if (await appWin.isMaximized().catch(() => false)) await appWin.unmaximize();
+    await appWin.setSize(new LogicalSize(DEFAULT_WIN.w, DEFAULT_WIN.h));
+    await appWin.center();
   } catch {}
   window.setTimeout(() => { applyingWinSize = false; }, 300);
 }

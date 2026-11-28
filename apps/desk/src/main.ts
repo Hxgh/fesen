@@ -19,6 +19,7 @@ import {
   showError,
   syncBrand,
   syncSigninSubmit,
+  theme,
 } from "./app/runtime";
 import { openSettings } from "./dialogs/settings-dialog";
 import { addShare } from "./dialogs/share-dialog";
@@ -27,7 +28,7 @@ import { accessIpFor, effectiveKind, toInt } from "./model/net";
 import { desktop, loadCollapsed, mac, probes, serviceKey, state } from "./model/state";
 import type { IconName, Reply, Status } from "./model/types";
 import { button, el, field, notify, str, submit } from "./ui/dom";
-import { initDesktopWindowSize } from "./ui/window";
+import { initDesktopWindowSize, initWindowsChrome } from "./ui/window";
 import {
   clearSearchInput,
   closeSearch,
@@ -199,7 +200,8 @@ function renderApp(force = false) {
         }),
         attach(t("continue")),
       ));
-    } else if (mac && ["extension_unsigned", "extension_restart", "extension_location"].includes(state.message)) {
+    } else if ((mac && ["extension_unsigned", "extension_restart", "extension_location"].includes(state.message))
+      || state.message === "core_location") {
       content.replaceChildren();
     } else {
       const caption = state.message === "extension_setup"
@@ -355,6 +357,7 @@ function deepLink(urls: string[] | null) {
 }
 
 async function boot() {
+  initWindowsChrome(theme.get());
   syncBrand(true);
   void initDesktopWindowSize(settingsDialog);
   i18n.onChange(() => {

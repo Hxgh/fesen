@@ -82,7 +82,7 @@ async fn call(app: &tauri::AppHandle, request: Value, launch: bool) -> Result<Va
 async fn call(_app: &tauri::AppHandle, request: Value, launch: bool) -> Result<Value, String> {
     use fesen_core::{
         ipc,
-        platform::windows::{data_dir, elevate},
+        platform::windows::{data_dir, elevate, installed},
     };
     static START: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let error = || String::from("not_connected");
@@ -100,12 +100,14 @@ async fn call(_app: &tauri::AppHandle, request: Value, launch: bool) -> Result<V
     let core = std::env::current_exe()
         .map_err(|_| error())?
         .with_file_name("fesen-core.exe");
-    let core = core.canonicalize().map_err(|_| error())?;
+    if !installed(&core) {
+        return Err(String::from("core_location"));
+    }
     tauri::async_runtime::spawn_blocking(move || elevate(&core))
         .await
         .map_err(|_| error())?
         .map_err(|_| error())?;
-    for _ in 0..60 {
+    for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(150)).await;
         if let Ok(reply) = ipc::request(&dir, &request).await {
             return Ok(reply);
@@ -219,4 +221,22 @@ pub fn run() {
     });
     app.run(tauri::generate_context!())
         .expect("无法启动飞弦（Fesen）");
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    #[test]
+    fn windows_window_config_matches_main_dimensions_and_uses_custom_titlebar() {
+        let base: Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let win: Value = serde_json::from_str(include_str!("../tauri.windows.conf.json")).unwrap();
+        let base_win = &base["app"]["windows"][0];
+        let win_win = &win["app"]["windows"][0];
+        for key in ["label", "width", "height", "minWidth", "minHeight", "center"] {
+            assert_eq!(base_win[key], win_win[key], "mismatch on {key}");
+        }
+        assert_eq!(win_win["decorations"], false);
+        assert_eq!(win_win["shadow"], true);
+    }
 }

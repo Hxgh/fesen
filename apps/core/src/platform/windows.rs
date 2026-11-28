@@ -18,7 +18,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        Arc, OnceLock, RwLock,
+        Arc, Mutex, OnceLock, RwLock,
         atomic::{AtomicU32, Ordering},
     },
     time::Duration,
@@ -35,7 +35,7 @@ use windows_sys::Win32::{
     Networking::WinSock::*,
     Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     },
     System::{
         Com::CoTaskMemFree,
@@ -99,9 +99,14 @@ pub fn pin_profile(dir: &Path) -> io::Result<Vec<fs::File>> {
                 Err(e) => return Err(e),
             }
         }
+        let share = if path == dir {
+            FILE_SHARE_READ | FILE_SHARE_WRITE
+        } else {
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        };
         let handle = fs::OpenOptions::new()
             .read(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .share_mode(share)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
         let meta = handle.metadata()?;
@@ -203,6 +208,7 @@ struct Adapter {
     reader: Option<std::thread::JoinHandle<()>>,
     index: u32,
     config: Tun,
+    nrpt_lock: Arc<Mutex<bool>>,
 }
 
 impl Drop for Adapter {
@@ -213,7 +219,9 @@ impl Drop for Adapter {
             }
         }
         if self.config.dns.is_some() {
+            let mut cleaned = self.nrpt_lock.lock().unwrap();
             let _ = nrpt(None);
+            *cleaned = true;
         }
         let _ = self.session.shutdown();
         if let Some(t) = self.reader.take() {
@@ -229,11 +237,22 @@ pub struct Windows {
     dll: PathBuf,
     network: RwLock<Network>,
     device: OnceLock<DeviceInfo>,
+    nrpt_lock: Arc<Mutex<bool>>,
 }
 
 impl Windows {
     pub fn new(dll: PathBuf) -> Self {
-        let _ = nrpt(None);
+        let nrpt_lock = Arc::new(Mutex::new(false));
+        let cleanup_lock = nrpt_lock.clone();
+        let _ = std::thread::Builder::new()
+            .name("fesen-nrpt-init".into())
+            .spawn(move || {
+                let mut cleaned = cleanup_lock.lock().unwrap();
+                if !*cleaned {
+                    let _ = nrpt(None);
+                    *cleaned = true;
+                }
+            });
         Self {
             adapter: RwLock::new(None),
             own_index: AtomicU32::new(0),
@@ -241,6 +260,7 @@ impl Windows {
             dll,
             network: RwLock::new(Network::default()),
             device: OnceLock::new(),
+            nrpt_lock,
         }
     }
 
@@ -284,6 +304,7 @@ impl Windows {
                 address: Some(ip),
                 ..Tun::default()
             },
+            nrpt_lock: self.nrpt_lock.clone(),
         })
     }
 }
@@ -526,7 +547,9 @@ impl Platform for Windows {
                 }
             }
             if adapter.config.dns != tun.dns {
+                let mut cleaned = self.nrpt_lock.lock().unwrap();
                 nrpt(tun.dns)?;
+                *cleaned = true;
                 adapter.config.dns = tun.dns;
             }
             Ok(())
@@ -556,21 +579,53 @@ fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
     s.as_ref().encode_wide().chain(Some(0)).collect()
 }
 
+fn strip_verbatim_drive_units(units: &[u16]) -> Option<&[u16]> {
+    // Strip `\\?\` only for local drive paths (`\\?\C:\...`); reject UNC/device namespaces.
+    const PREFIX: [u16; 4] = [
+        b'\\' as u16,
+        b'\\' as u16,
+        b'?' as u16,
+        b'\\' as u16,
+    ];
+    if units.starts_with(&PREFIX) {
+        let drive = *units.get(4)?;
+        if units.get(5) == Some(&(b':' as u16))
+            && units.get(6) == Some(&(b'\\' as u16))
+            && u8::try_from(drive).is_ok_and(|b| b.is_ascii_alphabetic())
+        {
+            return Some(&units[4..]);
+        }
+        return None;
+    }
+    Some(units)
+}
+
+fn shell_path(path: &Path) -> io::Result<PathBuf> {
+    let canonical = path.canonicalize()?;
+    let units: Vec<u16> = canonical.as_os_str().encode_wide().collect();
+    let trimmed = strip_verbatim_drive_units(&units)
+        .ok_or_else(|| io::Error::other("unsupported core path"))?;
+    Ok(PathBuf::from(OsString::from_wide(trimmed)))
+}
+
 pub fn elevate(path: &Path) -> io::Result<()> {
     if !installed(path) {
         return Err(io::Error::other(
             "Fesen must be installed in Program Files",
         ));
     }
+    // ShellExecuteW does not accept `\\?\` extended-length paths from Path::canonicalize().
+    let launch = shell_path(path)?;
+    let dir = launch.parent().map(wide);
     let verb = wide("runas");
-    let path = wide(path);
+    let file = wide(&launch);
     let code = unsafe {
         ShellExecuteW(
             std::ptr::null_mut(),
             verb.as_ptr(),
-            path.as_ptr(),
+            file.as_ptr(),
             std::ptr::null(),
-            std::ptr::null(),
+            dir.as_ref().map_or(std::ptr::null(), |d| d.as_ptr()),
             SW_HIDE,
         )
     };
@@ -918,4 +973,33 @@ pub async fn tray(core: Arc<Core>, gui: PathBuf) {
         }
     }
     let _ = tokio::task::spawn_blocking(move || thread.join().is_ok()).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_verbatim_drive_units;
+
+    fn utf16(s: &str) -> Vec<u16> {
+        s.encode_utf16().collect()
+    }
+
+    #[test]
+    fn strip_verbatim_drive_units_accepts_only_drive_and_plain_paths() {
+        assert_eq!(
+            strip_verbatim_drive_units(&utf16(r"\\?\C:\Program Files\Fesen\fesen-core.exe")),
+            Some(utf16(r"C:\Program Files\Fesen\fesen-core.exe").as_slice())
+        );
+        assert_eq!(
+            strip_verbatim_drive_units(&utf16(r"C:\Program Files\Fesen\fesen-core.exe")),
+            Some(utf16(r"C:\Program Files\Fesen\fesen-core.exe").as_slice())
+        );
+        assert_eq!(
+            strip_verbatim_drive_units(&utf16(r"\\?\UNC\server\share\fesen-core.exe")),
+            None
+        );
+        assert_eq!(
+            strip_verbatim_drive_units(&utf16(r"\\?\Volume{1234}\Fesen\fesen-core.exe")),
+            None
+        );
+    }
 }
